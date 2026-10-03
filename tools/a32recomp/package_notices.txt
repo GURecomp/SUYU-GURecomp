@@ -1,0 +1,26 @@
+Licenses
+========
+
+suyu (suyu.exe, link_kit) is free software under the GNU General Public License, version 3 or
+later (LICENSE.txt). Individual source files carry their own SPDX tags (GPL-2.0-or-later, MIT,
+BSD, ...); the full texts are in licenses/. The complete corresponding source code of this build
+is available from the same place you got this package; ask whoever gave it to you.
+
+This package contains no game code or data. The game is exported on your PC from your own dump.
+
+Bundled third-party components
+------------------------------
+- Qt 6 (Qt6*.dll, plugins/): GNU LGPL v3, dynamically linked. You may replace these DLLs with
+  your own build of the same Qt version. Texts in licenses/qt/.
+- OpenSSL (libssl.dll, libcrypto.dll, link_kit/lib/libcrypto_static.lib): Apache License 2.0
+  (licenses/Apache-2.0.txt).
+- DirectX Shader Compiler (dxcompiler.dll): University of Illinois/NCSA Open Source License,
+  from the Vulkan SDK. dxil.dll: Microsoft, redistributable with applications under the DXC
+  release license.
+- Libraries built into suyu.exe and link_kit (dynarmic, SDL3, Vulkan headers and utility
+  libraries, VulkanMemoryAllocator, FidelityFX FSR, sirit, SPIR-V headers, fmt, Boost, zstd,
+  lz4, zlib, cubeb, opus, FFmpeg, enet, cpp-httplib, cpp-jwt, nlohmann json, simpleini,
+  QuaZip, unordered_dense, xbyak, libusb, ...): each under its own license (GPL-compatible),
+  named in its source; texts in licenses/.
+
+Not affiliated with or endorsed by Nintendo or Capcom. Monster Hunter is a trademark of Capcom.
