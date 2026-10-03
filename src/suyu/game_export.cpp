@@ -2012,6 +2012,14 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                  FindVcVars64().toStdString());
     }
 #endif
+    const QString build_ninja = QStandardPaths::findExecutable(
+        QStringLiteral("ninja"),
+        build_env.value(QStringLiteral("PATH")).split(QDir::listSeparator(), Qt::SkipEmptyParts));
+    if (WantsCompiledOutput()) {
+        LOG_INFO(Frontend, "Build export: module builds use {}",
+                 build_ninja.isEmpty() ? std::string("CMake's default generator")
+                                       : "Ninja (" + build_ninja.toStdString() + ")");
+    }
 
     u64 recomp_total_blocks = 0;
     QStringList recomp_module_dirs;
@@ -2158,14 +2166,23 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             QString configure_log;
             QString build_log;
 
-            const QStringList configure_args{
+            QStringList configure_args{
                 QStringLiteral("-S"), mod_dir, QStringLiteral("-B"), build_dir,
                 // The package ships one self-contained exe, so only the static
                 // library is ever consumed. Without this the generated project
                 // also builds a standalone exe and a loadable DLL from the same
                 // sources - three full compiles of a translation unit that can
                 // take 40 minutes each on a large title.
-                QStringLiteral("-DRECOMP_STATIC_ONLY=ON")};
+                QStringLiteral("-DRECOMP_STATIC_ONLY=ON"),
+                // Single-config generators (Ninja, NMake: what Visual Studio 2026's CMake
+                // picks inside the developer environment) ignore --config and default to
+                // Debug, whose /RTC1 the generated project's /O1 can't be combined with.
+                QStringLiteral("-DCMAKE_BUILD_TYPE=Release")};
+            if (!build_ninja.isEmpty()) {
+                // Ninja builds in parallel (NMake can't); Visual Studio's CMake tools ship it.
+                configure_args << QStringLiteral("-G") << QStringLiteral("Ninja")
+                               << QStringLiteral("-DCMAKE_MAKE_PROGRAM=") + build_ninja;
+            }
             QProcess configure;
             configure.setProcessEnvironment(build_env);
             int configure_rc = RunProcessDrained(configure, cmake, configure_args,
