@@ -1988,6 +1988,31 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             output_path_edit->text() + QDir::separator() + game_name, module_results);
     }
 
+    // The module builds run CMake inside the Visual Studio x64 environment (cl, link, nmake
+    // and the SDK on PATH/INCLUDE/LIB), so they work whichever CMake is found and whichever
+    // generator it picks. Without the C++ tools nothing can be compiled: say so now instead of
+    // after lifting every module, where each configure would fail and fall back.
+    QProcessEnvironment build_env = QProcessEnvironment::systemEnvironment();
+#ifdef _WIN32
+    if (WantsCompiledOutput()) {
+        if (FindVcVars64().isEmpty()) {
+            LOG_ERROR(Frontend, "Build export: no Visual Studio C++ build tools found (vswhere "
+                                "lists no installation with the x64 C++ toolset)");
+            QMessageBox::critical(
+                this, tr("Export Failed"),
+                tr("The Visual Studio C++ build tools were not found, so the game's code can't "
+                   "be compiled.\n\nInstall Visual Studio 2022 (Community or Build Tools), "
+                   "version 17.14 or newer, with the workload \"Desktop development with C++\", "
+                   "then export again. The install guide (docs/a32recomp/INSTALL.md) has the "
+                   "steps."));
+            return {};
+        }
+        build_env = VsDeveloperEnvironment();
+        LOG_INFO(Frontend, "Build export: compiler environment from {}",
+                 FindVcVars64().toStdString());
+    }
+#endif
+
     u64 recomp_total_blocks = 0;
     QStringList recomp_module_dirs;
     QStringList fallback_modules;
@@ -2133,19 +2158,32 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             QString configure_log;
             QString build_log;
 
+            const QStringList configure_args{
+                QStringLiteral("-S"), mod_dir, QStringLiteral("-B"), build_dir,
+                // The package ships one self-contained exe, so only the static
+                // library is ever consumed. Without this the generated project
+                // also builds a standalone exe and a loadable DLL from the same
+                // sources - three full compiles of a translation unit that can
+                // take 40 minutes each on a large title.
+                QStringLiteral("-DRECOMP_STATIC_ONLY=ON")};
             QProcess configure;
-            const int configure_rc = RunProcessDrained(
-                configure, cmake,
-                {QStringLiteral("-S"), mod_dir, QStringLiteral("-B"), build_dir,
-                 // The package ships one self-contained exe, so only the static
-                 // library is ever consumed. Without this the generated project
-                 // also builds a standalone exe and a loadable DLL from the same
-                 // sources - three full compiles of a translation unit that can
-                 // take 40 minutes each on a large title.
-                 QStringLiteral("-DRECOMP_STATIC_ONLY=ON")},
-                &configure_log);
+            configure.setProcessEnvironment(build_env);
+            int configure_rc = RunProcessDrained(configure, cmake, configure_args,
+                                                 &configure_log);
+            if (configure_rc != 0 && QDir(build_dir).exists()) {
+                // A build folder left by an earlier failed export (another generator, or
+                // configured without a compiler) makes CMake refuse: start it over once.
+                LOG_WARNING(Frontend, "cmake configure of {} failed; retrying in a fresh folder",
+                            mod.name.toStdString());
+                QDir(build_dir).removeRecursively();
+                QProcess retry;
+                retry.setProcessEnvironment(build_env);
+                configure_log.clear();
+                configure_rc = RunProcessDrained(retry, cmake, configure_args, &configure_log);
+            }
             if (configure_rc == 0) {
                 QProcess build;
+                build.setProcessEnvironment(build_env);
                 const int build_rc =
                     RunProcessDrained(build, cmake,
                                       {QStringLiteral("--build"), build_dir,
