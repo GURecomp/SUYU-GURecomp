@@ -1,25 +1,17 @@
-# suyu
-
 <h1 align="center">
   <br>
   <img src="dist/suyu.svg" alt="suyu" height="128">
   <br>
-  <b>suyu</b>
+  <b>SUYU-GURecomp</b>
   <br>
 </h1>
 
 <h4 align="center">
-Nintendo Switch emulator and native recompiler — based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
+suyu with AArch32 static recompilation: Monster Hunter Generations Ultimate as a native Windows game.
 </h4>
 
-> **This fork adds AArch32 static recompilation**: it turns your own copy of Monster Hunter
-> Generations Ultimate (1.4.0) into a native Windows game, with runtime settings
-> (frame rate, resolution, ultrawide), local multiplayer and a drop-in mod host.
-> Players: [install guide](docs/a32recomp/INSTALL.md) · Developers:
-> [building](docs/a32recomp/BUILDING.md) · Maintainers: [releases](docs/a32recomp/RELEASE.md).
-> No keys, game files or recompiled game code are part of this repository or its releases.
-
 <p align="center">
+  <a href="docs/a32recomp/INSTALL.md">Install guide</a> |
   <a href="#status">Status</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
@@ -27,72 +19,101 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 
 ---
 
-> **This is the final public release of suyu — v0.04. This repository is a public archive.**
->
-> No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
->
-> **Note:** a small number of fixes were later pulled in from a community
-> continuation of this codebase, after users reported that installed
-> updates/DLC, service handler registration, and RomFS registration were all
-> broken in the archived build. Those fixes are folded in here as bug fixes to
-> suyu itself; this remains the same final v0.04 release, not new development.
-
 ## About
 
-suyu is a Nintendo Switch emulator and AArch64 native recompiler written in C++. It can run decrypted Switch titles using either:
+This is a fork of suyu, the Nintendo Switch emulator, which descends from
+[Eden](https://git.eden-emu.dev/eden-emu/eden) and yuzu. It adds a **static recompiler for
+32-bit ARM (AArch32) games**: suyu's **File → Export Game...** translates the game's code to C
+on your PC, compiles it with Microsoft's C++ compiler and links it with suyu's HLE runtime
+(OS services, GPU, audio) into one native Windows `.exe`.
 
-- **HLE/emulation mode** — full hardware-level emulation via the suyu core (GPU, CPU, audio, services)
-- **Recompiler mode** — ahead-of-time static recompilation of Switch AArch64 game code to native x86-64 executables, bundled with suyu's HLE backend
+The target is **Monster Hunter Generations Ultimate, version 1.4.0**, from your own dump. On
+top of the export:
 
-Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improvements to UI, recompiler, and platform support.
+- **Runtime settings** in `game_settings.ini` beside the exe, read at every start, never needing
+  a new export: frame rate (30, 60, 90, 120 or auto), resolution and aspect ratio (ultrawide),
+  native render resolution, fullscreen, draw distance. Defaults are the original game.
+- **F12 panel**: status, controller binding, mod folders and multiplayer.
+- **Local multiplayer** over a suyu room (for example through Radmin VPN), host or join from the
+  panel or the ini.
+- **PC keyboard input** wherever the game asks for text.
+- **A drop-in mod host**: a loader DLL such as Forge PC is loaded from the export's `mods` folder,
+  with plugins installed by copying files. No new export is needed for mods. The interface is in
+  [`src/core/arm/recomp/mod_host_api.h`](src/core/arm/recomp/mod_host_api.h) (MIT).
+
+**No keys, game files or recompiled game code are part of this repository or its releases.**
+You need your own Switch keys and your own dump of the game.
+
+The rest of suyu is still here and works as before: it runs as an emulator, and upstream's
+experimental AArch64 recompiler path is kept.
 
 ## Status
 
-Final version: **v0.04**. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android).
+Test builds. The native export is **Windows only** (x64, Visual Studio 2022 17.14 or newer),
+and **MHGU 1.4.0** is the only title it's tested with. Prebuilt test builds are on the
+[releases page](../../releases).
 
-Platforms: Windows, Linux, Android. macOS/iOS not included in this release.
+Upstream suyu's Linux and Android build paths are still in the tree, but this fork doesn't
+build or test them.
 
-## Legal Notice
+Known issues are listed with each release. Report problems as described in
+[INSTALL.md, section 10](docs/a32recomp/INSTALL.md#10-reporting-a-problem).
 
-suyu is a GPLv3 program, which allows fully free redistribution of its source code and releases liability of its authors for how this software is used as stated in Section 15 and 16.
+## Documentation
 
-The suyu Emulator program does not circumvent Nintendo's technological protection measures (TPMs) as the user is required to provide both the Nintendo Switch software & the encryption keys for these games, and the suyu Emulator uses a mode of the Advanced Encryption Standard (AES), an open encryption standard established by the US NIST, along with the encryption keys that the user themselves must lawfully acquire, to decrypt the software. As the standard is public and available to use by all, it does not constitute as the Digital Market Copyright Act's (DMCA) definition of "circumventing a technological measure" as defined in Section 1201(a)(3).
-
-The suyu Emulator also falls under the exemptions stated in Section 1201(f) of the DMCA as this software was created for the purposes of reverse engineering the Nintendo Switch software (known as Horizon OS) to create interoperability with Nintendo Switch games and software with the Windows, macOS, and GNU/Linux operating systems.
-
-Any aggressive DMCA claims or takedown notices against projects that explicitly disclaim piracy support, require user-provided keys, and limit functionality to interoperability (such as suyu) could constitute overreach or misuse of the DMCA.
-
-As derived from §512(f), if Nintendo (or an affiliated entity) knowingly materially misrepresents that a project like suyu is infringing (or circumvents TPMs) when it does not, especially if they fail to consider fair use, interoperability exemptions under §1201(f), or the fact that the emulator requires user-provided keys and does not itself contain proprietary Nintendo code, they can be made liable for any Damages against suyu.
+- [Install and export guide](docs/a32recomp/INSTALL.md): prerequisites step by step, keys,
+  exporting, settings, mods, multiplayer, troubleshooting
+- [Building from source](docs/a32recomp/BUILDING.md): tools, the build script, release packages,
+  where the recompiler code lives
+- [Publishing and releases](docs/a32recomp/RELEASE.md): what is never published, licensing
+  checklist, release steps
 
 ## Building
 
-### Dependencies
-
-- CMake 3.15+, Ninja
-- Qt 6.4+ (without bundled Qt: `-DYUZU_USE_BUNDLED_QT=OFF`)
-- Vulkan SDK, libusb, OpenSSL
-
-### Windows
+Windows, with Visual Studio 2022 17.14+, the Vulkan SDK, Qt 6 (MSVC 2022 64-bit, with Qt SVG),
+Git and Python 3 installed (details in [BUILDING.md](docs/a32recomp/BUILDING.md)):
 
 ```bat
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
+tools\a32recomp\build_windows.bat
+```
+
+The result is `build\bin\suyu.exe`. By hand, from an "x64 Native Tools Command Prompt for
+VS 2022":
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_TESTS=OFF ^
+  -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_PREFIX_PATH=C:\Qt\6.12.0\msvc2022_64
 cmake --build build --target suyu suyu-cmd
 ```
 
-### Linux
+Upstream's notes for other platforms are in [docs/Build.md](docs/Build.md).
 
-```sh
-sudo apt-get install ninja-build qt6-base-dev libqt6svg6-dev libusb-1.0-0-dev libssl-dev
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
-cmake --build build --target suyu suyu-cmd
-```
+## Legal Notice
 
-### Android
+suyu is a GPLv3 program, which allows free redistribution of its source code and limits its
+authors' liability for how the software is used, as stated in sections 15 and 16 of the license.
 
-```sh
-cd src/android && ./gradlew assembleMainlineRelease
-```
+suyu does not circumvent Nintendo's technological protection measures: the user must provide
+both the Nintendo Switch software and the encryption keys for it, which they must lawfully
+obtain themselves. suyu decrypts the software with AES, an open standard published by the US
+NIST, using those user-provided keys.
+
+suyu was created to reverse engineer the Nintendo Switch software (Horizon OS) for
+interoperability between Nintendo Switch games and other operating systems, the purpose
+described in section 1201(f) of the DMCA.
+
+This project contains no code or data from Nintendo or Capcom. The recompiler produces the
+game's native code on the user's own PC, from the user's own copy; that output must not be
+shared. Not affiliated with or endorsed by Nintendo or Capcom. Monster Hunter is a trademark
+of Capcom.
+
+## Credits
+
+suyu, Eden and yuzu developers for the emulator this builds on. Public MHGU patches used as
+references only, none of their content shipped: 60 FPS by masagrator, 90/120 FPS by minderrx,
+pchtxt pack by Fl4sh9174, 16:10 by TLin-Y. Forge by Fexty, which Forge PC ports with permission.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE.txt](LICENSE.txt).
+GPL-3.0-or-later. See [LICENSE.txt](LICENSE.txt). Individual files carry SPDX tags; their
+license texts are in [LICENSES/](LICENSES).

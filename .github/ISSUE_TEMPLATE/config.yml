@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
-  - name: suyu Discord
-    url: https://discord.com/invite/suyu
-    about: If you are experiencing an issue with suyu, and you need tech support, or if you have a general question, try asking in the official suyu Discord linked here. Piracy is not allowed.
+  - name: Install and export guide
+    url: https://github.com/GURecomp/SUYU-GURecomp/blob/main/docs/a32recomp/INSTALL.md
+    about: Setup steps and a troubleshooting table. Please check it before opening an issue. Piracy isn't supported; don't ask for keys or game files.
