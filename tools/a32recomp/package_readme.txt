@@ -8,9 +8,9 @@ Test build: expect rough edges, and please report what you see.
 NEEDED
 ------
 - Windows 10/11, 64-bit, and a GPU with a current Vulkan driver.
-- Visual Studio 2022 (the free Community edition or "Build Tools for Visual Studio
-  2022"), version 17.14 or newer, with the workload "Desktop development with C++"
-  (keep its default parts: MSVC v143, Windows SDK, C++ CMake tools). The export compiles
+- Visual Studio 2022 version 17.14 or newer, or Visual Studio 2026 (the free Community
+  edition or "Build Tools for Visual Studio"), with the workload "Desktop development with C++"
+  (keep its default parts: MSVC build tools, Windows SDK, C++ CMake tools). The export compiles
   the game's code with it. Already installed? Visual Studio Installer > Update.
   Nothing else to install.
 - About 25 GB free disk on the drive you export to.

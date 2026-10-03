@@ -2001,8 +2001,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             QMessageBox::critical(
                 this, tr("Export Failed"),
                 tr("The Visual Studio C++ build tools were not found, so the game's code can't "
-                   "be compiled.\n\nInstall Visual Studio 2022 (Community or Build Tools), "
-                   "version 17.14 or newer, with the workload \"Desktop development with C++\", "
+                   "be compiled.\n\nInstall Visual Studio 2022 (version 17.14 or newer) or "
+                   "Visual Studio 2026, Community or Build Tools, with the workload "
+                   "\"Desktop development with C++\", "
                    "then export again. The install guide (docs/a32recomp/INSTALL.md) has the "
                    "steps."));
             return {};

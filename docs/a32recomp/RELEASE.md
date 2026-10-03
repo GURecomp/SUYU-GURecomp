@@ -103,7 +103,7 @@ code, no keys and no game files.
   SHA-256: `<hash>`
 
 ### You need
-- Visual Studio 2022 **17.14 or newer** (free Community or Build Tools) with
+- Visual Studio 2022 **17.14 or newer**, or Visual Studio 2026 (free Community or Build Tools), with
   "Desktop development with C++". It's the only extra install.
 - About 25 GB free disk for the export, a GPU with a current Vulkan driver.
 - Your own keys and your own dump of MHGU with the 1.4.0 update.

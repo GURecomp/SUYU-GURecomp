@@ -49,7 +49,7 @@ experimental AArch64 recompiler path is kept.
 
 ## Status
 
-Test builds. The native export is **Windows only** (x64, Visual Studio 2022 17.14 or newer),
+Test builds. The native export is **Windows only** (x64, Visual Studio 2022 17.14 or newer, or Visual Studio 2026),
 and **MHGU 1.4.0** is the only title it's tested with. Prebuilt test builds are on the
 [releases page](../../releases).
 

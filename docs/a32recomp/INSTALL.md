@@ -11,7 +11,7 @@ your own console dump, and you must never share it or anything the export produc
 Contents:
 
 1. [What you need](#1-what-you-need)
-2. [Install Visual Studio 2022 (the C++ compiler)](#2-install-visual-studio-2022-the-c-compiler)
+2. [Install Visual Studio (the C++ compiler)](#2-install-visual-studio-the-c-compiler)
 3. [Unpack suyu](#3-unpack-suyu)
 4. [Keys and game files](#4-keys-and-game-files)
 5. [Export the game](#5-export-the-game)
@@ -32,43 +32,43 @@ Contents:
 | RAM | 16 GB recommended (the export compiles several large C files at once) |
 | GPU | Vulkan capable, with a **current** driver from NVIDIA, AMD or Intel |
 | Disk | About **25 GB free** on the drive you export to (the finished folder is about 22 GB, mostly build files), plus about 10 GB for Visual Studio |
-| Compiler | Visual Studio 2022 **17.14 or newer** with "Desktop development with C++" (free; section 2) |
+| Compiler | Visual Studio 2022 (**17.14 or newer**) or Visual Studio 2026, with "Desktop development with C++" (free; section 2) |
 | Game | Your own dump of MHGU (base game) **and the 1.4.0 update**, plus your own `prod.keys` / `title.keys` |
 
 Only the compiler needs a separate install. Everything else suyu needs at runtime ships in
 the zip.
 
-## 2. Install Visual Studio 2022 (the C++ compiler)
+## 2. Install Visual Studio (the C++ compiler)
 
 The export calls Microsoft's C++ compiler (`cl.exe`), linker (`link.exe`) and the CMake that
 comes with Visual Studio. suyu finds them automatically through the Visual Studio Installer,
 wherever and whichever edition you install.
 
-You can install **either** of these (both are free):
+Both **Visual Studio 2022** (version 17.14 or newer) and **Visual Studio 2026** work. If you
+already have one of them, skip to step 3 and check the workload. Otherwise install **either** of
+these (both are free), from https://visualstudio.microsoft.com/downloads/:
 
-- **Visual Studio 2022 Community**: the full IDE. https://visualstudio.microsoft.com/vs/community/
-- **Build Tools for Visual Studio 2022**: just the compiler, no IDE, smaller.
-  https://visualstudio.microsoft.com/downloads/ → "Tools for Visual Studio" → "Build Tools for
-  Visual Studio 2022".
+- **Visual Studio Community**: the full IDE.
+- **Build Tools for Visual Studio**: just the compiler, no IDE, smaller (under "Tools for
+  Visual Studio").
 
 Steps:
 
 1. Download and run the installer (`VisualStudioSetup.exe` or `vs_BuildTools.exe`).
 2. On the **Workloads** tab, tick **Desktop development with C++**.
 3. On the right, under *Installation details*, keep these ticked (they are by default):
-   - **MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)**
+   - **MSVC ... C++ x64/x86 build tools (Latest)** (the name depends on the Visual Studio version)
    - **Windows 11 SDK** (any version; Windows 10 SDK also works)
    - **C++ CMake tools for Windows**
 4. Click **Install** and wait (about 8-10 GB).
 5. **Version check:** the release was built with MSVC 14.44, which ships with Visual Studio
-   **17.14**. An older Visual Studio can't link it. If you already had VS 2022 installed, open
-   the **Visual Studio Installer** and press **Update** on it. The version is shown on its card
-   (it must say 17.14 or higher).
+   2022 **17.14**. An older Visual Studio can't link it. If you have Visual Studio 2022, open the
+   **Visual Studio Installer** and press **Update** on it; its card must say 17.14 or higher.
+   Visual Studio 2026 (version 18) is newer and works as it is.
 
 You don't have to open Visual Studio after installing. A reboot is not usually needed.
 
-Other compilers (MinGW, clang, Visual Studio 2019, 2026 previews) aren't supported for the
-export.
+Other compilers (MinGW, clang, Visual Studio 2019 or older) aren't supported for the export.
 
 ## 3. Unpack suyu
 
@@ -154,7 +154,7 @@ through a VPN such as Radmin VPN or ZeroTier.
 | Problem | Fix |
 |---|---|
 | Export: "no Visual Studio C++ build tools found", "cl.exe / link.exe not found" or "cmake was not found" | Section 2: install the C++ workload with "C++ CMake tools for Windows"; check that the Visual Studio Installer shows it. A Visual Studio in an unusual place: set the environment variable `SUYU_VCVARS` to its `VC\Auxiliary\Build\vcvars64.bat`. |
-| Export: link errors such as `LNK1104`, `LNK1143`, "unsupported version" or "was created with a newer compiler" | Update Visual Studio to 17.14 or newer (Installer → Update). |
+| Export: link errors such as `LNK1104`, `LNK1143`, "unsupported version" or "was created with a newer compiler" | Update Visual Studio 2022 to 17.14 or newer (Installer → Update), or use Visual Studio 2026. |
 | Export: "static recompiled executable was not produced" | Read the lines above it in the export log; usually a missing workload or no disk space. |
 | Export stops with an out-of-space error | Free about 25 GB on the output drive. |
 | suyu says keys are missing | Section 4: `prod.keys` and `title.keys` in suyu's `keys` folder, then restart. |
