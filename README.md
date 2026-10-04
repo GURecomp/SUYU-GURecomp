@@ -11,6 +11,7 @@ suyu with AArch32 static recompilation: Monster Hunter Generations Ultimate as a
 </h4>
 
 <p align="center">
+  <a href="#requirements">Requirements</a> |
   <a href="docs/a32recomp/INSTALL.md">Install guide</a> |
   <a href="#status">Status</a> |
   <a href="#building">Building</a> |
@@ -46,6 +47,27 @@ You need your own Switch keys and your own dump of the game.
 
 The rest of suyu is still here and works as before: it runs as an emulator, and upstream's
 experimental AArch64 recompiler path is kept.
+
+## Requirements
+
+What you need to export (recompile) the game with a [release build](../../releases):
+
+| | |
+|---|---|
+| OS | Windows 10 or 11, 64-bit |
+| CPU | 64-bit Intel or AMD. The export uses all cores. |
+| RAM | 16 GB recommended |
+| GPU | Vulkan capable, with a current driver from NVIDIA, AMD or Intel |
+| Disk | About **25 GB free** on the drive you export to, plus about 10 GB for Visual Studio |
+| Compiler | **Visual Studio 2022 (version 17.14 or newer) or Visual Studio 2026**, Community or Build Tools (both free), with the workload **"Desktop development with C++"** and its default parts |
+| Keys | Your own `prod.keys` and `title.keys`, dumped from your own Switch |
+| Game | Your own dump of Monster Hunter Generations Ultimate **and its 1.4.0 update** |
+
+The compiler is the only separate install; everything else suyu needs ships in the release
+zip. None of the keys or game files are included, and none may be shared.
+
+Step by step, including how to check your Visual Studio version and workload:
+[install guide](docs/a32recomp/INSTALL.md).
 
 ## Status
 
