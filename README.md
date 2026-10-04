@@ -50,24 +50,29 @@ experimental AArch64 recompiler path is kept.
 
 ## Requirements
 
-What you need to export (recompile) the game with a [release build](../../releases):
+Software you need to export (recompile) the game with a [release build](../../releases):
 
-| | |
-|---|---|
-| OS | Windows 10 or 11, 64-bit |
-| CPU | 64-bit Intel or AMD. The export uses all cores. |
-| RAM | 16 GB recommended |
-| GPU | Vulkan capable, with a current driver from NVIDIA, AMD or Intel |
-| Disk | About **25 GB free** on the drive you export to, plus about 10 GB for Visual Studio |
-| Compiler | **Visual Studio 2022 (version 17.14 or newer) or Visual Studio 2026**, Community or Build Tools (both free), with the workload **"Desktop development with C++"** and its default parts |
-| Keys | Your own `prod.keys` and `title.keys`, dumped from your own Switch |
-| Game | Your own dump of Monster Hunter Generations Ultimate **and its 1.4.0 update** |
+1. **Visual Studio 2022 (version 17.14 or newer) or Visual Studio 2026.** The free
+   *Community* or *Build Tools* edition is enough. In the Visual Studio Installer it needs:
+   - the workload **Desktop development with C++**, with these parts ticked (they are by
+     default):
+     - **MSVC C++ x64/x86 build tools (Latest)**
+     - **Windows 11 SDK** (or Windows 10 SDK)
+     - **C++ CMake tools for Windows**
 
-The compiler is the only separate install; everything else suyu needs ships in the release
-zip. None of the keys or game files are included, and none may be shared.
+   Already installed? Open the Visual Studio Installer, press **Update**, then **Modify** and
+   check the workload. suyu finds Visual Studio on its own; you don't have to open it.
+2. **A current GPU driver** from NVIDIA, AMD or Intel (the game runs on Vulkan).
+3. **Your own Switch keys**: `prod.keys` and `title.keys`.
+4. **Your own dump of Monster Hunter Generations Ultimate**, plus the **1.4.0 update** `.nsp`
+   installed in suyu (File → Install Files to NAND).
+5. **The release zip** from the [releases page](../../releases). It already contains everything
+   else suyu needs (Qt, the Vulkan shader compiler, OpenSSL, the link kit). No separate CMake,
+   Python, Qt or Vulkan SDK install is needed.
 
-Step by step, including how to check your Visual Studio version and workload:
-[install guide](docs/a32recomp/INSTALL.md).
+Also about 25 GB free disk on the drive you export to, plus about 10 GB for Visual Studio.
+None of the keys or game files are included, and none may be shared. The step-by-step guide is
+the [install guide](docs/a32recomp/INSTALL.md).
 
 ## Status
 
