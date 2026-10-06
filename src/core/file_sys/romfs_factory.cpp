@@ -39,7 +39,22 @@ void RomFSFactory::SetPackedUpdate(VirtualFile update_raw_file) {
 
 VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const {
     if (!updatable) {
-        return file;
+        // Recompiled exports load romfs.bin (base + update already merged) from their own
+        // folder; file mods (mods/<title id>/<mod>/romfs/...) still go on top, as in suyu.
+        std::scoped_lock lock{layered_mutex};
+        if (!layered_built) {
+            layered_built = true;
+            layered = file;
+            if (file != nullptr) {
+                const PatchManager patch_manager{current_process_title_id, filesystem_controller,
+                                                 content_provider};
+                layered = patch_manager.ApplyLayeredFSOnly(file, ContentRecordType::Program);
+                if (layered != file) {
+                    LOG_INFO(Service_FS, "RomFS: file mods applied on top of the game's RomFS");
+                }
+            }
+        }
+        return layered;
     }
 
     const auto type = ContentRecordType::Program;

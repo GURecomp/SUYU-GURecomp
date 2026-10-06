@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include "common/common_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -56,6 +57,12 @@ private:
     VirtualFile base;
 
     bool updatable;
+
+    // Not updatable (a recompiled export's romfs.bin, update already inside): the file with the
+    // load directory's LayeredFS mods on top, built on first open and reused.
+    mutable std::mutex layered_mutex;
+    mutable VirtualFile layered;
+    mutable bool layered_built{};
 
     ContentProvider& content_provider;
     Service::FileSystem::FileSystemController& filesystem_controller;

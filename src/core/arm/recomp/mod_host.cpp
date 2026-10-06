@@ -33,6 +33,7 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#include "hid_core/frontend/emulated_controller.h"
 
 namespace Core::ModHost {
 
@@ -188,6 +189,9 @@ bool ApiCall(u32 function, const u32* args, u32 count, const float* fargs, u32 f
 
 void ApiSetInputCaptured(bool captured) {
     g_input_captured.store(captured);
+    // Controllers too: a pad driving the mod's menu shouldn't also move the game.
+    Core::HID::EmulatedController::SetInputBlocked(Core::HID::EmulatedController::BlockerMods,
+                                                   captured);
 }
 
 void ApiSetTextInput(bool enabled) {

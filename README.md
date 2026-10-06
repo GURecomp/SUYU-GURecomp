@@ -34,9 +34,12 @@ top of the export:
 - **Runtime settings** in `game_settings.ini` beside the exe, read at every start, never needing
   a new export: frame rate (30, 60, 90, 120 or auto), resolution and aspect ratio (ultrawide),
   native render resolution, fullscreen, draw distance. Defaults are the original game.
-- **F12 panel**: status, controller binding, mod folders and multiplayer.
-- **Local multiplayer** over a suyu room (for example through Radmin VPN), host or join from the
-  panel or the ini.
+- **Game menu** (F10, or Minus + Plus on the controller) in its own window: controller choice
+  and rebinding, multiplayer, every `game_settings.ini` option, folders. The first controller
+  plugged in is used automatically, and the export can copy your suyu controller setup.
+- **Local multiplayer** over a suyu room (for example through Radmin VPN): host, copy an invite,
+  join, automatic reconnect.
+- **File mods** such as texture packs (`romfs` folders) work as in suyu.
 - **PC keyboard input** wherever the game asks for text.
 - **A drop-in mod host**: a loader DLL such as Forge PC is loaded from the export's `mods` folder,
   with plugins installed by copying files. No new export is needed for mods. The interface is in
@@ -90,6 +93,8 @@ Known issues are listed with each release. Report problems as described in
 
 - [Install and export guide](docs/a32recomp/INSTALL.md): prerequisites step by step, keys,
   exporting, settings, mods, multiplayer, troubleshooting
+- [Linux install and export guide](docs/a32recomp/INSTALL-LINUX.md): the same for Linux (gcc or
+  clang instead of Visual Studio)
 - [Building from source](docs/a32recomp/BUILDING.md): tools, the build script, release packages,
   where the recompiler code lives
 - [Publishing and releases](docs/a32recomp/RELEASE.md): what is never published, licensing

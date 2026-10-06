@@ -20,7 +20,7 @@ Bundled third-party components
 - Libraries built into suyu.exe and link_kit (dynarmic, SDL3, Vulkan headers and utility
   libraries, VulkanMemoryAllocator, FidelityFX FSR, sirit, SPIR-V headers, fmt, Boost, zstd,
   lz4, zlib, cubeb, opus, FFmpeg, enet, cpp-httplib, cpp-jwt, nlohmann json, simpleini,
-  QuaZip, unordered_dense, xbyak, libusb, ...): each under its own license (GPL-compatible),
-  named in its source; texts in licenses/.
+  QuaZip, unordered_dense, xbyak, libusb, Dear ImGui (the game menu window), ...): each under
+  its own license (GPL-compatible), named in its source; texts in licenses/.
 
 Not affiliated with or endorsed by Nintendo or Capcom. Monster Hunter is a trademark of Capcom.

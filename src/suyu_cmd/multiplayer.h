@@ -4,6 +4,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -48,5 +49,48 @@ std::string StatusText();
 
 /// At start: does what game_settings.ini [Multiplayer] mode asks for.
 void AutoStart(Core::System& system);
+
+/// What the game menu shows.
+struct Status {
+    enum class Phase { Offline, Connecting, Hosting, Joined, Reconnecting };
+    Phase phase{Phase::Offline};
+    std::string room;
+    std::string nickname;
+    std::vector<std::string> members; // "Name (Game)"
+    u32 slots{};
+    std::string last_error;
+    int reconnect_attempt{}; // while Reconnecting
+};
+Status GetStatus();
+
+/// Short form for the window title: "" offline, "Online 2/4", "Reconnecting...", or a recent
+/// event ("Mira joined") for a few seconds.
+std::string ShortStatus();
+/// Recent room events, newest last ("12:04 Mira joined").
+std::vector<std::string> Events();
+
+/// One of this PC's addresses friends can join, labelled (Radmin VPN, Hamachi, LAN, ...).
+struct LocalAddress {
+    std::string ip;
+    std::string label;
+};
+/// VPN addresses first (Radmin 26.x, Hamachi 25.x, ZeroTier/Tailscale), then LAN.
+std::vector<LocalAddress> LocalAddresses();
+/// "26.1.2.3:24872", plus "#password" when the room has one.
+std::string InviteCode(const std::string& ip, u16 port, const std::string& password);
+/// Reads "address", "address:port" or "address:port#password" into c (port and password only
+/// when given). false when no address is in it.
+bool ParseInvite(const std::string& text, Config* c);
+
+/// Hosts joined before, newest first, as "address:port" (game_settings.ini [Multiplayer] recent).
+std::vector<std::string> RecentHosts();
+void ForgetHost(const std::string& host);
+
+bool AutoReconnect();
+void SetAutoReconnect(bool on);
+
+/// Called by the main loop a few times a second: reconnects after a dropped connection and
+/// notes members joining/leaving.
+void Tick();
 
 } // namespace Multiplayer

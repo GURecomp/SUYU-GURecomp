@@ -15,6 +15,7 @@
 #include <thread>
 
 #include <fmt/ostream.h>
+#include <SDL3/SDL.h>
 
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
@@ -48,6 +49,8 @@
 #include "input_common/main.h"
 #include "network/network.h"
 #include "sdl_config.h"
+#include "suyu_cmd/controls.h"
+#include "suyu_cmd/game_menu.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2_gl.h"
 #ifdef __APPLE__
@@ -415,8 +418,9 @@ int main(int argc, char** argv) {
         const std::filesystem::path user_root =
             std::filesystem::path(exe_w).parent_path() / L"user";
 #else
-        const std::filesystem::path user_root =
-            std::filesystem::path(argv[0]).parent_path() / "user";
+        // argv[0] is only the name the game was started by (a bare name when run from PATH or
+        // a desktop entry), so ask the kernel where the binary really is.
+        const std::filesystem::path user_root = FS::GetExeDirectory() / "user";
 #endif
         std::filesystem::create_directories(user_root);
         // SetSuyuPath (path_util.cpp) fails with "is not a directory" if the
@@ -446,7 +450,12 @@ int main(int argc, char** argv) {
         FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
         FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
         FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
+#ifdef _WIN32
         FS::SetSuyuPath(FS::SuyuPath::KeysDir, FS::GetAppDataRoamingDirectory() / "suyu" / "keys");
+#else
+        FS::SetSuyuPath(FS::SuyuPath::KeysDir,
+                        FS::GetDataDirectory("XDG_DATA_HOME") / "suyu" / "keys");
+#endif
     }
 #endif
 
@@ -795,7 +804,7 @@ int main(int argc, char** argv) {
         GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
         const auto exe_dir = std::filesystem::path(exe_w).parent_path();
 #else
-        const auto exe_dir = std::filesystem::path(argv[0]).parent_path();
+        const auto exe_dir = Common::FS::GetExeDirectory();
 #endif
         const auto local_mods = exe_dir / "mods";
         std::error_code ec;
@@ -807,6 +816,18 @@ int main(int argc, char** argv) {
         LOG_INFO(Frontend, "Keys directory (never bundled): {}",
                  Common::FS::GetSuyuPathString(Common::FS::SuyuPath::KeysDir));
     }
+
+#ifdef _WIN32
+    // RivaTuner's Vulkan overlay layer crashes while the renderer starts (access violation in
+    // RTSSVkLayer64.dll). Its opt-out variable must be set before Vulkan starts.
+    // game_settings.ini [Debug] rtss_overlay = true lets it load.
+    if (const std::string rtss = Core::GameSettings::Value("Debug", "rtss_overlay");
+        !(rtss == "true" || rtss == "1" || rtss == "yes" || rtss == "on")) {
+        SetEnvironmentVariableW(L"DISABLE_RTSS_LAYER", L"1");
+        LOG_INFO(Frontend, "RivaTuner Vulkan overlay kept out (game_settings.ini [Debug] "
+                           "rtss_overlay = true lets it load)");
+    }
+#endif
 
     LOG_INFO(Frontend, "suyu-cmd: Initializing system...");
     Core::System system{};
@@ -822,6 +843,14 @@ int main(int argc, char** argv) {
     if (!fullscreen && Core::GameSettings::StartFullscreen()) {
         fullscreen = true;
         LOG_INFO(Frontend, "Starting in fullscreen mode (game_settings.ini)");
+    }
+    // ... and handheld mode (1280x720 render) for weak PCs; docked is the default. Set both ways:
+    // sdl2-config.ini is saved at exit, so a handheld run would otherwise stick.
+    if (Core::GameSettings::StartHandheld()) {
+        Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+        LOG_INFO(Frontend, "Console mode: handheld (game_settings.ini)");
+    } else if (g_native_export_mode) {
+        Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
     }
 
     std::unique_ptr<EmuWindow_SDL2> emu_window;
@@ -841,6 +870,16 @@ int main(int argc, char** argv) {
         emu_window = std::make_unique<EmuWindow_SDL2_VK>(&input_subsystem, system, fullscreen);
         break;
     }
+    // Player 1's controls (who chose them; a connected pad is picked up in the event loop).
+    Controls::Init(system, &input_subsystem, &config);
+
+#ifndef _WIN32
+    // fps = auto and resolution = auto need the desktop's mode; SDL knows it now.
+    if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) {
+        Core::GameSettings::SetDesktopMode(static_cast<u32>(mode->w), static_cast<u32>(mode->h),
+                                           static_cast<u32>(mode->refresh_rate + 0.5f));
+    }
+#endif
 
 #ifdef _WIN32
     Common::Windows::SetCurrentTimerResolutionToMaximum();
@@ -1017,6 +1056,7 @@ int main(int argc, char** argv) {
     while (emu_window->IsOpen()) {
         emu_window->WaitEvent();
     }
+    GameMenu::Shutdown(); // before the game window (its parent) goes away
     system.DetachDebugger();
     void(system.Pause());
     Multiplayer::Leave();

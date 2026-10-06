@@ -380,6 +380,17 @@ fs::path GetDataDirectory(const std::string& env_name) {
     return {};
 }
 
+fs::path GetExeDirectory() {
+    std::error_code ec;
+    const auto exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec) {
+        LOG_ERROR(Common_Filesystem,
+                  "Failed to get the path to the executable of the current process");
+        return {};
+    }
+    return exe.parent_path();
+}
+
 #endif
 
 #ifdef __APPLE__

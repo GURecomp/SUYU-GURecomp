@@ -9,6 +9,7 @@
 #include "core/frontend/graphics_context.h"
 
 struct SDL_Window;
+union SDL_Event;
 
 namespace Core {
 class System;
@@ -48,6 +49,11 @@ public:
     void HideShaderProgress();
 
 protected:
+    /// One event from WaitEvent: the game menu, mods and the software keyboard see it first.
+    void HandleEvent(const SDL_Event& event);
+    /// After each wait: the game menu, multiplayer upkeep, the window title.
+    void PeriodicWork();
+
     /// Called by WaitEvent when a key is pressed or released.
     void OnKeyEvent(int key, u8 state);
 

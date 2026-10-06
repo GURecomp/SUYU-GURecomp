@@ -144,11 +144,11 @@ if (NOT ANDROID)
         if (NOT WIN32)
             # Yuzu itself needs: Atomic Audio Events Joystick Haptic Sensor Threads Timers
             # Since 2.0.18 Atomic+Threads required for HIDAPI/libusb (see https://github.com/libsdl-org/SDL/issues/5095)
-            # Yuzu-cmd also needs: Video (depends on Loadso/Dlopen)
+            # Yuzu-cmd also needs: Video (depends on Loadso/Dlopen), Render (the game menu window)
             # CPUinfo also required for SDL Audio, at least until 2.28.0 (see https://github.com/libsdl-org/SDL/issues/7809)
             set(SDL_UNUSED_SUBSYSTEMS
                 File Filesystem
-                Locale Power Render)
+                Locale Power)
             foreach(_SUB ${SDL_UNUSED_SUBSYSTEMS})
               string(TOUPPER ${_SUB} _OPT)
               set(SDL_${_OPT} OFF)
@@ -181,6 +181,19 @@ if (NOT ANDROID)
             message(FATAL_ERROR "SDL3 package found, but no usable SDL3 target was exported")
         endif()
     endif()
+
+    # Dear ImGui (MIT, 1.92.8): the exported game's menu window (suyu-cmd), drawn with
+    # SDL_Renderer in a window of its own.
+    add_library(imgui STATIC
+        imgui/imgui.cpp
+        imgui/imgui_draw.cpp
+        imgui/imgui_tables.cpp
+        imgui/imgui_widgets.cpp
+        imgui/backends/imgui_impl_sdl3.cpp
+        imgui/backends/imgui_impl_sdlrenderer3.cpp
+    )
+    target_include_directories(imgui PUBLIC imgui imgui/backends)
+    target_link_libraries(imgui PUBLIC SDL3::SDL3)
 endif()
 
 set(BUILD_SHARED_LIBS OFF)

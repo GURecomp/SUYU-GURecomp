@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <mutex>
@@ -537,6 +538,75 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
     return out;
 }
 
+namespace {
+
+// A mod file that logs its first read ("RomFS mod file read: <mod>/<path>"), so a log shows
+// which mod files the game actually used. Capped so a large texture pack can't flood the log.
+std::atomic<u32> g_mod_reads_logged{0};
+constexpr u32 kModReadLogLimit = 300;
+
+class ModReadLogFile final : public VfsFile {
+public:
+    ModReadLogFile(VirtualFile inner_, std::string label_)
+        : inner{std::move(inner_)}, label{std::move(label_)} {}
+
+    std::string GetName() const override {
+        return inner->GetName();
+    }
+    std::size_t GetSize() const override {
+        return inner->GetSize();
+    }
+    bool Resize(std::size_t) override {
+        return false;
+    }
+    VirtualDir GetContainingDirectory() const override {
+        return inner->GetContainingDirectory();
+    }
+    bool IsWritable() const override {
+        return false;
+    }
+    bool IsReadable() const override {
+        return inner->IsReadable();
+    }
+    std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        if (!logged.exchange(true)) {
+            const u32 n = g_mod_reads_logged.fetch_add(1);
+            if (n < kModReadLogLimit) {
+                LOG_INFO(Loader, "RomFS mod file read: {}", label);
+            } else if (n == kModReadLogLimit) {
+                LOG_INFO(Loader, "RomFS mod file read: (more mod files, not listed)");
+            }
+        }
+        return inner->Read(data, length, offset);
+    }
+    std::size_t Write(const u8*, std::size_t, std::size_t) override {
+        return 0;
+    }
+    bool Rename(std::string_view) override {
+        return false;
+    }
+
+private:
+    VirtualFile inner;
+    std::string label;
+    mutable std::atomic<bool> logged{};
+};
+
+VirtualDir WrapModDirForReadLog(const VirtualDir& dir, const std::string& label) {
+    std::vector<VirtualFile> files;
+    std::vector<VirtualDir> dirs;
+    for (const auto& file : dir->GetFiles()) {
+        files.push_back(std::make_shared<ModReadLogFile>(file, label + "/" + file->GetName()));
+    }
+    for (const auto& sub : dir->GetSubdirectories()) {
+        dirs.push_back(WrapModDirForReadLog(sub, label + "/" + sub->GetName()));
+    }
+    return std::make_shared<VectorVfsDirectory>(std::move(files), std::move(dirs),
+                                                dir->GetName());
+}
+
+} // namespace
+
 static void ApplyLayeredFS(VirtualFile& romfs, u64 title_id, ContentRecordType type,
                            const Service::FileSystem::FileSystemController& fs_controller) {
     const auto load_dir = fs_controller.GetModificationLoadRoot(title_id);
@@ -565,8 +635,13 @@ static void ApplyLayeredFS(VirtualFile& romfs, u64 title_id, ContentRecordType t
         }
 
         auto romfs_dir = FindSubdirectoryCaseless(subdir, "romfs");
-        if (romfs_dir != nullptr)
+        if (romfs_dir != nullptr) {
+            LOG_INFO(Loader, "    RomFS: mod '{}'", subdir->GetName());
+            if (type == ContentRecordType::Program) {
+                romfs_dir = WrapModDirForReadLog(romfs_dir, subdir->GetName());
+            }
             layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(romfs_dir)));
+        }
 
         // Support for romfslite introduced in Atmosphere 1.9.5
         auto romfslite_dir = FindSubdirectoryCaseless(subdir, "romfslite");
@@ -631,6 +706,12 @@ void RecordUnappliedUpdate(u64 title_id, u32 version) {
 std::vector<UnappliedUpdate> ConsumeUnappliedUpdates() {
     std::scoped_lock lk{unapplied_lock};
     return std::exchange(unapplied_updates, {});
+}
+
+VirtualFile PatchManager::ApplyLayeredFSOnly(VirtualFile base_romfs, ContentRecordType type) const {
+    auto romfs = std::move(base_romfs);
+    ApplyLayeredFS(romfs, title_id, type, fs_controller);
+    return romfs;
 }
 
 VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs,

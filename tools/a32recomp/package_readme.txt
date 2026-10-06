@@ -29,12 +29,20 @@ EXPORTING THE GAME
 
 PLAYING
 -------
+- Game menu: F10, or hold Minus + Plus (Back + Start) on the controller for a second.
+  Controls (controller, rebinding), Multiplayer, Settings (every game_settings.ini option)
+  and General (frame rate, folders). The game ignores input while the menu has focus.
+- The first controller connected is used automatically, unless you chose a setup yourself.
 - game_settings.ini (beside the exe, created on first start) holds every option, read
   at each start (no re-export needed): fps (30 = original, 60, 90, 120 or auto),
   resolution (auto = your desktop), aspect, fullscreen, draw distance, multiplayer...
-  Each option has a comment explaining it.
-- F11 or Alt+Enter: fullscreen. F12: panel with status, controller binding, mod folders
-  and multiplayer.
+  Each option has a comment explaining it. The menu's Settings tab edits the same file.
+- F11 or Alt+Enter: fullscreen. F12: the older developer panel.
+- RivaTuner's Vulkan overlay is kept out of the game (it crashes it at start). For FPS, set
+  [Display] show_fps = true or open the game menu.
+- Texture packs and other file mods (a romfs folder): put them in
+  mods\0100770008DD8000\<mod name>\romfs\..., as in suyu. Cheats and code patches
+  (pchtxt/IPS) don't apply to the recompiled game; use game_settings.ini instead.
 - On screens that aren't 16:9 the HUD is stretched unless you install the HudFix plugin
   for Forge PC (separate download; it goes in the export's mods\0100770008DD8000\ folder).
 
@@ -42,11 +50,12 @@ Full guide with troubleshooting: docs/a32recomp/INSTALL.md in the source reposit
 
 MULTIPLAYER (local play over a room, e.g. Radmin VPN)
 -----------------------------------------------------
-One player presses Host in the F12 panel (or sets [Multiplayer] mode = host in
-game_settings.ini); the others enter the host's address (their Radmin VPN IP) and
-press Join. Same port and password on both sides. Nicknames must be 4-20 characters
-(letters, digits, space, . _ -) and different for each player. "Save settings" makes it automatic
-at the next start. Then use the game's own local play (Gathering Hall).
+In the game menu's Multiplayer tab: one player presses Host, then Copy invite next to
+their Radmin VPN address and sends it; the others paste it under "Join a friend" and
+press Join. Nicknames must be 4-20 characters (letters, digits, space, . _ -) and
+different for each player. Addresses stay hidden until clicked. A dropped connection is
+retried for a minute. Start-up (or [Multiplayer] mode = host / join in game_settings.ini)
+connects at the next start. Then use the game's own local play (Gathering Hall).
 
 REPORTING
 ---------

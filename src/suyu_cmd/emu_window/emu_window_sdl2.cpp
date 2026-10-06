@@ -12,6 +12,7 @@ static constexpr Uint8 SDL_RELEASED = 0;
 #include "common/logging/log.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
+#include "core/arm/recomp/game_settings.h"
 #include "core/arm/recomp/mod_host.h"
 #include "core/core.h"
 #include "core/perf_stats.h"
@@ -22,7 +23,9 @@ static constexpr Uint8 SDL_RELEASED = 0;
 #include "input_common/main.h"
 #include "common/param_package.h"
 #include "common/settings_input.h"
+#include "suyu_cmd/controls.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2.h"
+#include "suyu_cmd/game_menu.h"
 #include "suyu_cmd/multiplayer.h"
 #include "suyu_cmd/sdl_software_keyboard.h"
 #include "suyu_cmd/suyu_icon.h"
@@ -208,14 +211,10 @@ void DevBindSelected(DevPanelState& st, bool clear) {
         return;
     }
     const bool is_analog = sel >= kButtonCount;
-    auto& player = Settings::values.players.GetValue()[0];
+    const auto index = static_cast<std::size_t>(is_analog ? sel - kButtonCount : sel);
 
     if (clear) {
-        if (is_analog) {
-            player.analogs[sel - kButtonCount].clear();
-        } else {
-            player.buttons[sel].clear();
-        }
+        Controls::SetBinding(is_analog, index, {});
         DevRefreshBinds(st);
         return;
     }
@@ -245,15 +244,7 @@ void DevBindSelected(DevPanelState& st, bool clear) {
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
-    if (is_analog) {
-        player.analogs[sel - kButtonCount] = captured.Serialize();
-    } else {
-        player.buttons[sel] = captured.Serialize();
-    }
-    player.connected = true;
-    if (st.system != nullptr) {
-        st.system->HIDCore().ReloadInputDevices();
-    }
+    Controls::SetBinding(is_analog, index, captured.Serialize());
     DevRefreshBinds(st);
 }
 
@@ -289,53 +280,13 @@ void DevApplyPadMapping(DevPanelState& st) {
         MessageBoxW(nullptr, L"No controller selected.", L"Controls", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    const auto& device = st.device_list[index];
-    // GetValue() hands back a reference to the live array, so the mappings are
-    // written straight into the setting.
-    auto& player = Settings::values.players.GetValue()[0];
-    for (const auto& [button, param] : st.input->GetButtonMappingForDevice(device)) {
-        player.buttons[button] = param.Serialize();
-    }
-    for (const auto& [analog, param] : st.input->GetAnalogMappingForDevice(device)) {
-        player.analogs[analog] = param.Serialize();
-    }
-    for (const auto& [motion, param] : st.input->GetMotionMappingForDevice(device)) {
-        player.motions[motion] = param.Serialize();
-    }
-    player.connected = true;
-    if (st.system != nullptr) {
-        st.system->HIDCore().ReloadInputDevices();
-    }
+    Controls::UseDevice(st.device_list[index], "player");
     MessageBoxW(nullptr, L"Controller mapped to Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
 
 void DevApplyKeyboardMapping(DevPanelState& st) {
-    // Same layout the emulator ships as its keyboard default.
-    static constexpr std::array<int, Settings::NativeButton::NumButtons> kButtons = {
-        SDL_SCANCODE_A, SDL_SCANCODE_S, SDL_SCANCODE_Z, SDL_SCANCODE_X,
-        SDL_SCANCODE_T, SDL_SCANCODE_G, SDL_SCANCODE_F, SDL_SCANCODE_H,
-        SDL_SCANCODE_Q, SDL_SCANCODE_W, SDL_SCANCODE_M, SDL_SCANCODE_N,
-        SDL_SCANCODE_1, SDL_SCANCODE_2, SDL_SCANCODE_B,
-    };
-    static constexpr std::array<std::array<int, 4>, Settings::NativeAnalog::NumAnalogs> kAnalogs{{
-        {SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT},
-        {SDL_SCANCODE_I, SDL_SCANCODE_K, SDL_SCANCODE_J, SDL_SCANCODE_L},
-    }};
-    // GetValue() hands back a reference to the live array, so the mappings are
-    // written straight into the setting.
-    auto& player = Settings::values.players.GetValue()[0];
-    for (std::size_t i = 0; i < kButtons.size() && i < player.buttons.size(); ++i) {
-        player.buttons[i] = InputCommon::GenerateKeyboardParam(kButtons[i]);
-    }
-    for (std::size_t i = 0; i < kAnalogs.size() && i < player.analogs.size(); ++i) {
-        player.analogs[i] = InputCommon::GenerateAnalogParamFromKeys(
-            kAnalogs[i][0], kAnalogs[i][1], kAnalogs[i][2], kAnalogs[i][3], 0, 0.5f);
-    }
-    player.connected = true;
-    if (st.system != nullptr) {
-        st.system->HIDCore().ReloadInputDevices();
-    }
+    Controls::UseDefaultKeyboard("player");
     MessageBoxW(nullptr, L"Keyboard controls restored for Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
@@ -886,22 +837,28 @@ void EmuWindow_SDL2::WaitEvent() {
         }
     }
 
-    if (!SDL_WaitEvent(&event)) {
-        const char* error = SDL_GetError();
-        if (!error || strcmp(error, "") == 0) {
-            // https://github.com/libsdl-org/SDL/issues/5780
-            // Sometimes SDL will return without actually having hit an error condition;
-            // just ignore it in this case.
-            return;
-        }
-
-        LOG_CRITICAL(Frontend, "SDL_WaitEvent failed: {}", error);
-        exit(1);
+    // The game menu (its own window) is set up once the game window exists.
+    static bool menu_ready = false;
+    if (!menu_ready) {
+        menu_ready = true;
+        GameMenu::Init(system, input_subsystem, render_window);
     }
 
-    // Input a mod's menu consumed doesn't reach the game (0 matches no case).
-    // Then the game's software keyboard: while it wants text, typing goes to it.
-    const bool consumed_by_mods = ForwardToMods(event) || SdlKeyboard::HandleEvent(event);
+    // Waits with a timeout so the menu can draw, the controller combo is watched and dropped
+    // multiplayer connections are retried while nothing else happens.
+    const bool has_event = SDL_WaitEventTimeout(&event, GameMenu::WaitTimeoutMs());
+    if (has_event) {
+        HandleEvent(event);
+    }
+    PeriodicWork();
+}
+
+void EmuWindow_SDL2::HandleEvent(const SDL_Event& event) {
+    // The menu first (its key, its window's events), then a mod's menu (input it consumed
+    // doesn't reach the game; 0 matches no case), then the game's software keyboard: while
+    // it wants text, typing goes to it.
+    const bool consumed_by_mods = GameMenu::HandleEvent(event) || ForwardToMods(event) ||
+                                  SdlKeyboard::HandleEvent(event);
     switch (consumed_by_mods ? 0u : event.type) {
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
     case SDL_EVENT_WINDOW_RESIZED:
@@ -965,8 +922,26 @@ void EmuWindow_SDL2::WaitEvent() {
     case SDL_EVENT_QUIT:
         is_open = false;
         break;
+    case SDL_EVENT_JOYSTICK_ADDED:
+        // A controller connected (also each one present at start): Player 1 takes it when
+        // nobody chose the controls (Controls::OnDeviceAdded has the rules).
+        if (const std::string mapped = Controls::OnDeviceAdded(); !mapped.empty()) {
+            GameMenu::Notify("Controller connected: " + mapped + " (Player 1)");
+            last_time = 0; // show it in the title now
+        }
+        break;
     default:
         break;
+    }
+}
+
+void EmuWindow_SDL2::PeriodicWork() {
+    GameMenu::Update();
+    const u64 now_ms = SDL_GetTicks();
+    static u64 last_tick = 0;
+    if (now_ms - last_tick >= 200) {
+        last_tick = now_ms;
+        Multiplayer::Tick();
     }
 
     // While the game waits for typed text, the title shows it (the game draws no keyboard).
@@ -980,14 +955,25 @@ void EmuWindow_SDL2::WaitEvent() {
     }
 
     const u64 current_time = SDL_GetTicks();
-    if (!title_typing && current_time > last_time + 2000) {
-        const auto results = system.GetAndResetPerfStats();
+    if (!title_typing && current_time > last_time + 1000) {
         std::string game_name;
         [[maybe_unused]] auto _ = system.GetGameName(game_name);
+        // One measurement a second, shared by the title and the game menu.
+        const auto results = system.GetAndResetPerfStats();
+        GameMenu::SetFrameRate(results.average_game_fps);
         if (g_native_export_mode) {
-            // Standalone game export: plain game title, no emulator branding.
+            // Standalone game export: plain game title, no emulator branding; plus the frame
+            // rate (game_settings.ini [Display] show_fps) and a short note (online status, a
+            // controller that was just mapped).
+            std::string title = game_name;
+            if (Core::GameSettings::ShowFps()) {
+                title += fmt::format("  -  {:.0f} FPS", results.average_game_fps);
+            }
+            if (const std::string note = GameMenu::TitleNote(); !note.empty()) {
+                title += "  -  " + note;
+            }
             if (!game_name.empty()) {
-                SDL_SetWindowTitle(render_window, game_name.c_str());
+                SDL_SetWindowTitle(render_window, title.c_str());
             }
         } else {
             const auto title =
@@ -1105,6 +1091,16 @@ void EmuWindow_SDL2::SetWindowIcon() {
         }
         LOG_WARNING(Frontend, "Native export: failed to load game icon from exe resources, "
                                "falling back to suyu icon.");
+    }
+#else
+    // Linux exports carry the game's icon as icon.bmp beside the binary (ELF has no resources).
+    if (g_native_export_mode) {
+        const auto bmp = Common::FS::GetExeDirectory() / "icon.bmp";
+        if (SDL_Surface* const icon_surface = SDL_LoadBMP(bmp.string().c_str())) {
+            SDL_SetWindowIcon(render_window, icon_surface);
+            SDL_DestroySurface(icon_surface);
+            return;
+        }
     }
 #endif
     SDL_IOStream* const suyu_icon_stream = SDL_IOFromConstMem((void*)suyu_icon, suyu_icon_size);

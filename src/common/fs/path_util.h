@@ -322,6 +322,12 @@ void SetSuyuPath(SuyuPath eden_path, const Path& new_path) {
  */
 [[nodiscard]] std::filesystem::path GetDataDirectory(const std::string& env_name);
 
+/**
+ * Gets the path of the directory containing the executable of the current process
+ * (/proc/self/exe; empty when it can't be read).
+ */
+[[nodiscard]] std::filesystem::path GetExeDirectory();
+
 #endif
 
 #ifdef __APPLE__

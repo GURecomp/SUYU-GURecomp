@@ -22,6 +22,10 @@ if (SUYU_CMD OR YUZU_CMD)
         emu_window/emu_window_sdl2_null.h
         emu_window/emu_window_sdl2_vk.cpp
         emu_window/emu_window_sdl2_vk.h
+        controls.cpp
+        controls.h
+        game_menu.cpp
+        game_menu.h
         multiplayer.cpp
         multiplayer.h
         sdl_software_keyboard.cpp
@@ -130,7 +134,7 @@ if (SUYU_CMD OR YUZU_CMD)
 
         target_include_directories(${_t} PRIVATE ${RESOURCES_DIR})
 
-        target_link_libraries(${_t} PRIVATE SDL3::SDL3 Vulkan::Headers VulkanMemoryAllocator)
+        target_link_libraries(${_t} PRIVATE SDL3::SDL3 Vulkan::Headers VulkanMemoryAllocator imgui)
         # FFmpeg headers are not transitively exposed by core; add them explicitly
         target_include_directories(${_t} PRIVATE ${FFmpeg_INCLUDE_DIR})
 

@@ -1,4 +1,6 @@
-# Building suyu (A32 recompiler) from source on Windows
+# Building suyu (A32 recompiler) from source
+
+Windows is sections 1-5; Linux is [section 6](#6-linux).
 
 This builds `suyu.exe` (the Qt frontend with **File → Export Game...**) and `suyu-cmd.exe` from
 this repository. Players don't need this: the prebuilt release and
@@ -84,6 +86,46 @@ it with the kit.
    export log must say `Built single-file launcher with the link kit`.
 
 Then follow [RELEASE.md](RELEASE.md).
+
+## 6. Linux
+
+Tested on Ubuntu 24.04 with gcc 13; any distribution with gcc 12+ or clang 16+, CMake 3.22+ and
+Ninja works. Install the tools (Ubuntu/Debian names; the Qt frontend uses the Qt that the build
+downloads, so no Qt packages are needed):
+
+```bash
+sudo apt install build-essential git cmake ninja-build python3 pkg-config glslang-tools   libgl-dev libx11-dev libxext-dev libxrandr-dev libxkbcommon-dev libxkbcommon-x11-dev   libxcb-cursor0 libwayland-dev libasound2-dev libpulse-dev libudev-dev libdbus-1-dev   libfontconfig1-dev libfreetype-dev
+```
+
+Build:
+
+```bash
+git clone <this repository's URL> ~/suyu-src && cd ~/suyu-src
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_TESTS=OFF   -DYUZU_USE_BUNDLED_QT=ON
+cmake --build build --target suyu suyu-cmd
+./build/bin/suyu
+```
+
+As on Windows, a suyu run from its build tree exports through that tree (section 4); the
+game's modules are compiled with the system's `cc`, the launcher is linked in the tree.
+
+**Release package**: from a tree at a neutral path (not under `/home`), on the oldest
+distribution the release should support (Ubuntu 22.04 with gcc 13 from the
+`ubuntu-toolchain-r/test` PPA gives glibc 2.35):
+
+```bash
+tools/a32recomp/build_release_package.sh 0.2.0 <your name> <your user name>
+```
+
+It builds with libstdc++ linked statically (the kit carries the matching `libstdc++.a`, so a
+player's older compiler doesn't matter), makes the Linux link kit (`link.rsp` holds
+compiler-driver arguments; system libraries are linked by their runtime name, e.g.
+`-l:libz.so.1`, so players need no `-dev` packages; suyu's own shared libraries are copied into
+`link_kit/lib` and shipped beside each exported game), copies suyu with its Qt libraries and
+plugins (`lib/`, `plugins/`, `qt.conf`), scans it for personal data like the Windows script,
+and writes `publish/suyu-mhgu-<version>-linux-x64.tar.xz`. Test it like the zip: export into
+an empty folder with the packaged `./suyu`; the log must say
+`Built single-file launcher with the link kit`.
 
 ## Layout of the recompiler code
 

@@ -6,6 +6,7 @@
 
 # TODO(crueter, MaranBr): Externals FFmpeg 8.0
 
+option(FFmpeg_HWACCEL "Hardware video decoding (VA-API, VDPAU, CUDA) where available" ON)
 set(FFmpeg_HWACCEL_LIBRARIES)
 set(FFmpeg_HWACCEL_FLAGS)
 set(FFmpeg_HWACCEL_INCLUDE_DIRS)
@@ -34,8 +35,8 @@ if (NOT YUZU_USE_BUNDLED_FFMPEG)
     # User attempts to do a FFmpeg cross compilation because...
     # Here we just quickly test against host/system processors not matching
     # TODO: Test for versions not matching as well?
-    elseif (NOT (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES CMAKE_SYSTEM_PROCESSOR
-    AND CMAKE_HOST_SYSTEM_NAME MATCHES CMAKE_SYSTEM_NAME))
+    elseif (NOT ("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "${CMAKE_SYSTEM_PROCESSOR}"
+    AND "${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "${CMAKE_SYSTEM_NAME}"))
         string(TOLOWER "${CMAKE_SYSTEM_NAME}" FFmpeg_SYSTEM_NAME)
         if (FFmpeg_SYSTEM_NAME STREQUAL "openorbis" OR FFmpeg_SYSTEM_NAME STREQUAL "managarm")
             set(FFmpeg_SYSTEM_NAME "none")
@@ -64,7 +65,12 @@ elseif (ANDROID)
         --enable-mediacodec
         --enable-jni
     )
-elseif (UNIX AND NOT DEFINED FFmpeg_IS_CROSS_COMPILING AND NOT ANDROID)
+elseif (UNIX AND NOT ANDROID AND (DEFINED FFmpeg_IS_CROSS_COMPILING OR NOT FFmpeg_HWACCEL))
+    # Software decoding only: a portable build shouldn't need the player's VA-API/VDPAU
+    # libraries, and a cross build can't probe them.
+    # --disable-autodetect: no libdrm/xlib/vaapi/... picked up behind our back either.
+    list(APPEND FFmpeg_HWACCEL_FLAGS --disable-autodetect --disable-vaapi --disable-vdpau)
+elseif (UNIX AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBVA libva)
     pkg_check_modules(CUDA cuda)
@@ -274,7 +280,7 @@ else()
                 --enable-pic
                 --cc=${FFmpeg_CC}
                 --cxx=${FFmpeg_CXX}
-                --ld=${CMAKE_LINKER}
+                --ld=${FFmpeg_CC}
                 --extra-cflags=${CMAKE_C_FLAGS}
                 --extra-cxxflags=${CMAKE_CXX_FLAGS}
                 --extra-ldflags=${CMAKE_C_LINK_FLAGS}
@@ -305,11 +311,15 @@ else()
         set(FFmpeg_MAKE_ARGS "")
     endif()
 
+    # GNU make: "gmake" on the BSDs, plain "make" on most Linux distributions.
+    find_program(FFmpeg_GNU_MAKE NAMES gmake make REQUIRED)
     add_custom_command(
         OUTPUT
             ${FFmpeg_BUILD_LIBRARIES}
         COMMAND
-            gmake ${FFmpeg_MAKE_ARGS}
+            ${FFmpeg_GNU_MAKE} ${FFmpeg_MAKE_ARGS}
+        DEPENDS
+            ${FFmpeg_MAKEFILE}
         WORKING_DIRECTORY
             ${FFmpeg_BUILD_DIR}
     )

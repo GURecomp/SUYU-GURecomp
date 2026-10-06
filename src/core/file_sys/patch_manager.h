@@ -111,6 +111,12 @@ public:
                                          VirtualFile packed_update_raw = nullptr,
                                          bool apply_layeredfs = true) const;
 
+    // Only the LayeredFS part of PatchRomFS (romfs/ folders of the mods in the load directory),
+    // for a RomFS that already carries its update, such as a recompiled export's romfs.bin.
+    // Returns base_romfs unchanged when no mod applies.
+    [[nodiscard]] VirtualFile ApplyLayeredFSOnly(VirtualFile base_romfs,
+                                                 ContentRecordType type = ContentRecordType::Program) const;
+
     // Returns a vector of patches
     [[nodiscard]] std::vector<Patch> GetPatches(VirtualFile update_raw = nullptr) const;
 

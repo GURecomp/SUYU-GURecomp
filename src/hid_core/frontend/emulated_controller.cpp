@@ -27,6 +27,22 @@ constexpr Common::UUID VIRTUAL_UUID =
 
 EmulatedController::EmulatedController(NpadIdType npad_id_type_) : npad_id_type(npad_id_type_) {}
 
+namespace {
+std::atomic<u32> g_input_blockers{0};
+} // namespace
+
+void EmulatedController::SetInputBlocked(InputBlocker blocker, bool blocked) {
+    if (blocked) {
+        g_input_blockers.fetch_or(blocker);
+    } else {
+        g_input_blockers.fetch_and(~static_cast<u32>(blocker));
+    }
+}
+
+bool EmulatedController::IsInputBlocked() {
+    return g_input_blockers.load(std::memory_order_relaxed) != 0;
+}
+
 EmulatedController::~EmulatedController() = default;
 
 NpadStyleIndex EmulatedController::MapSettingsTypeToNPad(Settings::ControllerType type) {
@@ -1807,37 +1823,37 @@ RingAnalogValue EmulatedController::GetRingSensorValues() const {
 }
 
 HomeButtonState EmulatedController::GetHomeButtons() const {
-    if (is_configuring)
+    if (is_configuring || IsInputBlocked())
         return {};
     return controller.home_button_state;
 }
 
 CaptureButtonState EmulatedController::GetCaptureButtons() const {
-    if (is_configuring)
+    if (is_configuring || IsInputBlocked())
         return {};
     return controller.capture_button_state;
 }
 
 NpadButtonState EmulatedController::GetNpadButtons() const {
-    if (is_configuring)
+    if (is_configuring || IsInputBlocked())
         return {};
     return {controller.npad_button_state.raw & GetTurboButtonMask()};
 }
 
 DebugPadButton EmulatedController::GetDebugPadButtons() const {
-    if (is_configuring)
+    if (is_configuring || IsInputBlocked())
         return {};
     return controller.debug_pad_button_state;
 }
 
 AnalogSticks EmulatedController::GetSticks() const {
-    if (is_configuring)
+    if (is_configuring || IsInputBlocked())
         return {};
     return controller.analog_stick_state;
 }
 
 NpadGcTriggerState EmulatedController::GetTriggers() const {
-    if (is_configuring)
+    if (is_configuring || IsInputBlocked())
         return {};
     return controller.gc_trigger_state;
 }

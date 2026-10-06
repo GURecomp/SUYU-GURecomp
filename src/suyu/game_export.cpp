@@ -29,6 +29,9 @@
 #include <QThread>
 #include <QVBoxLayout>
 
+#include <SimpleIni.h>
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -41,6 +44,9 @@
 #endif
 
 #include "common/assert.h"
+#include "common/param_package.h"
+#include "common/settings.h"
+#include "common/settings_input.h"
 #include "common/logging/log.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -275,6 +281,81 @@ static bool CopyPortableSupportData(quint64 program_id, const QString& package_r
 }
 
 // ---------------------------------------------------------------------------
+// Controller setup
+// ---------------------------------------------------------------------------
+
+/// Player 1's controller bindings in suyu's own setup (keyboard and mouse ones aren't
+/// portable: suyu stores Qt key codes, the exported game reads SDL scancodes).
+static std::vector<std::pair<std::string, std::string>> SuyuControllerBindings() {
+    std::vector<std::pair<std::string, std::string>> out;
+    const auto& player = Settings::values.players.GetValue()[0];
+    const auto is_controller = [](const std::string& param) {
+        const std::string engine = Common::ParamPackage{param}.Get("engine", "");
+        return !engine.empty() && engine != "keyboard" && engine != "mouse" &&
+               engine != "analog_from_button" && engine != "touch_from_button";
+    };
+    for (std::size_t i = 0; i < Settings::NativeButton::NumButtons; ++i) {
+        if (is_controller(player.buttons[i])) {
+            out.emplace_back(std::string("player_0_") + Settings::NativeButton::mapping[i],
+                             player.buttons[i]);
+        }
+    }
+    for (std::size_t i = 0; i < Settings::NativeAnalog::NumAnalogs; ++i) {
+        if (is_controller(player.analogs[i])) {
+            out.emplace_back(std::string("player_0_") + Settings::NativeAnalog::mapping[i],
+                             player.analogs[i]);
+        }
+    }
+    for (std::size_t i = 0; i < Settings::NativeMotion::NumMotions; ++i) {
+        if (is_controller(player.motions[i])) {
+            out.emplace_back(std::string("player_0_") + Settings::NativeMotion::mapping[i],
+                             player.motions[i]);
+        }
+    }
+    return out;
+}
+
+/// Writes suyu's Player 1 controller bindings into the export's user/config/sdl2-config.ini
+/// and marks them controls_set_by = suyu, unless the player chose controls in the game
+/// (controls_set_by = player), which are kept. Returns what happened, for the log.
+static std::string CopyControllerSetup(const QString& package_root) {
+    const auto bindings = SuyuControllerBindings();
+    if (bindings.empty()) {
+        return "Player 1 uses the keyboard in suyu: nothing copied (the game picks up a "
+               "connected controller by itself)";
+    }
+    const QString dir = package_root + QStringLiteral("/user/config");
+    const QString path = dir + QStringLiteral("/sdl2-config.ini");
+    CSimpleIniA ini;
+    ini.SetUnicode(true);
+    ini.SetSpaces(false);
+    if (QFile in(path); in.open(QIODevice::ReadOnly)) {
+        const QByteArray data = in.readAll();
+        ini.LoadData(data.constData(), static_cast<size_t>(data.size()));
+    }
+    if (std::string(ini.GetValue("Controls", "controls_set_by", "")) == "player") {
+        return "kept the controls the player chose in the game";
+    }
+    for (const auto& [key, value] : bindings) {
+        // Same shape the game's own config writes: a "\default" flag, then the quoted value.
+        ini.SetValue("Controls", (key + "\\default").c_str(), "false");
+        ini.SetValue("Controls", key.c_str(), ("\"" + value + "\"").c_str());
+    }
+    ini.SetValue("Controls", "controls_set_by", "suyu");
+    std::string text;
+    if (ini.Save(text) < 0 || !QDir().mkpath(dir)) {
+        return "couldn't write " + path.toStdString();
+    }
+    QFile out(path);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+        out.write(text.data(), static_cast<qint64>(text.size())) !=
+            static_cast<qint64>(text.size())) {
+        return "couldn't write " + path.toStdString();
+    }
+    return fmt::format("copied {} controller bindings for Player 1", bindings.size());
+}
+
+// ---------------------------------------------------------------------------
 // Dialog setup
 // ---------------------------------------------------------------------------
 
@@ -320,9 +401,13 @@ void GameExportDialog::SetupUi() {
     auto* plat_row = new QHBoxLayout();
     plat_row->addWidget(new QLabel(tr("Target:"), this));
     platform_combo = new QComboBox(this);
-    platform_combo->addItem(tr("Windows artifact bundle"), static_cast<int>(TargetPlatform::Windows));
-    platform_combo->addItem(tr("Linux artifact bundle"), static_cast<int>(TargetPlatform::Linux));
+    platform_combo->addItem(tr("Windows"), static_cast<int>(TargetPlatform::Windows));
+    platform_combo->addItem(tr("Linux"), static_cast<int>(TargetPlatform::Linux));
     platform_combo->addItem(tr("macOS artifact bundle"), static_cast<int>(TargetPlatform::MacOS));
+    platform_combo->setToolTip(
+        tr("The system the exported game runs on. The Build format compiles with this "
+           "computer's own C compiler, so it can only make a game for the system suyu is "
+           "running on; Source exports can target any of them."));
 #ifdef _WIN32
     platform_combo->setCurrentIndex(0);
 #elif defined(__APPLE__)
@@ -382,12 +467,11 @@ void GameExportDialog::SetupUi() {
 
     // Source vs Build is a real, explicit choice rather than an easily-missed
     // checkbox, because the two produce completely different deliverables and
-    // "I picked build and got a folder of C" was the reported complaint. Source
-    // stays the default: a large title lifts to gigabytes of C - Smash
-    // Ultimate's main module alone is ~3 GB across 139 translation units - and
-    // compiling that is hours of C-compiler work, so it must be asked for, not
-    // stumbled into. When Build IS chosen the export compiles all the way to a
-    // binary and fails loudly if it cannot, instead of silently degrading.
+    // "I picked build and got a folder of C" was the reported complaint. Build is
+    // the default: players export to get a game they can start, and the 32-bit
+    // titles this fork targets compile in minutes. When Build is chosen the export
+    // compiles all the way to a binary and fails loudly if it cannot, instead of
+    // silently degrading.
     auto* format_row = new QHBoxLayout();
     format_row->addWidget(new QLabel(tr("Export Format:"), this));
     output_format_combo = new QComboBox(this);
@@ -401,7 +485,7 @@ void GameExportDialog::SetupUi() {
            "'recompiled' executable and the shared library suyu loads to run the game on its own "
            "recompiler. Build can take hours on large titles; the window stays responsive while "
            "it works."));
-    output_format_combo->setCurrentIndex(0);
+    output_format_combo->setCurrentIndex(1);
     format_row->addWidget(output_format_combo, 1);
     layout->addLayout(format_row);
 
@@ -418,14 +502,23 @@ void GameExportDialog::SetupUi() {
     layout->addWidget(include_custom_config_checkbox);
 
     decompress_archives_checkbox =
-        new QCheckBox(tr("Decompress game archives (experimental: faster loading, larger export)"), this);
-    decompress_archives_checkbox->setChecked(false);
+        new QCheckBox(tr("Decompress game archives (faster loading, larger export)"), this);
+    decompress_archives_checkbox->setChecked(true);
     decompress_archives_checkbox->setToolTip(
         tr("Stores the game's MT Framework archives (.arc) unpacked in the exported game files, so "
            "decompressing them while loading is a plain copy. The export grows by the unpacked size "
-           "and takes longer the first time. Experimental: turn it off again if the game fails "
-           "to load."));
+           "(about 10 GB more for Monster Hunter Generations Ultimate) and takes longer the first "
+           "time. Untick it if disk space is tight."));
     layout->addWidget(decompress_archives_checkbox);
+
+    copy_controls_checkbox =
+        new QCheckBox(tr("Use my suyu controller setup for Player 1"), this);
+    copy_controls_checkbox->setChecked(true);
+    copy_controls_checkbox->setToolTip(
+        tr("Copies the controller Player 1 uses in suyu (Emulation > Configure > Controls) into "
+           "the game. Controls a player changed in the game itself are kept. Without a "
+           "controller set up here, the game uses the first controller it finds."));
+    layout->addWidget(copy_controls_checkbox);
 
     auto* note_label = new QLabel(
           tr("Translates the game's ARM64 code into C. Output mirrors the ROM structure: "
@@ -1631,6 +1724,96 @@ static QString LinkWithKit(const QString& kit_dir, const QString& recomp_root,
 }
 #endif
 
+/// The C and C++ compiler drivers for builds on Linux: $CC / $CXX when set, else the first of
+/// cc, gcc, clang (c++, g++, clang++) on PATH. Empty when there is none.
+#ifdef __linux__
+static QString FindUnixCompiler(bool cxx) {
+    const QString env = QString::fromLocal8Bit(qgetenv(cxx ? "CXX" : "CC")).trimmed();
+    if (!env.isEmpty()) {
+        const QString found = QStandardPaths::findExecutable(env);
+        return found.isEmpty() && QFile::exists(env) ? env : found;
+    }
+    const QStringList names = cxx ? QStringList{QStringLiteral("c++"), QStringLiteral("g++"),
+                                                QStringLiteral("clang++")}
+                                  : QStringList{QStringLiteral("cc"), QStringLiteral("gcc"),
+                                                QStringLiteral("clang")};
+    for (const auto& name : names) {
+        const QString found = QStandardPaths::findExecutable(name);
+        if (!found.isEmpty()) {
+            return found;
+        }
+    }
+    return {};
+}
+
+// Linux version of the link kit: <app dir>/link_kit holds suyu-cmd's objects (obj/*.o) and
+// libraries (lib/*.a, lib/*.so*), and link.rsp the compiler-driver arguments that link them,
+// relative to the kit (made by tools/a32recomp/make_link_kit.py from a Linux build). The game's
+// registration table is compiled with the system C compiler and everything is linked with the
+// C++ driver, so only a compiler (gcc or clang) has to be installed. Returns the linked binary,
+// or empty on failure (*log gets the tool output).
+static QString LinkWithKit(const QString& kit_dir, const QString& recomp_root,
+                           const QStringList& modules, const QString& out_dir, QString* log) {
+    const QString cc = FindUnixCompiler(false);
+    const QString cxx = FindUnixCompiler(true);
+    if (cc.isEmpty() || cxx.isEmpty()) {
+        *log = QStringLiteral("no C/C++ compiler found (install gcc and g++, or clang)");
+        return {};
+    }
+    QDir().mkpath(out_dir);
+    const QString reg_obj = out_dir + QStringLiteral("/recomp_registration.o");
+    QProcess ccp;
+    QString cc_log;
+    if (RunProcessDrained(ccp, cc,
+                          {QStringLiteral("-c"), QStringLiteral("-O2"),
+                           recomp_root + QStringLiteral("/recomp_registration.c"),
+                           QStringLiteral("-o"), reg_obj},
+                          &cc_log) != 0) {
+        *log = QStringLiteral("the C compiler failed on recomp_registration.c:\n") + cc_log;
+        return {};
+    }
+    // GNU ld resolves archives in command-line order; the game's modules call into suyu's
+    // libraries and a32_runtime_shared (the A32 runtime every module build makes an identical
+    // copy of; one copy is linked), so the whole set is one group that may refer both ways.
+    QStringList args{reg_obj, QStringLiteral("-Wl,--start-group")};
+    QString runtime_lib;
+    for (const auto& m : modules) {
+        const QString want = QStringLiteral("librecomp_static_") + m + QStringLiteral(".a");
+        QDirIterator it(recomp_root + QDir::separator() + m, {want}, QDir::Files,
+                        QDirIterator::Subdirectories);
+        if (!it.hasNext()) {
+            *log = QStringLiteral("module library not found: ") + want;
+            return {};
+        }
+        const QString lib = it.next();
+        args.append(lib);
+        const QString runtime =
+            QFileInfo(lib).absolutePath() + QStringLiteral("/liba32_runtime_shared.a");
+        if (runtime_lib.isEmpty() && QFile::exists(runtime)) {
+            runtime_lib = runtime;
+        }
+    }
+    if (!runtime_lib.isEmpty()) {
+        args.append(runtime_lib);
+    }
+    args.append(QStringLiteral("@link.rsp"));
+    args.append(QStringLiteral("-Wl,--end-group"));
+    // Shared libraries the package ships (bundled FFmpeg, OpenSSL ...) sit in lib/ beside the
+    // game binary.
+    args.append(QStringLiteral("-Wl,-rpath,$ORIGIN/lib"));
+    const QString exe = out_dir + QStringLiteral("/static_launcher");
+    QFile::remove(exe);
+    args.append(QStringLiteral("-o"));
+    args.append(exe);
+    QProcess link;
+    link.setWorkingDirectory(kit_dir); // link.rsp paths are relative to the kit
+    if (RunProcessDrained(link, cxx, args, log) != 0 || !QFile::exists(exe)) {
+        return {};
+    }
+    return exe;
+}
+#endif
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -2011,6 +2194,29 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         build_env = VsDeveloperEnvironment();
         LOG_INFO(Frontend, "Build export: compiler environment from {}",
                  FindVcVars64().toStdString());
+    }
+#elif defined(__linux__)
+    if (WantsCompiledOutput()) {
+        const QString cc = FindUnixCompiler(false);
+        const QString cxx = FindUnixCompiler(true);
+        const QString cmake = FindBestCmakeExecutable();
+        if (cc.isEmpty() || cxx.isEmpty() || cmake.isEmpty()) {
+            LOG_ERROR(Frontend, "Build export: missing build tools (C compiler '{}', C++ compiler "
+                                "'{}', cmake '{}')",
+                      cc.toStdString(), cxx.toStdString(), cmake.toStdString());
+            QMessageBox::critical(
+                this, tr("Export Failed"),
+                tr("The build tools were not found, so the game's code can't be compiled.\n\n"
+                   "Install a C/C++ compiler, CMake and Ninja with your package manager, then "
+                   "export again:\n"
+                   "  Debian/Ubuntu/Mint: sudo apt install build-essential cmake ninja-build\n"
+                   "  Fedora: sudo dnf install gcc gcc-c++ cmake ninja-build\n"
+                   "  Arch/SteamOS: sudo pacman -S base-devel cmake ninja\n\n"
+                   "The install guide (docs/a32recomp/INSTALL.md) has the steps."));
+            return {};
+        }
+        LOG_INFO(Frontend, "Build export: compilers {} / {}", cc.toStdString(),
+                 cxx.toStdString());
     }
 #endif
     const QString build_ninja = QStandardPaths::findExecutable(
@@ -2413,7 +2619,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         const QString kit_dir =
             QCoreApplication::applicationDirPath() + QStringLiteral("/link_kit");
         const bool no_tree = build_tree.isEmpty() || source_tree.isEmpty() || cmake.isEmpty();
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
         if (no_tree && QFile::exists(kit_dir + QStringLiteral("/link.rsp"))) {
             status_label->setText(tr("Linking the single-file executable..."));
             QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
@@ -2563,8 +2769,13 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     const QString dst_dir = cache_dir + QDir::separator() +
                                             QStringLiteral("launcher");
                     QDir().mkpath(dst_dir);
+#ifdef _WIN32
                     const QString dst =
                         dst_dir + QDir::separator() + QStringLiteral("static_launcher.exe");
+#else
+                    const QString dst =
+                        dst_dir + QDir::separator() + QStringLiteral("static_launcher");
+#endif
                     QFile::remove(dst);
                     if (QFile::copy(c, dst)) {
                         LOG_INFO(Frontend, "Built single-file launcher from {}", c.toStdString());
@@ -2726,15 +2937,12 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
 static QString AotCacheDirFor(const QString& output_dir, const QString& game_name,
                               GameExportDialog::TargetPlatform platform) {
     switch (platform) {
-    case GameExportDialog::TargetPlatform::Linux:
-        return output_dir + QDir::separator() + game_name + QStringLiteral(".AppDir") +
-               QDir::separator() + QStringLiteral("usr/bin") + QDir::separator() +
-               QStringLiteral("aot_cache");
     case GameExportDialog::TargetPlatform::MacOS:
         return output_dir + QDir::separator() + game_name + QStringLiteral(".app") +
                QDir::separator() + QStringLiteral("Contents") + QDir::separator() +
                QStringLiteral("Resources") + QDir::separator() + QStringLiteral("aot_cache");
     case GameExportDialog::TargetPlatform::Windows:
+    case GameExportDialog::TargetPlatform::Linux:
     default:
         return output_dir + QDir::separator() + game_name + QDir::separator() +
                QStringLiteral("aot_cache");
@@ -2763,7 +2971,12 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
     };
 
     switch (platform) {
-    case TargetPlatform::Windows: {
+    case TargetPlatform::Windows:
+    case TargetPlatform::Linux: {
+        // Both are the same plain folder: the game binary, exefs/, user/, mods/. Linux binaries
+        // have no extension and keep their shared libraries in lib/ (found through the rpath).
+        const bool linux_pkg = platform == TargetPlatform::Linux;
+        const QString exe_suffix = linux_pkg ? QString() : QStringLiteral(".exe");
         const QString pkg_dir = output_dir + QDir::separator() + game_name;
         if (!QDir().mkpath(pkg_dir)) {
             return false;
@@ -2777,7 +2990,8 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // format switch on the same output folder doesn't leave orphaned
         // binaries next to freshly generated C source.
         if (!WantsCompiledOutput()) {
-            QFile::remove(pkg_dir + QDir::separator() + game_name + QStringLiteral(".exe"));
+            QFile::remove(pkg_dir + QDir::separator() + game_name + exe_suffix);
+            QDir(pkg_dir + QStringLiteral("/lib")).removeRecursively();
             for (const char* dll : {"avcodec-61.dll", "avformat-61.dll", "avutil-59.dll",
                                      "dxcompiler.dll", "dxil.dll", "libcrypto.dll", "libssl.dll",
                                      "swresample-5.dll", "swscale-8.dll"}) {
@@ -2865,16 +3079,18 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
                 // rebuilt from this game's own shader package into the package's shader
                 // cache, so they are built at boot instead of the first time they're drawn.
                 if (rom_program_id != 0) {
+                    // Only the title ID is upper case (the folder path keeps its case: Linux).
                     const QString pmf = QCoreApplication::applicationDirPath() +
                                         QStringLiteral("/pipelines/%1.pmf")
-                                            .arg(rom_program_id, 16, 16, QLatin1Char('0'))
-                                            .toUpper()
-                                            .replace(QStringLiteral(".PMF"), QStringLiteral(".pmf"));
+                                            .arg(QStringLiteral("%1")
+                                                     .arg(rom_program_id, 16, 16, QLatin1Char('0'))
+                                                     .toUpper());
                     if (QFile::exists(pmf)) {
                         const QString cache = pkg_dir + QStringLiteral("/user/cache/shader/%1/vulkan.bin")
                                                             .arg(rom_program_id, 16, 16, QLatin1Char('0'));
                         const auto res = Core::PipelineManifest::Apply(
-                            pmf.toStdWString(), romfs_vf, cache.toStdWString());
+                            std::filesystem::path(pmf.toStdU16String()), romfs_vf,
+                            std::filesystem::path(cache.toStdU16String()));
                         if (res.ok) {
                             LOG_INFO(Frontend, "Export: pipeline manifest: {} pipelines, {} new to the "
                                      "shader cache", res.pipelines, res.added);
@@ -2895,7 +3111,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // suyu-cmd is the fallback for source-only exports and for machines
         // where the static link could not be produced.
         const QString static_launcher =
-            cache_dir + QStringLiteral("/launcher/static_launcher.exe");
+            cache_dir + QStringLiteral("/launcher/static_launcher") + exe_suffix;
         const bool has_static_launcher = QFile::exists(static_launcher);
 
         // The generated C source and per-module build trees under aot_cache/
@@ -2940,11 +3156,17 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         }
         const QString launcher_src = has_static_launcher
                                          ? static_launcher
-                                         : bin_dir + QStringLiteral("/suyu-cmd.exe");
-        const QString launcher_dst = pkg_dir + QDir::separator() + game_name + QStringLiteral(".exe");
+                                         : bin_dir + QStringLiteral("/suyu-cmd") + exe_suffix;
+        const QString launcher_dst = pkg_dir + QDir::separator() + game_name + exe_suffix;
         if (QFile::exists(launcher_src)) {
             QFile::remove(launcher_dst);
             QFile::copy(launcher_src, launcher_dst);
+            if (linux_pkg) {
+                QFile::setPermissions(launcher_dst, QFile::permissions(launcher_dst) |
+                                                        QFileDevice::ExeOwner |
+                                                        QFileDevice::ExeGroup |
+                                                        QFileDevice::ExeOther);
+            }
 
             // Embed the game's icon into the launcher exe via Windows resource update API.
             if (!game_icon_.isNull()) {
@@ -2982,6 +3204,35 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
                     }
                 }
 #endif
+                if (linux_pkg) {
+                    // ELF has no resources: the game window loads icon.bmp beside the binary
+                    // (SDL reads BMP without extra libraries), the desktop entry uses icon.png.
+                    const QImage icon = game_icon_
+                                            .scaled(256, 256, Qt::KeepAspectRatioByExpanding,
+                                                    Qt::SmoothTransformation)
+                                            .copy(0, 0, 256, 256)
+                                            .toImage();
+                    icon.save(pkg_dir + QStringLiteral("/icon.png"), "PNG");
+                    icon.convertToFormat(QImage::Format_ARGB32)
+                        .save(pkg_dir + QStringLiteral("/icon.bmp"), "BMP");
+                }
+            }
+
+            // Linux: the shared libraries suyu-cmd links that a desktop doesn't have (bundled
+            // FFmpeg, OpenSSL ...) are in the link kit's lib/ (prebuilt packages) and go to
+            // lib/ beside the game, where the game's rpath ($ORIGIN/lib) finds them. A game
+            // linked in a build tree finds them through the tree's own rpath instead.
+            if (linux_pkg) {
+                const QDir src_lib(bin_dir + QStringLiteral("/link_kit/lib"));
+                const QString dst_lib = pkg_dir + QStringLiteral("/lib");
+                QDir(dst_lib).removeRecursively();
+                const QStringList libs = src_lib.entryList({QStringLiteral("*.so*")}, QDir::Files);
+                if (!libs.isEmpty()) {
+                    QDir().mkpath(dst_lib);
+                }
+                for (const QString& lib : libs) {
+                    QFile::copy(src_lib.filePath(lib), dst_lib + QLatin1Char('/') + lib);
+                }
             }
 
             // DLLs required by suyu-cmd (FFmpeg, DXC, OpenSSL — SDL3 is statically linked)
@@ -2995,7 +3246,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             };
             for (const char* dll : kRuntimeDlls) {
                 const QString src = bin_dir + QLatin1Char('/') + QLatin1String(dll);
-                if (QFile::exists(src)) {
+                if (!linux_pkg && QFile::exists(src)) {
                     const QString dst = pkg_dir + QDir::separator() + QLatin1String(dll);
                     QFile::remove(dst);
                     QFile::copy(src, dst);
@@ -3009,12 +3260,42 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // bypass that and force suyu-cmd to re-open the encrypted source ROM
         // instead - needing keys and the original file present, exactly what
         // bundling exefs/romfs was meant to avoid.
-        QFile bat(pkg_dir + QDir::separator() + QStringLiteral("launch.bat"));
-        if (bat.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QTextStream out(&bat);
-            out << "@echo off\n";
-            out << "\"" << game_name << ".exe\"\n";
-            bat.close();
+        if (linux_pkg) {
+            // A desktop entry, so the game can be put in the application menu (copy it to
+            // ~/.local/share/applications) or started by double-click in file managers that
+            // trust it. Paths are absolute: desktop entries have no "relative to this file".
+            const QString exe_abs = QFileInfo(launcher_dst).absoluteFilePath();
+            const auto quoted = [](QString s) {
+                s.replace(QLatin1Char('\\'), QStringLiteral("\\\\"))
+                    .replace(QLatin1Char('"'), QStringLiteral("\\\""));
+                return QLatin1Char('"') + s + QLatin1Char('"');
+            };
+            QFile desktop(pkg_dir + QDir::separator() + game_name + QStringLiteral(".desktop"));
+            if (desktop.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream out(&desktop);
+                out << "[Desktop Entry]\n"
+                       "Type=Application\n"
+                    << "Name=" << game_name << "\n"
+                    << "Exec=" << quoted(exe_abs) << "\n"
+                    << "Path=" << QFileInfo(pkg_dir).absoluteFilePath() << "\n";
+                if (QFile::exists(pkg_dir + QStringLiteral("/icon.png"))) {
+                    out << "Icon=" << QFileInfo(pkg_dir + QStringLiteral("/icon.png"))
+                                          .absoluteFilePath()
+                        << "\n";
+                }
+                out << "Categories=Game;\n"
+                       "Terminal=false\n";
+                desktop.close();
+                desktop.setPermissions(desktop.permissions() | QFileDevice::ExeOwner);
+            }
+        } else {
+            QFile bat(pkg_dir + QDir::separator() + QStringLiteral("launch.bat"));
+            if (bat.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream out(&bat);
+                out << "@echo off\n";
+                out << "\"" << game_name << ".exe\"\n";
+                bat.close();
+            }
         }
 
         // cache_dir is pkg_dir/aot_cache itself (RunAotPrecompile generates
@@ -3038,11 +3319,17 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         QFile readme(pkg_dir + QDir::separator() + QStringLiteral("README_NATIVE_EXPORT.txt"));
         if (readme.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream out(&readme);
+            const QString exe_name = game_name + exe_suffix;
             out << "Recompiled native build — fully standalone, no ROM or keys needed to run\n\n";
-            out << "Run: double-click launch.bat (or " << game_name << ".exe directly)\n\n";
+            if (linux_pkg) {
+                out << "Run: ./\"" << exe_name << "\" in this folder, or the " << game_name
+                    << ".desktop entry\n\n";
+            } else {
+                out << "Run: double-click launch.bat (or " << exe_name << " directly)\n\n";
+            }
             out << "This is the game itself, statically recompiled to x86 machine code and\n";
-            out << "linked into " << game_name << ".exe alongside suyu's HLE/GPU/audio backend\n";
-            out << "- no emulator install and no separate DLLs for the game code.\n\n";
+            out << "linked into " << exe_name << " alongside suyu's HLE/GPU/audio backend\n";
+            out << "- no emulator install and no separate libraries for the game code.\n\n";
             out << "What runs native vs emulated:\n";
             out << "- Native  : the game's own CPU code, translated ahead of time to C and\n";
             out << "            compiled into this exe. No instruction decoding at run time.\n";
@@ -3055,46 +3342,25 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             out << "            demand and hands control straight back; correctness never\n";
             out << "            depends on how much of the program it covers.\n\n";
             out << "Contents:\n";
-            out << "- " << game_name << ".exe : the game (recompiled code + HLE/GPU backend, one file)\n";
-            out << "- launch.bat      : one-click launcher\n";
+            out << "- " << exe_name << " : the game (recompiled code + HLE/GPU backend, one file)\n";
+            if (linux_pkg) {
+                out << "- " << game_name << ".desktop : application menu entry\n";
+                out << "- lib/            : runtime libraries (FFmpeg, OpenSSL)\n";
+            } else {
+                out << "- launch.bat      : one-click launcher\n";
+                out << "- *.dll           : runtime libraries (FFmpeg, Vulkan, OpenSSL)\n";
+            }
             out << "- exefs/          : the game's own executables and data, extracted once at\n";
             out << "                    export time so no ROM or decryption keys are needed to run\n";
-            out << "- *.dll           : runtime libraries (FFmpeg, Vulkan, OpenSSL)\n";
             out << "- mods/           : optional; drop <title_id>/<mod name>/ folders here\n";
             out << "- user/           : this game's own config, saves, and logs (not suyu's)\n\n";
-            out << "Press F12 in-game for the debug panel (status, mods, folders).\n";
+            if (!linux_pkg) {
+                out << "Press F12 in-game for the debug panel (status, mods, folders).\n";
+            }
             readme.close();
         }
 
         MaybeAddToSteam(game_name, launcher_dst);
-
-        return true;
-    }
-
-    case TargetPlatform::Linux: {
-        const QString appdir =
-            output_dir + QDir::separator() + game_name + QStringLiteral(".AppDir");
-        const QString bin_dir = appdir + QDir::separator() + QStringLiteral("usr/bin");
-        if (!QDir().mkpath(bin_dir)) {
-            return false;
-        }
-
-        write_source_reference(bin_dir);
-
-        // Copy AOT cache
-        if (!CopyDirectoryUnlessInPlace(cache_dir,
-                                    bin_dir + QDir::separator() + QStringLiteral("aot_cache"))) {
-            return false;
-        }
-
-        QFile readme(appdir + QDir::separator() + QStringLiteral("README_NATIVE_EXPORT.txt"));
-        if (readme.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QTextStream out(&readme);
-            out << "Suyu native export artifact bundle\n\n";
-            out << "Compiler artifacts are under usr/bin/aot_cache.\n";
-            out << "No frontend runtime binary is bundled in this export.\n";
-            readme.close();
-        }
 
         return true;
     }
@@ -3139,6 +3405,9 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
 namespace {
 constexpr char kOutputRootsKey[] = "recompile/output_roots";
 constexpr char kLastExportGroup[] = "recompile/last_export";
+// Bumped when a default changes, so choices saved under the old defaults don't hide the
+// new ones. 2: Build format and decompressed archives became the defaults.
+constexpr int kExportDefaultsVersion = 2;
 } // namespace
 
 void GameExportDialog::SaveLastExport() const {
@@ -3150,6 +3419,7 @@ void GameExportDialog::SaveLastExport() const {
     settings.setValue(QStringLiteral("platform"), platform_combo->currentIndex());
     settings.setValue(QStringLiteral("backend"), backend_combo->currentIndex());
     settings.setValue(QStringLiteral("format"), output_format_combo->currentIndex());
+    settings.setValue(QStringLiteral("defaults_version"), kExportDefaultsVersion);
     const std::pair<const char*, QCheckBox*> boxes[] = {
         {"full_scan", aot_full_scan_checkbox},
         {"steam_shortcut", steam_shortcut_checkbox},
@@ -3159,6 +3429,7 @@ void GameExportDialog::SaveLastExport() const {
         {"shader_cache", include_shader_cache_checkbox},
         {"custom_config", include_custom_config_checkbox},
         {"decompress_archives", decompress_archives_checkbox},
+        {"copy_controls", copy_controls_checkbox},
     };
     for (const auto& [key, box] : boxes) {
         settings.setValue(QString::fromLatin1(key), box->isChecked());
@@ -3191,9 +3462,16 @@ void GameExportDialog::RestoreLastExport() {
             combo->setCurrentIndex(i);
         }
     };
-    index("platform", platform_combo);
+    // Saved before the current defaults existed: keep the remembered paths and choices,
+    // but let the options whose default changed start from the new default once.
+    const bool old_defaults =
+        settings.value(QStringLiteral("defaults_version"), 1).toInt() < kExportDefaultsVersion;
+    // Target isn't restored: it always starts as the system suyu runs on, which is what the
+    // Build format needs (a Source export for another system picks it each time).
     index("backend", backend_combo);
-    index("format", output_format_combo);
+    if (!old_defaults) {
+        index("format", output_format_combo);
+    }
     const std::pair<const char*, QCheckBox*> boxes[] = {
         {"full_scan", aot_full_scan_checkbox},
         {"steam_shortcut", steam_shortcut_checkbox},
@@ -3203,9 +3481,13 @@ void GameExportDialog::RestoreLastExport() {
         {"shader_cache", include_shader_cache_checkbox},
         {"custom_config", include_custom_config_checkbox},
         {"decompress_archives", decompress_archives_checkbox},
+        {"copy_controls", copy_controls_checkbox},
     };
     for (const auto& [key, box] : boxes) {
         // Portable-data boxes stay unticked while they're disabled (ROM without a title id).
+        if (old_defaults && box == decompress_archives_checkbox) {
+            continue;
+        }
         if (box->isEnabled() || box == steam_replace_rom_checkbox) {
             box->setChecked(settings.value(QString::fromLatin1(key), box->isChecked()).toBool());
         }
@@ -3437,10 +3719,29 @@ void GameExportDialog::OnExport() {
                              tr("The specified ROM file does not exist."));
         return;
     }
-    SaveLastExport();
-
     const auto platform =
         static_cast<TargetPlatform>(platform_combo->currentData().toInt());
+    {
+#ifdef _WIN32
+        constexpr auto host = TargetPlatform::Windows;
+#elif defined(__APPLE__)
+        constexpr auto host = TargetPlatform::MacOS;
+#else
+        constexpr auto host = TargetPlatform::Linux;
+#endif
+        // Build compiles and links with this computer's toolchain against this suyu's own
+        // objects, so it can only produce a game for the system suyu runs on.
+        if (WantsCompiledOutput() && platform != host) {
+            QMessageBox::warning(
+                this, tr("Different Target"),
+                tr("The Build format makes a game for the system suyu is running on. Set Target "
+                   "to %1, or export on the other system with its own suyu.")
+                    .arg(platform_combo->itemText(platform_combo->findData(static_cast<int>(host)))));
+            return;
+        }
+    }
+    SaveLastExport();
+
     const auto backend =
         static_cast<RecompileBackend>(backend_combo->currentData().toInt());
     const bool include_save_data = include_save_data_checkbox->isChecked();
@@ -3583,10 +3884,8 @@ void GameExportDialog::OnExport() {
         QString pkg_root;
         switch (platform) {
         case TargetPlatform::Windows:
-            pkg_root = output_dir + QDir::separator() + game_name;
-            break;
         case TargetPlatform::Linux:
-            pkg_root = output_dir + QDir::separator() + game_name + QStringLiteral(".AppDir");
+            pkg_root = output_dir + QDir::separator() + game_name;
             break;
         case TargetPlatform::MacOS:
             pkg_root = output_dir + QDir::separator() + game_name + QStringLiteral(".app");
@@ -3598,6 +3897,12 @@ void GameExportDialog::OnExport() {
             throw std::runtime_error("Failed to bundle portable support data");
         }
     }
+    // Player 1's controller from suyu's setup, so a re-export can't leave a player on the
+    // keyboard defaults (controls chosen in the game itself are kept).
+    if (copy_controls_checkbox->isChecked() && platform != TargetPlatform::MacOS) {
+        const QString pkg_root = output_dir + QDir::separator() + game_name;
+        LOG_INFO(Frontend, "Export: controller setup: {}", CopyControllerSetup(pkg_root));
+    }
     progress_bar->setValue(90);
 
     // Step 6: Clean up working directory
@@ -3608,10 +3913,8 @@ void GameExportDialog::OnExport() {
     QString final_path;
     switch (platform) {
     case TargetPlatform::Windows:
-        final_path = output_dir + QDir::separator() + game_name;
-        break;
     case TargetPlatform::Linux:
-        final_path = output_dir + QDir::separator() + game_name + QStringLiteral(".AppDir");
+        final_path = output_dir + QDir::separator() + game_name;
         break;
     case TargetPlatform::MacOS:
         final_path = output_dir + QDir::separator() + game_name + QStringLiteral(".app");

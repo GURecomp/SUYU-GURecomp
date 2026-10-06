@@ -141,6 +141,7 @@ private:
     QCheckBox* include_shader_cache_checkbox{};
     QCheckBox* include_custom_config_checkbox{};
     QCheckBox* decompress_archives_checkbox{};
+    QCheckBox* copy_controls_checkbox{};
     QCheckBox* aot_full_scan_checkbox{};
     /// When checked and a module fails to recompile, emit a stub that falls back
     /// to the dynarmic interpreter for that module instead of aborting the export.

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -44,10 +45,35 @@ namespace GameSettings {
 /// game_settings.ini [Display] fullscreen = true (read before the window opens).
 bool StartFullscreen();
 
+/// game_settings.ini [Display] console_mode = handheld: the game runs as on the Switch's own
+/// screen (1280x720 render). Read once at start, before the game boots.
+bool StartHandheld();
+
+/// The desktop's mode for fps = auto / resolution = auto, given by the frontend where the OS
+/// can't be asked directly (Linux: SDL knows it once the window exists). Windows asks the OS.
+void SetDesktopMode(u32 width, u32 height, u32 refresh_hz);
+
 /// Any game_settings.ini value ("" when absent), and writing one back (frontend options such as
 /// [Multiplayer]; the ini is created with its defaults first if needed).
 std::string Value(const std::string& section, const std::string& key);
 void SetValue(const std::string& section, const std::string& key, const std::string& value);
+
+/// One option as game_settings.ini documents it (the game menu's Settings tab lists these).
+struct OptionInfo {
+    std::string section;
+    std::string key;
+    std::string default_value;
+    std::string comment; // the ini comment without its "; " prefixes
+};
+std::vector<OptionInfo> Options();
+
+/// Applies a changed option to the running game where that is possible (frame rate, the
+/// title's FPS); false = it takes effect at the next start. The value is saved separately
+/// (SetValue).
+bool ApplyLive(const std::string& section, const std::string& key, const std::string& value);
+
+/// game_settings.ini [Display] show_fps: the frame rate in the window title.
+bool ShowFps();
 
 /// game_settings.ini [Debug] diagnostics: the run reports beyond recomp_report.txt's misses
 /// (profiler, NVN census/trace, timing watch, file monitor). On unless set to false.

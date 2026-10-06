@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -78,19 +79,29 @@ constexpr Option kOptions[] = {
      "; 21:9, 32:9, 16:10, 4:3 or a number such as 2.39.\n"},
     {"Display", "fullscreen", "false",
      "; true = start fullscreen. F11 or Alt+Enter switches while playing.\n"},
+    {"Display", "show_fps", "false",
+     "; true = show the frame rate in the window title. The game menu (F10) always shows it.\n"},
+    {"Display", "console_mode", "docked",
+     "; docked = the game renders at 1920x1080, as on a TV (original PC default).\n"
+     "; handheld = the game renders at 1280x720, as on the Switch's own screen: much lighter on\n"
+     "; weak PCs and integrated graphics. The picture is scaled up to the window either way;\n"
+     "; native_render doesn't raise the handheld render size.\n"},
     {"Graphics", "native_render", "true",
      "; With a resolution set: the game renders at that resolution itself (up to 3840x2160)\n"
      "; instead of suyu scaling a 1920x1080 picture. Keep suyu's resolution scale at 1x then.\n"
      "; false = keep the 1920x1080 render (use suyu's resolution scale instead).\n"},
-    {"Debug", "diagnostics", "true",
+    {"Debug", "diagnostics", "false",
      "; Run reports for development (profiler, graphics call census, timing watch, file\n"
-     "; monitor; written to the user folder). false = skip them for a little more speed.\n"},
+     "; monitor; written to the user folder). true = write them (a little slower).\n"},
+    {"Debug", "rtss_overlay", "false",
+     "; RivaTuner Statistics Server's Vulkan overlay crashes the game at start, so it is kept\n"
+     "; out of this game (RivaTuner itself keeps working elsewhere). true = let it load.\n"},
     {"Graphics", "draw_distance", "1.0",
      "; Far clip plane multiplier: 1.0 = original game, up to 8.0. Moves the distance beyond which\n"
      "; nothing is drawn. Objects that fade out by their own distance checks aren't affected yet.\n"},
     {"Multiplayer", "mode", "off",
      "; Local play over a suyu room (e.g. through Radmin VPN). off | host | join: what to do at\n"
-     "; start. Also available any time in the F12 panel, which can save its fields here.\n"},
+     "; start. Also in the game menu (F10), which saves its fields here.\n"},
     {"Multiplayer", "nickname", "Hunter",
      "; Your name in the room: 4-20 characters (letters, digits, space, . _ -).\n"},
     {"Multiplayer", "address", "",
@@ -99,6 +110,17 @@ constexpr Option kOptions[] = {
     {"Multiplayer", "password", "", "; Room password; empty = none.\n"},
     {"Multiplayer", "room_name", "MHGU", "; host: the room's name.\n"},
     {"Multiplayer", "max_players", "4", "; host: room size (2-16).\n"},
+    {"Multiplayer", "auto_reconnect", "true",
+     "; true = when the connection to a joined room drops, try again every 5 s for a minute.\n"},
+    {"Multiplayer", "recent", "",
+     "; Hosts joined before (address:port, newest first), offered in the game menu.\n"},
+    {"Menu", "key", "F10",
+     "; Opens the game menu window (controls, multiplayer, folders): a key name such as F10,\n"
+     "; F9 or Home. none = no key. The F12 debug panel (Windows) stays as it is.\n"},
+    {"Menu", "pad_combo", "back+start",
+     "; Controller buttons held together for 1 s to open the menu (SDL names: back, start,\n"
+     "; guide, leftstick, rightstick, leftshoulder, ...). back+start = Minus + Plus on a\n"
+     "; Switch layout, View + Menu on Xbox. none = off.\n"},
     {"Mods", "loader", "Forge/forge.dll",
      "; Mod loader DLL, relative to mods/<title id>/ (install Forge PC there for code mods).\n"
      "; none = load no mod code (file replacements in mods/ still apply).\n"},
@@ -113,7 +135,7 @@ std::unordered_map<u32, float> g_far_written; // camera params -> far value we w
 bool g_logged_clip{false};
 u32 g_field_ptr_addr{}; // main + kFrameRateGlobal
 std::atomic<float> g_fps{kOriginalFps};
-bool g_fps_auto{false};
+std::atomic<bool> g_fps_auto{false};
 float g_fps_cap{60.0f}; // auto: the monitor's refresh rate
 std::atomic<bool> g_active{false};
 u64 g_frames{};
@@ -230,9 +252,14 @@ Settings::AspectRatio OutputAspect(float a) {
     return Settings::AspectRatio::Stretch;
 }
 
+/// What the frontend reported through SetDesktopMode (0s when it didn't).
+u32 g_desk_w = 0, g_desk_h = 0, g_desk_hz = 0;
+
 /// The primary monitor's mode: width, height, refresh rate (0s when unknown).
 void DesktopMode(u32* w, u32* h, u32* hz) {
-    *w = *h = *hz = 0;
+    *w = g_desk_w;
+    *h = g_desk_h;
+    *hz = g_desk_hz;
 #ifdef _WIN32
     DEVMODEW mode{};
     mode.dmSize = sizeof(mode);
@@ -266,7 +293,7 @@ std::atomic<u32> g_aspect_pc{0};
 bool DiagnosticsEnabled() {
     static const bool enabled = [] {
         const std::string v = ReadValue("Debug", "diagnostics");
-        return !(v == "false" || v == "0" || v == "no" || v == "off");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
     }();
     return enabled;
 }
@@ -321,9 +348,80 @@ void SetValue(const std::string& want_section, const std::string& want_key,
     }
 }
 
+std::vector<OptionInfo> Options() {
+    std::vector<OptionInfo> out;
+    for (const Option& o : kOptions) {
+        std::string comment;
+        const std::string_view text{o.comment};
+        std::size_t start = 0;
+        while (start < text.size()) {
+            const std::size_t end = std::min(text.find('\n', start), text.size());
+            std::string_view line = text.substr(start, end - start);
+            if (line.starts_with(";")) {
+                line.remove_prefix(line.starts_with("; ") ? 2 : 1);
+            }
+            if (!comment.empty()) {
+                comment += ' ';
+            }
+            comment += line;
+            start = end + 1;
+        }
+        out.push_back({o.section, o.key, o.value, std::move(comment)});
+    }
+    return out;
+}
+
+namespace {
+std::atomic<int> g_show_fps{-1}; // -1: not read yet
+} // namespace
+
+bool ShowFps() {
+    if (g_show_fps.load() < 0) {
+        const std::string v = ReadValue("Display", "show_fps");
+        g_show_fps = (v == "true" || v == "1" || v == "yes" || v == "on") ? 1 : 0;
+    }
+    return g_show_fps.load() == 1;
+}
+
+bool ApplyLive(const std::string& section, const std::string& key, const std::string& value) {
+    if (section == "Display" && key == "show_fps") {
+        g_show_fps = (value == "true" || value == "1" || value == "yes" || value == "on") ? 1 : 0;
+        return true;
+    }
+    if (section == "Display" && key == "fps") {
+        // OnFrame writes the engine's frame rate field every 8 frames from g_fps; the display
+        // rate (DisplayRateScale) is read per vsync. Both follow at once.
+        if (value == "auto") {
+            g_fps = std::min(g_fps.load(), g_fps_cap);
+            g_fps_auto = true;
+        } else {
+            const float v = std::strtof(value.c_str(), nullptr);
+            if (v < 10.0f || v > 360.0f) {
+                return false;
+            }
+            g_fps_auto = false;
+            g_fps = v;
+        }
+        LOG_INFO(Core_ARM, "game settings: fps = {} applied while running", value);
+        return true;
+    }
+    return false;
+}
+
 bool StartFullscreen() {
     const std::string v = ReadValue("Display", "fullscreen");
     return v == "true" || v == "1" || v == "yes" || v == "on";
+}
+
+bool StartHandheld() {
+    const std::string v = ReadValue("Display", "console_mode");
+    return v == "handheld" || v == "undocked" || v == "portable";
+}
+
+void SetDesktopMode(u32 width, u32 height, u32 refresh_hz) {
+    g_desk_w = width;
+    g_desk_h = height;
+    g_desk_hz = refresh_hz > 1 ? refresh_hz : 0;
 }
 std::atomic<u32> g_render_default_pc{0};
 std::atomic<u32> g_render_create_pc{0};

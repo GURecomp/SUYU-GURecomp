@@ -69,6 +69,21 @@ void SdlConfig::SaveAllValues() {
     SaveSdlValues();
 }
 
+std::string SdlConfig::ReadControlsSetBy() {
+    BeginGroup(Settings::TranslateCategory(Settings::Category::Controls));
+    std::string value = ReadStringSetting(std::string("controls_set_by"));
+    EndGroup();
+    return value;
+}
+
+void SdlConfig::WriteControlsSetBy(const std::string& value) {
+    SaveAllValues();
+    BeginGroup(Settings::TranslateCategory(Settings::Category::Controls));
+    WriteStringSetting(std::string("controls_set_by"), value);
+    EndGroup();
+    WriteToIni();
+}
+
 void SdlConfig::ReadSdlValues() {
     ReadSdlControlValues();
 }

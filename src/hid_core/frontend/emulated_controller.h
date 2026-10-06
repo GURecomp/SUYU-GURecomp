@@ -194,6 +194,15 @@ public:
     /// Converts npad type to the equivalent of controller type from settings
     static Settings::ControllerType MapNPadToSettingsType(NpadStyleIndex type);
 
+    /// Sources that can hold back all controller input from the game (bit flags).
+    enum InputBlocker : u32 {
+        BlockerMenu = 1u << 0, ///< the exported game's menu window has focus
+        BlockerMods = 1u << 1, ///< a mod's overlay captured input (mod host)
+    };
+    /// While any blocker is set, every controller reads as idle (buttons up, sticks centred).
+    static void SetInputBlocked(InputBlocker blocker, bool blocked);
+    static bool IsInputBlocked();
+
     /// Gets the NpadIdType for this controller
     NpadIdType GetNpadIdType() const;
 

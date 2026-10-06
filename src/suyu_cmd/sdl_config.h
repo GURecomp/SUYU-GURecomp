@@ -13,6 +13,12 @@ public:
     void ReloadAllValues() override;
     void SaveAllValues() override;
 
+    /// [Controls] controls_set_by: who chose Player 1's mapping. "" (never set) | suyu (copied
+    /// from suyu by the export) | auto (the game mapped a connected controller) | player.
+    std::string ReadControlsSetBy();
+    /// Stores it and writes the whole file (the current mapping included).
+    void WriteControlsSetBy(const std::string& value);
+
 protected:
     void ReadSdlValues();
     void ReadSdlPlayerValues(std::size_t player_index);
