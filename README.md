@@ -25,15 +25,17 @@ suyu with AArch32 static recompilation: Monster Hunter Generations Ultimate as a
 This is a fork of suyu, the Nintendo Switch emulator, which descends from
 [Eden](https://git.eden-emu.dev/eden-emu/eden) and yuzu. It adds a **static recompiler for
 32-bit ARM (AArch32) games**: suyu's **File → Export Game...** translates the game's code to C
-on your PC, compiles it with Microsoft's C++ compiler and links it with suyu's HLE runtime
-(OS services, GPU, audio) into one native Windows `.exe`.
+on your PC, compiles it with your C compiler (Visual Studio on Windows, gcc or clang on Linux)
+and links it with suyu's HLE runtime (OS services, GPU, audio) into one native game executable
+for **Windows or Linux**.
 
 The target is **Monster Hunter Generations Ultimate, version 1.4.0**, from your own dump. On
 top of the export:
 
 - **Runtime settings** in `game_settings.ini` beside the exe, read at every start, never needing
   a new export: frame rate (30, 60, 90, 120 or auto), resolution and aspect ratio (ultrawide),
-  native render resolution, fullscreen, draw distance. Defaults are the original game.
+  native render resolution, fullscreen, draw distance, an FPS readout in the title bar. Defaults
+  are the original game.
 - **Game menu** (F10, or Minus + Plus on the controller) in its own window: controller choice
   and rebinding, multiplayer, every `game_settings.ini` option, folders. The first controller
   plugged in is used automatically, and the export can copy your suyu controller setup.
@@ -53,7 +55,9 @@ experimental AArch64 recompiler path is kept.
 
 ## Requirements
 
-Software you need to export (recompile) the game with a [release build](../../releases):
+Software you need to export (recompile) the game with a [release build](../../releases) on
+Windows (for Linux, see the [Linux guide](docs/a32recomp/INSTALL-LINUX.md): glibc 2.35 or newer,
+gcc or clang, CMake and Ninja):
 
 1. **Visual Studio 2022 (version 17.14 or newer) or Visual Studio 2026.** The free
    *Community* or *Build Tools* edition is enough. In the Visual Studio Installer it needs:
@@ -79,12 +83,12 @@ the [install guide](docs/a32recomp/INSTALL.md).
 
 ## Status
 
-Test builds. The native export is **Windows only** (x64, Visual Studio 2022 17.14 or newer, or Visual Studio 2026),
-and **MHGU 1.4.0** is the only title it's tested with. Prebuilt test builds are on the
+Test builds for **Windows** (x64, Visual Studio 2022 17.14 or newer, or Visual Studio 2026) and
+**Linux** (x64, glibc 2.35 or newer; so far tested in WSL only, not yet on real Linux hardware).
+**MHGU 1.4.0** is the only title it's tested with. Prebuilt test builds for both are on the
 [releases page](../../releases).
 
-Upstream suyu's Linux and Android build paths are still in the tree, but this fork doesn't
-build or test them.
+Upstream suyu's Android build path is still in the tree, but this fork doesn't build or test it.
 
 Known issues are listed with each release. Report problems as described in
 [INSTALL.md, section 10](docs/a32recomp/INSTALL.md#10-reporting-a-problem).
