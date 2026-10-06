@@ -13,33 +13,38 @@ your own console dump, and you must never share it or anything the export produc
 
 | | |
 |---|---|
-| OS | 64-bit x86 Linux with glibc **2.35 or newer**: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, SteamOS 3.5+, Arch and derivatives |
+| OS | 64-bit x86 Linux with glibc **2.35 or newer**: Ubuntu 22.04+, Debian 12+, Fedora 36+, Linux Mint 21+, current SteamOS, Arch and derivatives |
 | CPU | 64-bit x86 (Intel or AMD). The export uses all cores. |
 | RAM | 16 GB recommended (the export compiles several large C files at once) |
 | GPU | Vulkan capable, with a **current** driver: Mesa (RADV for AMD, ANV for Intel) or NVIDIA's own driver |
 | Disk | About **25 GB free** where you export to (the finished folder is about 22 GB, mostly the unpacked game files; about 12 GB if you untick "Decompress game archives") |
-| Build tools | A C/C++ compiler (gcc or clang), CMake and Ninja (section 2) |
+| Build tools | A C/C++ compiler (gcc or clang) and CMake 3.13 or newer; Ninja is recommended (faster, used when installed). Section 2 |
+| System libraries | Vulkan loader, OpenSSL 3, libusb 1.0, Brotli, zlib, and the PulseAudio and ALSA client libraries. Desktop installs usually have them; section 2 installs any that are missing |
 | Game | Your own dump of MHGU (base game) **and the 1.4.0 update**, plus your own `prod.keys` / `title.keys` |
 
 ## 2. Install the build tools
 
-One command, for your distribution:
+One command, for your distribution. It installs the build tools and the system libraries the
+export links the game against (most are already there on a desktop install):
 
 ```bash
 # Debian, Ubuntu, Linux Mint, Pop!_OS
-sudo apt install build-essential cmake ninja-build
+sudo apt install build-essential cmake ninja-build libvulkan1 libssl3 libusb-1.0-0 libbrotli1 zlib1g libpulse0 libasound2
 # Fedora
-sudo dnf install gcc gcc-c++ cmake ninja-build
+sudo dnf install gcc gcc-c++ cmake ninja-build vulkan-loader openssl-libs libusb1 libbrotli zlib pulseaudio-libs alsa-lib
 # Arch, Manjaro, EndeavourOS, CachyOS
-sudo pacman -S --needed base-devel cmake ninja
+sudo pacman -S --needed base-devel cmake ninja vulkan-icd-loader openssl libusb brotli zlib libpulse alsa-lib
 ```
 
-Any gcc 9+ or clang 10+ works: suyu's own part is prebuilt (with its C++ runtime linked in), and
-your compiler only builds the game's generated C.
+The Vulkan driver for your GPU comes from your distribution too (Mesa: `mesa-vulkan-drivers` on
+Debian/Ubuntu/Fedora, `vulkan-radeon` or `vulkan-intel` on Arch; NVIDIA: the proprietary driver).
+
+suyu's own part is prebuilt, with its C++ runtime included, so your compiler only builds the
+game's generated C and links it. Tested with Ubuntu 22.04's gcc 11 and CMake 3.22.
 
 **SteamOS (Steam Deck)**: the system partition is read-only. Either switch to desktop mode and
 run `sudo steamos-readonly disable`, then `sudo pacman-key --init && sudo pacman-key
---populate archlinux holo && sudo pacman -S --needed base-devel cmake ninja` (SteamOS updates
+--populate archlinux holo && sudo pacman -S --needed base-devel cmake ninja` plus the libraries above (SteamOS updates
 may undo it, which is fine: the tools are only needed while exporting), or export on another
 Linux PC and copy the finished folder to the Deck.
 
@@ -115,7 +120,7 @@ both sides have, such as ZeroTier or Tailscale.
 |---|---|
 | Export: "The build tools were not found" | Section 2. Check with `cc --version`, `c++ --version`, `cmake --version`. |
 | Export: "static recompiled executable was not produced" | Read the lines above it in the export log (`~/.local/share/suyu/log/suyu_log.txt`). |
-| `./suyu`: "cannot open shared object file" | Keep the unpacked folder together; a missing system library (for example `libxcb-cursor0` on some Ubuntu installs) is installed with the package manager. |
+| `./suyu`: "cannot open shared object file" | Keep the unpacked folder together; a missing system library is installed with the package manager (section 2 lists them). |
 | `./suyu`: "version GLIBC_2.xx not found" | The distribution is older than the requirements in section 1. |
 | The game closes right away | Run it from its folder; keep `lib/`, `exefs/` and `user/` beside it. Check `user/log/suyu_log.txt`. |
 | Black screen or Vulkan error | Update Mesa / the NVIDIA driver; `vulkaninfo --summary` should list your GPU. On hybrid laptops start the game with `DRI_PRIME=1` (Mesa) or `prime-run` (NVIDIA). |

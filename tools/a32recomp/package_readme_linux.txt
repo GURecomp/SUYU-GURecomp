@@ -8,13 +8,19 @@ Test build: expect rough edges, and please report what you see.
 NEEDED
 ------
 - 64-bit Linux (x86-64) with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36,
-  Linux Mint 21, SteamOS 3.5, Arch and anything newer), and a GPU with a current Vulkan
+  Linux Mint 21, current SteamOS, Arch and anything newer), and a GPU with a current Vulkan
   driver (Mesa RADV/ANV, or NVIDIA's own driver).
-- A C/C++ compiler, CMake and Ninja. The export compiles the game's code with them:
-    Debian/Ubuntu/Mint:  sudo apt install build-essential cmake ninja-build
-    Fedora:              sudo dnf install gcc gcc-c++ cmake ninja-build
-    Arch/SteamOS:        sudo pacman -S base-devel cmake ninja
-  (SteamOS: the system is read-only by default; see the install guide.)
+- A C/C++ compiler (gcc or clang), CMake 3.13+ and preferably Ninja, plus a few system
+  libraries the game is linked against (Vulkan loader, OpenSSL 3, libusb, Brotli, zlib,
+  PulseAudio/ALSA client libraries; desktop installs usually have them):
+    Debian/Ubuntu/Mint:  sudo apt install build-essential cmake ninja-build libvulkan1
+                         libssl3 libusb-1.0-0 libbrotli1 zlib1g libpulse0 libasound2
+    Fedora:              sudo dnf install gcc gcc-c++ cmake ninja-build vulkan-loader
+                         openssl-libs libusb1 libbrotli zlib pulseaudio-libs alsa-lib
+    Arch/SteamOS:        sudo pacman -S --needed base-devel cmake ninja vulkan-icd-loader
+                         openssl libusb brotli zlib libpulse alsa-lib
+  (One command each; the line breaks are only for this file. SteamOS: the system is
+  read-only by default; see the install guide.)
 - About 25 GB free disk where you export to.
 - Your own Switch keys (prod.keys, title.keys) and your own dump of the game with the
   1.4.0 update. None are included and none may be shared.

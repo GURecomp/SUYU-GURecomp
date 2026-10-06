@@ -55,9 +55,9 @@ experimental AArch64 recompiler path is kept.
 
 ## Requirements
 
-Software you need to export (recompile) the game with a [release build](../../releases) on
-Windows (for Linux, see the [Linux guide](docs/a32recomp/INSTALL-LINUX.md): glibc 2.35 or newer,
-gcc or clang, CMake and Ninja):
+### Windows
+
+Software you need to export (recompile) the game with a [release build](../../releases):
 
 1. **Visual Studio 2022 (version 17.14 or newer) or Visual Studio 2026.** The free
    *Community* or *Build Tools* edition is enough. In the Visual Studio Installer it needs:
@@ -80,6 +80,23 @@ gcc or clang, CMake and Ninja):
 Also about 25 GB free disk on the drive you export to, plus about 10 GB for Visual Studio.
 None of the keys or game files are included, and none may be shared. The step-by-step guide is
 the [install guide](docs/a32recomp/INSTALL.md).
+
+### Linux
+
+1. **64-bit x86 Linux with glibc 2.35 or newer**: Ubuntu 22.04+, Debian 12+, Fedora 36+,
+   Linux Mint 21+, Arch and derivatives, current SteamOS.
+2. **Build tools**: gcc or clang, CMake 3.13 or newer, and Ninja (recommended; faster).
+3. **System libraries** the game is linked against: Vulkan loader, OpenSSL 3, libusb 1.0,
+   Brotli, zlib, PulseAudio and ALSA client libraries. Desktop installs usually have them.
+4. **A current Vulkan driver**: Mesa (RADV for AMD, ANV for Intel) or NVIDIA's own driver.
+5. **Your own keys and game dump** with the 1.4.0 update, as on Windows.
+6. **The Linux release** (`.tar.xz`) from the [releases page](../../releases). It bundles Qt and
+   suyu's other libraries.
+
+One command installs items 2 and 3, for example on Ubuntu:
+`sudo apt install build-essential cmake ninja-build libvulkan1 libssl3 libusb-1.0-0 libbrotli1 zlib1g libpulse0 libasound2`.
+Fedora, Arch and SteamOS commands, and the full steps, are in the
+[Linux guide](docs/a32recomp/INSTALL-LINUX.md). About 25 GB free disk is needed for the export.
 
 ## Status
 
