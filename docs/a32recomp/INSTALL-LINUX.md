@@ -93,8 +93,10 @@ Same as on Windows ([INSTALL.md, section 6](INSTALL.md#6-play-and-settings)): th
 Differences on Linux:
 
 - There is no **F12** developer panel; the game menu covers it.
-- Code mods (Forge PC, HudFix) are Windows-only for now. File replacement mods such as
-  texture packs (`mods/0100770008DD8000/<mod>/romfs/...`) work.
+- Code mods: the game loads Forge PC from `mods/0100770008DD8000/Forge/forge.so` (the Linux
+  build of Forge PC; `[Mods] loader` in `game_settings.ini`). The current Forge PC release is
+  Windows-only. File replacement mods such as texture packs
+  (`mods/0100770008DD8000/<mod>/romfs/...`) work.
 
 ## 7. Multiplayer
 

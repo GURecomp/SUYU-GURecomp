@@ -121,8 +121,9 @@ constexpr Option kOptions[] = {
      "; Controller buttons held together for 1 s to open the menu (SDL names: back, start,\n"
      "; guide, leftstick, rightstick, leftshoulder, ...). back+start = Minus + Plus on a\n"
      "; Switch layout, View + Menu on Xbox. none = off.\n"},
-    {"Mods", "loader", "Forge/forge.dll",
-     "; Mod loader DLL, relative to mods/<title id>/ (install Forge PC there for code mods).\n"
+    {"Mods", "loader", kDefaultModLoader,
+     "; Mod loader library (forge.dll on Windows, forge.so on Linux), relative to\n"
+     "; mods/<title id>/ (install Forge PC there for code mods).\n"
      "; none = load no mod code (file replacements in mods/ still apply).\n"},
 };
 

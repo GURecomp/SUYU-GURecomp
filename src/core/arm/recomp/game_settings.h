@@ -58,6 +58,13 @@ void SetDesktopMode(u32 width, u32 height, u32 refresh_hz);
 std::string Value(const std::string& section, const std::string& key);
 void SetValue(const std::string& section, const std::string& key, const std::string& value);
 
+/// Default [Mods] loader, relative to mods/<title id>/: Forge PC's library for this platform.
+#ifdef _WIN32
+inline constexpr const char* kDefaultModLoader = "Forge/forge.dll";
+#else
+inline constexpr const char* kDefaultModLoader = "Forge/forge.so";
+#endif
+
 /// One option as game_settings.ini documents it (the game menu's Settings tab lists these).
 struct OptionInfo {
     std::string section;

@@ -645,7 +645,11 @@ constexpr SettingHint kSettingHints[] = {
     {"Menu", "key", "Menu key", "F10|F9|F8|Home|none"},
     {"Menu", "pad_combo", "Menu controller combo",
      "back+start|back+guide|leftstick+rightstick|none"},
+#ifdef _WIN32
     {"Mods", "loader", "Mod loader", "Forge/forge.dll|none"},
+#else
+    {"Mods", "loader", "Mod loader", "Forge/forge.so|none"},
+#endif
 };
 
 std::vector<GS::OptionInfo> g_options;

@@ -45,7 +45,6 @@ const volatile u8* g_hook_bits{};
 namespace {
 
 constexpr const char* kModuleAliases[] = {"rtld", "main", "subsdk0", "sdk"}; // load order
-constexpr const char* kDefaultLoader = "Forge/forge.dll";
 
 System* g_system{};
 RecompLookupFn g_lookup{};
@@ -285,12 +284,18 @@ void MapGuestHeap() {
 void LoadLoader() {
     std::string rel = GameSettings::Value("Mods", "loader");
     if (rel.empty()) {
-        rel = kDefaultLoader;
+        rel = GameSettings::kDefaultModLoader;
     }
     if (rel == "none") {
         LOG_INFO(Core_ARM, "[mods] no loader (game_settings.ini [Mods] loader = none)");
         return;
     }
+#ifndef _WIN32
+    // Settings written by builds before 0.2.1 name the Windows library on Linux too.
+    if (rel.size() > 4 && rel.compare(rel.size() - 4, 4, ".dll") == 0) {
+        rel.replace(rel.size() - 4, 4, ".so");
+    }
+#endif
     const auto path = std::filesystem::path{Common::FS::ToU8String(g_mods_dir)} /
                       std::filesystem::path{Common::FS::ToU8String(rel)};
     std::error_code ec;
