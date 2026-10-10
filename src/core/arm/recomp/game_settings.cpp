@@ -114,6 +114,20 @@ constexpr Option kOptions[] = {
      "; true = when the connection to a joined room drops, try again every 5 s for a minute.\n"},
     {"Multiplayer", "recent", "",
      "; Hosts joined before (address:port, newest first), offered in the game menu.\n"},
+    {"Multiplayer", "backend", "room",
+     "; Who carries local wireless play: room = a suyu room (the settings above);\n"
+     "; ryuldn = a RyuLdn master server, the lobby server Ryujinx uses, so you can play with\n"
+     "; Ryujinx players (everyone uses the same server). Read at start.\n"},
+    {"Multiplayer", "ryuldn_host", "ldn.ryujinx.app",
+     "; ryuldn: the main server's address (host name or IP); lobbies you host live there.\n"
+     "; ldn.ryujinx.app = Ryujinx's public server (empty means the same).\n"},
+    {"Multiplayer", "ryuldn_port", "30456", "; ryuldn: the server's port (Ryujinx uses 30456).\n"},
+    {"Multiplayer", "ryuldn_servers", "",
+     "; ryuldn: more servers whose lobbies you also see and can join, comma separated\n"
+     "; host or host:port (e.g. my-server.example:30456). Lobbies you host stay on the main one.\n"},
+    {"Multiplayer", "ryuldn_passphrase", "",
+     "; ryuldn: empty = public lobbies; Ryujinx-xxxxxxxx (8 hex digits) = only players with the\n"
+     "; same passphrase see each other (Ryujinx's LDN passphrase setting).\n"},
     {"Menu", "key", "F10",
      "; Opens the game menu window (controls, multiplayer, folders): a key name such as F10,\n"
      "; F9 or Home. none = no key. The F12 debug panel (Windows) stays as it is.\n"},

@@ -186,6 +186,10 @@ std::string NACP::GetVersionString() const {
                                                        raw.version_string.size());
 }
 
+u64 NACP::GetLocalCommunicationId() const {
+    return raw.local_communication[0];
+}
+
 u64 NACP::GetDefaultNormalSaveSize() const {
     return raw.user_account_save_data_size;
 }

@@ -14,6 +14,11 @@
 #include "core/hle/service/server_manager.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/network_interface.h"
+#include "core/file_sys/control_metadata.h"
+#include "core/file_sys/patch_manager.h"
+#include "core/hle/service/filesystem/filesystem.h"
+#include "core/loader/loader.h"
+#include "network/ryuldn/backend.h"
 #include "network/network.h"
 
 // This is defined by synchapi.h and conflicts with ServiceContext::CreateEvent
@@ -24,7 +29,15 @@ namespace Service::LDN {
 IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& system_)
     : ServiceFramework{system_, "IUserLocalCommunicationService"},
       service_context{system, "IUserLocalCommunicationService"},
-      lan_discovery{} {
+      ldn_backend{Network::GetLdnBackend()} {
+    if (auto ryu = Network::RyuLdn::GetActiveBackend()) {
+        network = std::make_unique<RyuLdnNetwork>(ryu, [this] { return ReadAppInfo(); });
+    } else {
+        auto lan = std::make_unique<LANDiscovery>();
+        lan_discovery = lan.get();
+        network = std::move(lan);
+    }
+
     // clang-format off
         static const FunctionInfo functions[] = {
             {0, D<&IUserLocalCommunicationService::GetState>, "GetState"},
@@ -68,9 +81,7 @@ IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& sys
 
 IUserLocalCommunicationService::~IUserLocalCommunicationService() {
     if (is_initialized) {
-        if (auto room_member = Network::GetRoomMember().lock()) {
-            room_member->Unbind(ldn_packet_received);
-        }
+        ldn_backend->Unbind(ldn_packet_received);
     }
 
     service_context.CloseEvent(state_change_event);
@@ -80,7 +91,7 @@ Result IUserLocalCommunicationService::GetState(Out<State> out_state) {
     *out_state = State::Error;
 
     if (is_initialized) {
-        *out_state = lan_discovery.GetState();
+        *out_state = network->GetState();
     }
 
     LOG_INFO(Service_LDN, "called, state={}", *out_state);
@@ -92,7 +103,7 @@ Result IUserLocalCommunicationService::GetNetworkInfo(
     OutLargeData<NetworkInfo, BufferAttr_HipcPointer> out_network_info) {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.GetNetworkInfo(*out_network_info));
+    R_RETURN(network->GetNetworkInfo(*out_network_info));
 }
 
 Result IUserLocalCommunicationService::GetIpv4Address(Out<Ipv4Address> out_current_address,
@@ -106,9 +117,10 @@ Result IUserLocalCommunicationService::GetIpv4Address(Out<Ipv4Address> out_curre
     *out_subnet_mask = {Network::TranslateIPv4(network_interface->subnet_mask)};
 
     // When we're connected to a room, spoof the hosts IP address
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        if (room_member->IsConnected()) {
-            *out_current_address = room_member->GetFakeIpAddress();
+    if (ldn_backend->IsConnected()) {
+        *out_current_address = ldn_backend->GetFakeIpAddress();
+        if (const auto mask = ldn_backend->GetFakeSubnetMask()) {
+            *out_subnet_mask = *mask;
         }
     }
 
@@ -121,7 +133,7 @@ Result IUserLocalCommunicationService::GetDisconnectReason(
     Out<DisconnectReason> out_disconnect_reason) {
     LOG_INFO(Service_LDN, "called");
 
-    *out_disconnect_reason = lan_discovery.GetDisconnectReason();
+    *out_disconnect_reason = network->GetDisconnectReason();
     R_SUCCEED();
 }
 
@@ -130,7 +142,7 @@ Result IUserLocalCommunicationService::GetSecurityParameter(
     LOG_INFO(Service_LDN, "called");
 
     NetworkInfo info{};
-    R_TRY(lan_discovery.GetNetworkInfo(info));
+    R_TRY(network->GetNetworkInfo(info));
 
     out_security_parameter->session_id = info.network_id.session_id;
     std::memcpy(out_security_parameter->data.data(), info.ldn.security_parameter.data(),
@@ -142,7 +154,7 @@ Result IUserLocalCommunicationService::GetNetworkConfig(Out<NetworkConfig> out_n
     LOG_INFO(Service_LDN, "called");
 
     NetworkInfo info{};
-    R_TRY(lan_discovery.GetNetworkInfo(info));
+    R_TRY(network->GetNetworkInfo(info));
 
     out_network_config->intent_id = info.network_id.intent_id;
     out_network_config->channel = info.common.channel;
@@ -166,7 +178,7 @@ Result IUserLocalCommunicationService::GetNetworkInfoLatestUpdate(
 
     R_UNLESS(!out_node_latest_update.empty(), ResultBadInput);
 
-    R_RETURN(lan_discovery.GetNetworkInfo(*out_network_info, out_node_latest_update));
+    R_RETURN(network->GetNetworkInfo(*out_network_info, out_node_latest_update));
 }
 
 Result IUserLocalCommunicationService::Scan(
@@ -176,7 +188,7 @@ Result IUserLocalCommunicationService::Scan(
              channel, scan_filter.flag, scan_filter.network_type);
 
     R_UNLESS(!out_network_info.empty(), ResultBadInput);
-    R_RETURN(lan_discovery.Scan(out_network_info, *network_count, scan_filter));
+    R_RETURN(network->Scan(out_network_info, *network_count, scan_filter));
 }
 
 Result IUserLocalCommunicationService::ScanPrivate(
@@ -186,7 +198,7 @@ Result IUserLocalCommunicationService::ScanPrivate(
              channel, scan_filter.flag, scan_filter.network_type);
 
     R_UNLESS(out_network_info.empty(), ResultBadInput);
-    R_RETURN(lan_discovery.Scan(out_network_info, *network_count, scan_filter));
+    R_RETURN(network->Scan(out_network_info, *network_count, scan_filter));
 }
 
 Result IUserLocalCommunicationService::SetProtocol(u32 protocol) {
@@ -203,19 +215,19 @@ Result IUserLocalCommunicationService::SetWirelessControllerRestriction(
 Result IUserLocalCommunicationService::OpenAccessPoint() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.OpenAccessPoint());
+    R_RETURN(network->OpenAccessPoint());
 }
 
 Result IUserLocalCommunicationService::CloseAccessPoint() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.CloseAccessPoint());
+    R_RETURN(network->CloseAccessPoint());
 }
 
 Result IUserLocalCommunicationService::CreateNetwork(const CreateNetworkConfig& create_config) {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.CreateNetwork(create_config.security_config, create_config.user_config,
+    R_RETURN(network->CreateNetwork(create_config.security_config, create_config.user_config,
                                          create_config.network_config));
 }
 
@@ -224,26 +236,26 @@ Result IUserLocalCommunicationService::CreateNetworkPrivate(
     InArray<AddressEntry, BufferAttr_HipcPointer> address_list) {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.CreateNetwork(create_config.security_config, create_config.user_config,
+    R_RETURN(network->CreateNetwork(create_config.security_config, create_config.user_config,
                                          create_config.network_config));
 }
 
 Result IUserLocalCommunicationService::DestroyNetwork() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.DestroyNetwork());
+    R_RETURN(network->DestroyNetwork());
 }
 
 Result IUserLocalCommunicationService::SetAdvertiseData(
     InBuffer<BufferAttr_HipcAutoSelect> buffer_data) {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.SetAdvertiseData(buffer_data));
+    R_RETURN(network->SetAdvertiseData(buffer_data));
 }
 
 Result IUserLocalCommunicationService::SetStationAcceptPolicy(AcceptPolicy accept_policy) {
     LOG_WARNING(Service_LDN, "(STUBBED) called");
-    R_SUCCEED();
+    R_RETURN(network->SetStationAcceptPolicy(accept_policy));
 }
 
 Result IUserLocalCommunicationService::AddAcceptFilterEntry(MacAddress mac_address) {
@@ -254,13 +266,13 @@ Result IUserLocalCommunicationService::AddAcceptFilterEntry(MacAddress mac_addre
 Result IUserLocalCommunicationService::OpenStation() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.OpenStation());
+    R_RETURN(network->OpenStation());
 }
 
 Result IUserLocalCommunicationService::CloseStation() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.CloseStation());
+    R_RETURN(network->CloseStation());
 }
 
 Result IUserLocalCommunicationService::Connect(
@@ -272,14 +284,14 @@ Result IUserLocalCommunicationService::Connect(
              connect_data.security_config.passphrase_size,
              connect_data.security_config.security_mode, connect_data.local_communication_version);
 
-    R_RETURN(lan_discovery.Connect(*network_info, connect_data.user_config,
+    R_RETURN(network->Connect(*network_info, connect_data.user_config,
                                    static_cast<u16>(connect_data.local_communication_version)));
 }
 
 Result IUserLocalCommunicationService::Disconnect() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(lan_discovery.Disconnect());
+    R_RETURN(network->Disconnect());
 }
 
 Result IUserLocalCommunicationService::Initialize(ClientProcessId aruid) {
@@ -288,28 +300,27 @@ Result IUserLocalCommunicationService::Initialize(ClientProcessId aruid) {
     const auto network_interface = Network::GetSelectedNetworkInterface();
     R_UNLESS(network_interface, ResultAirplaneModeEnabled);
 
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        ldn_packet_received = room_member->BindOnLdnPacketReceived(
+    if (lan_discovery) {
+        ldn_packet_received = ldn_backend->BindOnLdnPacketReceived(
             [this](const Network::LDNPacket& packet) { OnLDNPacketReceived(packet); });
-    } else {
-        LOG_ERROR(Service_LDN, "Couldn't bind callback!");
-        R_RETURN(ResultAirplaneModeEnabled);
+        if (!ldn_packet_received) {
+            LOG_ERROR(Service_LDN, "Couldn't bind callback!");
+            R_RETURN(ResultAirplaneModeEnabled);
+        }
     }
 
-    lan_discovery.Initialize([&]() { OnEventFired(); });
+    network->Initialize([&]() { OnEventFired(); });
     is_initialized = true;
     R_SUCCEED();
 }
 
 Result IUserLocalCommunicationService::Finalize() {
     LOG_INFO(Service_LDN, "called");
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        room_member->Unbind(ldn_packet_received);
-    }
+    ldn_backend->Unbind(ldn_packet_received);
 
     is_initialized = false;
 
-    R_RETURN(lan_discovery.Finalize());
+    R_RETURN(network->Finalize());
 }
 
 Result IUserLocalCommunicationService::Initialize2(u32 version, ClientProcessId process_id) {
@@ -318,7 +329,33 @@ Result IUserLocalCommunicationService::Initialize2(u32 version, ClientProcessId 
 }
 
 void IUserLocalCommunicationService::OnLDNPacketReceived(const Network::LDNPacket& packet) {
-    lan_discovery.ReceivePacket(packet);
+    if (lan_discovery) {
+        lan_discovery->ReceivePacket(packet);
+    }
+}
+
+RyuLdnNetwork::AppInfo IUserLocalCommunicationService::ReadAppInfo() const {
+    RyuLdnNetwork::AppInfo info{system.GetApplicationProcessProgramID(), ""};
+    FileSys::NACP nacp;
+    bool have_nacp = system.GetAppLoader().ReadControlData(nacp) == Loader::ResultStatus::Success;
+    if (!have_nacp) {
+        const FileSys::PatchManager pm{system.GetApplicationProcessProgramID(),
+                                       system.GetFileSystemController(),
+                                       system.GetContentProvider()};
+        if (const auto control = pm.GetControlMetadata().first) {
+            nacp = *control;
+            have_nacp = true;
+        }
+    }
+    if (have_nacp) {
+        if (const u64 id = nacp.GetLocalCommunicationId(); id != 0) {
+            info.local_communication_id = id;
+        }
+        info.display_version = nacp.GetVersionString();
+    } else {
+        LOG_WARNING(Service_LDN, "ryuldn: no control data; local communication id = program id");
+    }
+    return info;
 }
 
 void IUserLocalCommunicationService::OnEventFired() {

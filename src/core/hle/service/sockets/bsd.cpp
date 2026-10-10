@@ -6,6 +6,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -19,8 +20,10 @@
 #include "core/hle/service/sockets/bsd.h"
 #include "core/hle/service/sockets/sockets_translate.h"
 #include "core/internal_network/network.h"
+#include "core/internal_network/ldn_census.h"
 #include "core/internal_network/socket_proxy.h"
 #include "core/internal_network/sockets.h"
+#include "network/ldn_backend.h"
 #include "network/network.h"
 #include <common/settings.h>
 
@@ -37,6 +40,13 @@ bool IsConnectionBased(Type type) {
     default:
         UNIMPLEMENTED_MSG("Unimplemented type={}", type);
         return false;
+    }
+}
+
+/// LDN socket census (game_settings.ini [Debug] diagnostics only).
+void CensusCall(s32 fd, const char* what, std::optional<Network::SockAddrIn> addr = std::nullopt) {
+    if (Network::LdnCensus::Enabled()) {
+        Network::LdnCensus::OnCall(fd, what, addr ? &*addr : nullptr);
     }
 }
 
@@ -519,8 +529,8 @@ std::pair<s32, Errno> BSD::SocketImpl(Domain domain, Type type, Protocol protoco
 
     LOG_INFO(Service, "New socket fd={}", fd);
 
-    auto room_member = Network::GetRoomMember().lock();
-    if (room_member && room_member->IsConnected()) {
+    const bool proxy = Network::GetLdnBackend()->IsConnected();
+    if (proxy) {
         descriptor.socket = std::make_shared<Network::ProxySocket>();
     } else {
         descriptor.socket = std::make_shared<Network::Socket>();
@@ -528,6 +538,8 @@ std::pair<s32, Errno> BSD::SocketImpl(Domain domain, Type type, Protocol protoco
 
     descriptor.socket->Initialize(Translate(domain), Translate(type), Translate(protocol));
     descriptor.is_connection_based = IsConnectionBased(type);
+    Network::LdnCensus::OnSocket(fd, static_cast<u32>(domain), static_cast<u32>(type),
+                                 static_cast<u32>(protocol), proxy);
 
     if (Settings::values.airplane_mode.GetValue() && descriptor.is_connection_based) {
         LOG_ERROR(Service, "Airplane mode is enabled, cannot create socket");
@@ -616,6 +628,7 @@ std::pair<s32, Errno> BSD::AcceptImpl(s32 fd, std::vector<u8>& write_buffer) {
     }
 
     FileDescriptor& descriptor = *file_descriptors[fd];
+    CensusCall(fd, "accept");
     auto [result, bsd_errno] = descriptor.socket->Accept();
     if (bsd_errno != Network::Errno::SUCCESS) {
         return {-1, Translate(bsd_errno)};
@@ -643,6 +656,7 @@ Errno BSD::BindImpl(s32 fd, std::span<const u8> addr) {
     }
 
     auto addr_in = GetValue<SockAddrIn>(addr);
+    CensusCall(fd, "bind", Translate(addr_in));
 
     return Translate(file_descriptors[fd]->socket->Bind(Translate(addr_in)));
 }
@@ -659,6 +673,7 @@ Errno BSD::ConnectImpl(s32 fd, std::span<const u8> addr) {
     }
 
     auto addr_in = GetValue<SockAddrIn>(addr);
+    CensusCall(fd, "connect", Translate(addr_in));
 
     const Errno result = Translate(file_descriptors[fd]->socket->Connect(Translate(addr_in)));
 
@@ -722,6 +737,7 @@ Errno BSD::ListenImpl(s32 fd, s32 backlog) {
         LOG_WARNING(Service, "Uninitialized socket");
         return Errno::BADF;
     }
+    CensusCall(fd, "listen");
     return Translate(file_descriptors[fd]->socket->Listen(backlog));
 }
 
@@ -938,6 +954,7 @@ std::pair<s32, Errno> BSD::SendImpl(s32 fd, u32 flags, std::span<const u8> messa
         LOG_WARNING(Service, "Uninitialized socket");
         return {-1, Errno::BADF};
     }
+    CensusCall(fd, "send");
     return Translate(file_descriptors[fd]->socket->Send(message, flags));
 }
 
@@ -960,6 +977,7 @@ std::pair<s32, Errno> BSD::SendToImpl(s32 fd, u32 flags, std::span<const u8> mes
         p_addr_in = &addr_in;
     }
 
+    CensusCall(fd, "sendto");
     return Translate(file_descriptors[fd]->socket->SendTo(flags, message, p_addr_in));
 }
 
@@ -1107,18 +1125,16 @@ BSD::BSD(Core::System& system_, const char* name)
 
     RegisterHandlers(functions);
 
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        proxy_packet_received = room_member->BindOnProxyPacketReceived(
-            [this](const Network::ProxyPacket& packet) { OnProxyPacketReceived(packet); });
-    } else {
+    ldn_backend = Network::GetLdnBackend();
+    proxy_packet_received = ldn_backend->BindOnProxyPacketReceived(
+        [this](const Network::ProxyPacket& packet) { OnProxyPacketReceived(packet); });
+    if (!proxy_packet_received) {
         LOG_ERROR(Service, "Network isn't initialized");
     }
 }
 
 BSD::~BSD() {
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        room_member->Unbind(proxy_packet_received);
-    }
+    ldn_backend->Unbind(proxy_packet_received);
 }
 
 std::unique_lock<std::mutex> BSD::LockService() noexcept {

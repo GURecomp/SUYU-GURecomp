@@ -14,6 +14,7 @@
 #include "common/socket_types.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/sockets/sockets.h"
+#include "network/ldn_backend.h"
 #include "network/network.h"
 
 namespace Core {
@@ -185,7 +186,8 @@ private:
     void OnProxyPacketReceived(const Network::ProxyPacket& packet);
 
     // Callback identifier for the OnProxyPacketReceived event.
-    Network::RoomMember::CallbackHandle<Network::ProxyPacket> proxy_packet_received;
+    std::shared_ptr<Network::LdnBackend> ldn_backend;
+    Network::LdnBackend::CallbackHandle<Network::ProxyPacket> proxy_packet_received;
 
 protected:
     std::unique_lock<std::mutex> LockService() noexcept override;

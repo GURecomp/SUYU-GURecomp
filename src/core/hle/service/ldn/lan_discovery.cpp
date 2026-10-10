@@ -4,8 +4,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/hle/service/ldn/lan_discovery.h"
+#include "core/internal_network/ldn_census.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/network_interface.h"
+#include "network/ldn_backend.h"
 
 namespace Service::LDN {
 
@@ -74,6 +76,15 @@ State LANDiscovery::GetState() const {
 
 void LANDiscovery::SetState(State new_state) {
     state = new_state;
+    if (Network::LdnCensus::Enabled()) {
+        static constexpr const char* kNames[] = {"None",          "Initialized",
+                                                 "AccessPointOpened", "AccessPointCreated",
+                                                 "StationOpened", "StationConnected", "Error"};
+        const auto index = static_cast<u32>(new_state);
+        const Network::IPv4Address own_ip = Network::GetLdnBackend()->GetFakeIpAddress();
+        Network::LdnCensus::OnLdnState(index < 7 ? kNames[index] : "?", own_ip,
+                                       network_info.ldn.node_count);
+    }
 }
 
 Result LANDiscovery::GetNetworkInfo(NetworkInfo& out_network) const {
@@ -411,10 +422,8 @@ void LANDiscovery::OnNetworkInfoChanged() {
 
 Network::IPv4Address LANDiscovery::GetLocalIp() const {
     Network::IPv4Address local_ip{0xFF, 0xFF, 0xFF, 0xFF};
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        if (room_member->IsConnected()) {
-            local_ip = room_member->GetFakeIpAddress();
-        }
+    if (const auto backend = Network::GetLdnBackend(); backend->IsConnected()) {
+        local_ip = backend->GetFakeIpAddress();
     }
     return local_ip;
 }
@@ -469,11 +478,7 @@ void LANDiscovery::SendBroadcast(Network::LDNPacketType type) {
 }
 
 void LANDiscovery::SendPacket(const Network::LDNPacket& packet) {
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        if (room_member->IsConnected()) {
-            room_member->SendLdnPacket(packet);
-        }
-    }
+    Network::GetLdnBackend()->SendLdnPacket(packet);
 }
 
 void LANDiscovery::ReceivePacket(const Network::LDNPacket& packet) {

@@ -16,6 +16,7 @@
 #include "core/internal_network/network.h"
 #include "core/internal_network/network_interface.h"
 #include "core/internal_network/wifi_scanner.h"
+#include "network/ldn_backend.h"
 #include "network/network.h"
 
 #include <atomic>
@@ -572,9 +573,8 @@ void IGeneralService::GetCurrentNetworkProfile(HLERequestContext& ctx) {
         std::strncpy(profile.network_name.data(), st.ssid, sizeof(profile.network_name) - 1);
 
         if (auto room_member = Network::GetRoomMember().lock()) {
-            if (room_member->IsConnected()) {
-                profile.ip_setting_data.ip_address_setting.ip_address =
-                    room_member->GetFakeIpAddress();
+            if (const auto ldn = Network::GetLdnBackend(); ldn->IsConnected()) {
+                profile.ip_setting_data.ip_address_setting.ip_address = ldn->GetFakeIpAddress();
             }
             profile.ip_setting_data.dns_setting.secondary_dns = {8, 8, 8, 8};
         }
@@ -711,10 +711,8 @@ void IGeneralService::GetNetworkProfile(HLERequestContext& ctx) {
             .wireless_setting_data{wifi}};
     }();
 
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        if (room_member->IsConnected()) {
-            profile.ip_setting_data.ip_address_setting.ip_address = room_member->GetFakeIpAddress();
-        }
+    if (const auto ldn = Network::GetLdnBackend(); ldn->IsConnected()) {
+        profile.ip_setting_data.ip_address_setting.ip_address = ldn->GetFakeIpAddress();
     }
 
     ctx.WriteBuffer(profile);
@@ -852,10 +850,8 @@ void IGeneralService::GetCurrentIpAddress(HLERequestContext& ctx) {
         ipv4.emplace(Network::IPv4Address{0, 0, 0, 0});
     }
 
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        if (room_member->IsConnected()) {
-            ipv4 = room_member->GetFakeIpAddress();
-        }
+    if (const auto ldn = Network::GetLdnBackend(); ldn->IsConnected()) {
+        ipv4 = ldn->GetFakeIpAddress();
     }
 
     IPC::ResponseBuilder rb{ctx, 3};
@@ -902,8 +898,8 @@ void IGeneralService::GetCurrentIpConfigInfo(HLERequestContext& ctx) {
     }
 
     if (auto room_member = Network::GetRoomMember().lock()) {
-        if (room_member->IsConnected()) {
-            info.ip.ip_address = room_member->GetFakeIpAddress();
+        if (const auto ldn = Network::GetLdnBackend(); ldn->IsConnected()) {
+            info.ip.ip_address = ldn->GetFakeIpAddress();
         }
         info.dns.is_automatic = true;
         info.dns.primary_dns = {1, 1, 1, 1};

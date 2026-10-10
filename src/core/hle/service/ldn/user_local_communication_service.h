@@ -10,7 +10,9 @@
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/ldn/lan_discovery.h"
 #include "core/hle/service/ldn/ldn_types.h"
+#include "core/hle/service/ldn/ryuldn_network.h"
 #include "core/hle/service/service.h"
+#include "network/ldn_backend.h"
 
 namespace Core {
 class System;
@@ -89,13 +91,19 @@ private:
     /// Callback to parse and handle a received LDN packet.
     void OnLDNPacketReceived(const Network::LDNPacket& packet);
     void OnEventFired();
+    /// The game's LocalCommunicationId and display version (RyuLdn lobbies carry them).
+    RyuLdnNetwork::AppInfo ReadAppInfo() const;
 
     KernelHelpers::ServiceContext service_context;
     Kernel::KEvent* state_change_event;
-    LANDiscovery lan_discovery;
+    /// The LDN state machine (LANDiscovery over a suyu room by default).
+    std::unique_ptr<ILdnNetwork> network;
+    /// The same object when it is a LANDiscovery: it takes the room's LDN packets.
+    LANDiscovery* lan_discovery{};
+    std::shared_ptr<Network::LdnBackend> ldn_backend;
 
     // Callback identifier for the OnLDNPacketReceived event.
-    Network::RoomMember::CallbackHandle<Network::LDNPacket> ldn_packet_received;
+    Network::LdnBackend::CallbackHandle<Network::LDNPacket> ldn_packet_received;
 
     bool is_initialized{};
 };

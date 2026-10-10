@@ -280,6 +280,8 @@ public:
     u64 GetTitleId() const;
     u64 GetDLCBaseTitleId() const;
     std::string GetVersionString() const;
+    /// The first LocalCommunicationId (local wireless play), 0 when none is set.
+    u64 GetLocalCommunicationId() const;
     u64 GetDefaultNormalSaveSize() const;
     u64 GetDefaultJournalSaveSize() const;
     u32 GetSupportedLanguages() const;

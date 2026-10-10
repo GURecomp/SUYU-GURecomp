@@ -4,21 +4,28 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "common/logging/log.h"
 #include "core/arm/recomp/game_settings.h"
 #include "core/core.h"
+#include "core/hle/service/ldn/ldn_types.h"
 #include "core/internal_network/network_interface.h"
 #include "network/network.h"
 #include "network/room.h"
 #include "network/room_member.h"
+#include "network/ryuldn/backend.h"
+#include "network/ryuldn/server.h"
 #include "network/verify_user.h"
 #include "suyu_cmd/multiplayer.h"
 
@@ -203,6 +210,437 @@ void Init() {
     EnsureNetwork();
 }
 
+namespace {
+bool g_ryuldn_chosen{false};
+std::string g_ryuldn_problem; // why ryuldn isn't usable this run ("" = fine)
+} // namespace
+
+namespace {
+
+bool ApplyServersLive(std::string* error);
+
+/// "host" or "host:port"; nullopt when empty or the port isn't a number.
+std::optional<std::pair<std::string, u16>> ParseServer(const std::string& text) {
+    std::string host = Trimmed(text);
+    u16 port = Network::RyuLdn::DefaultPort;
+    if (const auto colon = host.rfind(':'); colon != std::string::npos) {
+        const u32 p = ParseU32(host.substr(colon + 1), 0);
+        if (p == 0 || p > 65535) {
+            return std::nullopt;
+        }
+        port = static_cast<u16>(p);
+        host = Trimmed(host.substr(0, colon));
+    }
+    if (host.empty()) {
+        return std::nullopt;
+    }
+    return std::pair{host, port};
+}
+
+/// Main server first, then the extra ones (duplicates dropped), all with the passphrase.
+std::vector<Network::RyuLdn::Client::Settings> ConfiguredRyuLdnServers() {
+    std::vector<Network::RyuLdn::Client::Settings> out;
+    const std::string passphrase = Trimmed(GS::Value("Multiplayer", "ryuldn_passphrase"));
+    const auto add = [&](const std::string& host, u16 port) {
+        for (const auto& s : out) {
+            if (s.host == host && s.port == port) {
+                return;
+            }
+        }
+        Network::RyuLdn::Client::Settings s;
+        s.host = host;
+        s.port = port;
+        s.passphrase = passphrase;
+        out.push_back(std::move(s));
+    };
+    const u16 port = static_cast<u16>(
+        ParseU32(GS::Value("Multiplayer", "ryuldn_port"), Network::RyuLdn::DefaultPort));
+    const std::string main_host = Trimmed(GS::Value("Multiplayer", "ryuldn_host"));
+    if (main_host.empty()) {
+        add(DefaultRyuLdnHost, port);
+    } else if (main_host == SelfHostKeyword) {
+        add("127.0.0.1", port); // the server this game runs (StartOwnServer)
+    } else if (const auto server = ParseServer(main_host)) {
+        add(server->first, main_host.find(':') == std::string::npos ? port : server->second);
+    } else {
+        add(DefaultRyuLdnHost, port);
+    }
+    for (const auto& entry : ExtraRyuLdnServers()) {
+        if (const auto server = ParseServer(entry)) {
+            add(server->first, server->second);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+std::vector<std::string> ExtraRyuLdnServers() {
+    std::vector<std::string> out;
+    const std::string list = GS::Value("Multiplayer", "ryuldn_servers");
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const std::size_t comma = std::min(list.find(',', start), list.size());
+        if (const std::string entry = Trimmed(list.substr(start, comma - start)); !entry.empty()) {
+            out.push_back(entry);
+        }
+        start = comma + 1;
+    }
+    return out;
+}
+
+std::string MainRyuLdnServer() {
+    const auto main = ConfiguredRyuLdnServers().front();
+    return main.port == Network::RyuLdn::DefaultPort ? main.host
+                                                     : fmt::format("{}:{}", main.host, main.port);
+}
+
+bool AddExtraRyuLdnServer(const std::string& text, std::string* error) {
+    const auto server = ParseServer(text);
+    if (!server) {
+        *error = "not a server address (host or host:port)";
+        return false;
+    }
+    auto list = ExtraRyuLdnServers();
+    const std::string entry = server->second == Network::RyuLdn::DefaultPort
+                                  ? server->first
+                                  : fmt::format("{}:{}", server->first, server->second);
+    if (std::find(list.begin(), list.end(), entry) != list.end()) {
+        *error = "already in the list";
+        return false;
+    }
+    list.push_back(entry);
+    GS::SetValue("Multiplayer", "ryuldn_servers", fmt::format("{}", fmt::join(list, ",")));
+    std::string live_error;
+    if (!ApplyServersLive(&live_error)) {
+        *error = "saved; the game uses it once you leave the lobby (" + live_error + ")";
+    }
+    return true;
+}
+
+void RemoveExtraRyuLdnServer(const std::string& entry) {
+    auto list = ExtraRyuLdnServers();
+    std::erase(list, entry);
+    GS::SetValue("Multiplayer", "ryuldn_servers", fmt::format("{}", fmt::join(list, ",")));
+    std::string ignored;
+    ApplyServersLive(&ignored);
+}
+
+namespace {
+
+std::mutex g_own_server_lock;
+std::unique_ptr<Network::RyuLdn::Server> g_own_server;
+std::string g_own_server_error;
+
+/// Starts the in-game RyuLdn server on [Multiplayer] ryuldn_port (all adapters) if needed.
+bool StartOwnServer(std::string* error) {
+    std::scoped_lock lk{g_own_server_lock};
+    if (g_own_server && g_own_server->GetStatus().running) {
+        return true;
+    }
+    if (!g_own_server) {
+        g_own_server = std::make_unique<Network::RyuLdn::Server>();
+    }
+    const u16 port = static_cast<u16>(
+        ParseU32(GS::Value("Multiplayer", "ryuldn_port"), Network::RyuLdn::DefaultPort));
+    std::string why;
+    if (!g_own_server->Start("", port, why)) {
+        g_own_server_error = why;
+        *error = why;
+        return false;
+    }
+    g_own_server_error.clear();
+    return true;
+}
+
+void StopOwnServer() {
+    std::scoped_lock lk{g_own_server_lock};
+    if (g_own_server) {
+        g_own_server->Stop();
+    }
+    g_own_server_error.clear();
+}
+
+/// Gives the running backend the servers game_settings.ini names now.
+bool ApplyServersLive(std::string* error) {
+    const auto ryu = Network::RyuLdn::GetActiveBackend();
+    if (!ryu) {
+        return true; // room backend: takes effect when switching to Ryujinx LDN
+    }
+    std::string why;
+    if (!ryu->SetServers(ConfiguredRyuLdnServers(), why)) {
+        *error = why;
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+RyuLdnServerChoice CurrentRyuLdnServerChoice() {
+    const std::string host = Trimmed(GS::Value("Multiplayer", "ryuldn_host"));
+    if (host.empty() || host == DefaultRyuLdnHost) {
+        return {RyuLdnServerChoice::Mode::Public, {}};
+    }
+    if (host == SelfHostKeyword) {
+        return {RyuLdnServerChoice::Mode::Host, {}};
+    }
+    return {RyuLdnServerChoice::Mode::Friend, host};
+}
+
+bool ChooseRyuLdnServer(const RyuLdnServerChoice& choice, std::string* error) {
+    using Mode = RyuLdnServerChoice::Mode;
+    if (choice.mode == Mode::Friend && !ParseServer(choice.address)) {
+        *error = "enter your friend's address (e.g. 26.12.34.56)";
+        return false;
+    }
+    const auto ryu = Network::RyuLdn::GetActiveBackend();
+    if (ryu && ryu->client().InNetwork()) {
+        *error = "leave the lobby first";
+        return false;
+    }
+    const std::string old = GS::Value("Multiplayer", "ryuldn_host");
+    if (choice.mode == Mode::Host) {
+        if (!StartOwnServer(error)) {
+            return false;
+        }
+    } else {
+        StopOwnServer();
+    }
+    GS::SetValue("Multiplayer", "ryuldn_host",
+                 choice.mode == Mode::Public ? std::string{DefaultRyuLdnHost}
+                 : choice.mode == Mode::Host ? std::string{SelfHostKeyword}
+                                             : Trimmed(choice.address));
+    if (!ApplyServersLive(error)) {
+        GS::SetValue("Multiplayer", "ryuldn_host", old);
+        return false;
+    }
+    return true;
+}
+
+OwnServerStatus GetOwnServerStatus() {
+    std::scoped_lock lk{g_own_server_lock};
+    OwnServerStatus out;
+    if (g_own_server) {
+        const auto st = g_own_server->GetStatus();
+        out.running = st.running;
+        out.port = st.port;
+        out.connections = st.connections;
+        out.lobbies = st.lobbies;
+        out.players = st.players;
+    }
+    out.error = g_own_server_error;
+    return out;
+}
+
+bool SetupLdnBackend() {
+    std::scoped_lock lock{g_mutex};
+    const std::string backend = Trimmed(GS::Value("Multiplayer", "backend"));
+    if (backend.empty() || backend == "room") {
+        return true;
+    }
+    if (backend != "ryuldn") {
+        LOG_ERROR(Network, "multiplayer: unknown [Multiplayer] backend '{}' (room or ryuldn)",
+                  backend);
+        return false;
+    }
+    g_ryuldn_chosen = true;
+    if (CurrentRyuLdnServerChoice().mode == RyuLdnServerChoice::Mode::Host) {
+        std::string error;
+        if (!StartOwnServer(&error)) {
+            LOG_ERROR(Network, "multiplayer: hosting the RyuLdn server failed: {}", error);
+        }
+    }
+    auto servers = ConfiguredRyuLdnServers();
+    const std::string& passphrase = servers[0].passphrase;
+    if (!passphrase.empty() &&
+        (passphrase.size() != 16 || passphrase.rfind("Ryujinx-", 0) != 0)) {
+        LOG_WARNING(Network, "multiplayer: ryuldn_passphrase '{}' isn't Ryujinx-xxxxxxxx; the "
+                             "server treats it as empty (public lobbies)",
+                    passphrase);
+    }
+    LOG_INFO(Network, "multiplayer: local play through the RyuLdn server {}:{}{}{}",
+             servers[0].host, servers[0].port,
+             servers.size() > 1 ? fmt::format(" + {} more", servers.size() - 1) : std::string{},
+             passphrase.empty() ? "" : " (private passphrase)");
+    Network::RyuLdn::Activate(std::make_shared<Network::RyuLdn::Backend>(std::move(servers)));
+    return true;
+}
+
+bool UsingRyuLdn() {
+    std::scoped_lock lock{g_mutex};
+    return g_ryuldn_chosen;
+}
+
+bool RyuLdnChosenInSettings() {
+    return Trimmed(GS::Value("Multiplayer", "backend")) == "ryuldn";
+}
+
+void ChooseBackend(bool ryuldn) {
+    GS::SetValue("Multiplayer", "backend", ryuldn ? "ryuldn" : "room");
+}
+
+std::string RyuLdnServer() {
+    const auto ryu = Network::RyuLdn::GetActiveBackend();
+    if (!ryu) {
+        return {};
+    }
+    std::string out;
+    for (std::size_t i = 0; i < ryu->ServerCount(); i++) {
+        out += fmt::format("{}{}:{}", i ? ", " : "", ryu->settings(i).host, ryu->settings(i).port);
+    }
+    return out;
+}
+
+// ── Public rooms: the lobbies of this game on the RyuLdn servers (a scan per server) ──
+
+namespace {
+
+struct RoomsState {
+    std::mutex lock;
+    PublicRooms rooms;
+};
+const auto g_rooms = std::make_shared<RoomsState>();
+
+std::string ServerLabel(const std::string& host, std::size_t index) {
+    if (host == DefaultRyuLdnHost) {
+        return "Ryujinx";
+    }
+    if (index == 0) {
+        switch (CurrentRyuLdnServerChoice().mode) {
+        case RyuLdnServerChoice::Mode::Host:
+            return "Your server";
+        case RyuLdnServerChoice::Mode::Friend:
+            return "Friend's server";
+        default:
+            break;
+        }
+    }
+    return fmt::format("Server {}", index + 1);
+}
+
+std::string NodeName(const std::array<u8, 0x21>& raw) {
+    std::string name(reinterpret_cast<const char*>(raw.data()), raw.size());
+    name.resize(std::strlen(name.c_str()));
+    return name.empty() ? std::string{"?"} : name;
+}
+
+void ScanPublicRooms(std::shared_ptr<RoomsState> state, u64 local_communication_id) {
+    namespace RL = Network::RyuLdn;
+    const auto servers = ConfiguredRyuLdnServers();
+    RL::ScanFilterBlob filter{};
+    Service::LDN::ScanFilter f{};
+    f.network_id.intent_id.local_communication_id = local_communication_id;
+    f.flag = Service::LDN::ScanFilterFlag::LocalCommunicationId;
+    std::memcpy(filter.data(), &f, sizeof(f));
+
+    std::vector<std::optional<std::vector<RL::NetworkInfoBlob>>> found(servers.size());
+    std::vector<std::string> errors(servers.size());
+    std::vector<std::thread> threads;
+    for (std::size_t i = 0; i < servers.size(); i++) {
+        threads.emplace_back([&, i] {
+            // A short session of its own: doesn't disturb the game's connection.
+            auto settings = servers[i];
+            settings.keep_identity = false;
+            RL::Client client{std::move(settings), {}};
+            found[i] = client.Scan(filter);
+            if (!found[i]) {
+                errors[i] = client.LastError().empty() ? "no answer" : client.LastError();
+            }
+            client.Close();
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    PublicRooms result;
+    result.refreshed = true;
+    for (std::size_t i = 0; i < servers.size(); i++) {
+        const std::string label = ServerLabel(servers[i].host, i);
+        if (!found[i]) {
+            result.errors.push_back(label + ": " + errors[i]);
+            continue;
+        }
+        for (const auto& blob : *found[i]) {
+            Service::LDN::NetworkInfo info;
+            std::memcpy(&info, blob.data(), sizeof(info));
+            PublicRoom room;
+            room.server = label;
+            room.players = info.ldn.node_count;
+            room.max_players = info.ldn.node_count_max;
+            for (const auto& node : info.ldn.nodes) {
+                if (node.is_connected) {
+                    room.names.push_back(NodeName(node.user_name));
+                }
+            }
+            room.host = room.names.empty() ? std::string{"?"} : room.names.front();
+            result.rooms.push_back(std::move(room));
+        }
+    }
+    std::scoped_lock lk{state->lock};
+    result.private_passphrase = !servers[0].passphrase.empty();
+    result.last_refresh = std::chrono::steady_clock::now();
+    state->rooms = std::move(result);
+}
+
+} // namespace
+
+void RefreshPublicRooms() {
+    u64 id;
+    {
+        std::scoped_lock lock{g_mutex};
+        id = g_game.id;
+    }
+    std::scoped_lock lk{g_rooms->lock};
+    if (g_rooms->rooms.refreshing) {
+        return;
+    }
+    if (id == 0) {
+        g_rooms->rooms.errors = {"the game hasn't started yet"};
+        return;
+    }
+    g_rooms->rooms.refreshing = true;
+    // Detached: holds its own reference to the state, finishes within the connect timeouts.
+    std::thread([state = g_rooms, id] {
+        ScanPublicRooms(state, id);
+        std::scoped_lock done{state->lock};
+        state->rooms.refreshing = false;
+    }).detach();
+}
+
+PublicRooms GetPublicRooms() {
+    std::scoped_lock lk{g_rooms->lock};
+    return g_rooms->rooms;
+}
+
+std::string RyuLdnStatusText() {
+    std::scoped_lock lock{g_mutex};
+    if (!g_ryuldn_chosen) {
+        return {};
+    }
+    if (!g_ryuldn_problem.empty()) {
+        return "RyuLdn: " + g_ryuldn_problem;
+    }
+    const auto ryu = Network::RyuLdn::GetActiveBackend();
+    if (!ryu) {
+        return "RyuLdn: off";
+    }
+    std::string out = "RyuLdn: ";
+    auto& client = ryu->client();
+    if (ryu->IsConnected()) {
+        const auto ip = ryu->GetFakeIpAddress();
+        out += fmt::format("in a lobby as {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    } else if (client.IsConnected()) {
+        out += "connected, not in a lobby";
+    } else {
+        const std::string error = client.LastError();
+        out += error.empty() ? "not connected yet (connects when the game looks for lobbies)"
+                             : "not connected (" + error + ")";
+    }
+    return out;
+}
+
 Config Load() {
     Config c;
     const auto get = [](const char* key, const std::string& fallback) {
@@ -231,6 +669,10 @@ void Save(const Config& c) {
 
 bool Host(Core::System& system, const Config& c, std::string* error) {
     std::scoped_lock lock{g_mutex};
+    if (g_ryuldn_chosen) {
+        *error = "this run uses the RyuLdn server ([Multiplayer] backend = ryuldn)";
+        return false;
+    }
     if (!ValidNickname(c.nickname, error)) {
         return false;
     }
@@ -272,6 +714,10 @@ bool Host(Core::System& system, const Config& c, std::string* error) {
 
 bool Join(const Config& c, std::string* error) {
     std::scoped_lock lock{g_mutex};
+    if (g_ryuldn_chosen) {
+        *error = "this run uses the RyuLdn server ([Multiplayer] backend = ryuldn)";
+        return false;
+    }
     if (!ValidNickname(c.nickname, error)) {
         return false;
     }
@@ -362,6 +808,13 @@ void AutoStart(Core::System& system) {
     SetGame(system);
     const Config c = Load();
     std::string error;
+    if (UsingRyuLdn()) {
+        if (c.mode != "off") {
+            LOG_INFO(Network, "multiplayer: [Multiplayer] mode = {} ignored (backend = ryuldn)",
+                     c.mode);
+        }
+        return;
+    }
     if (c.mode == "host") {
         if (!Host(system, c, &error)) {
             LOG_ERROR(Network, "multiplayer: hosting at start failed: {}", error);

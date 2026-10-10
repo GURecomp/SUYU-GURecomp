@@ -185,6 +185,9 @@ through a VPN such as Radmin VPN or ZeroTier.
    the next start.
 6. In game, use the Gathering Hall's local play.
 
+To play with Ryujinx players instead (a RyuLdn server, experimental), see
+[RYULDN.md](RYULDN.md).
+
 ## 9. Troubleshooting
 
 | Problem | Fix |

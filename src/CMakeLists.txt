@@ -261,6 +261,7 @@ add_subdirectory(input_common)
 add_subdirectory(frontend_common)
 add_subdirectory(shader_recompiler)
 add_subdirectory(shader_scan)
+add_subdirectory(ryuldn_test)
 
 if (YUZU_TESTS)
     add_subdirectory(tests)

@@ -451,7 +451,297 @@ void DoJoin() {
     }
 }
 
+/// [Multiplayer] backend = ryuldn: the lobby server replaces the room for this run.
+void DrawRyuLdn() {
+    static bool show_server = false;
+    const std::string status = Multiplayer::RyuLdnStatusText();
+    const bool ok = status.find("in a lobby") != std::string::npos;
+    const bool bad = status.find("no server") != std::string::npos ||
+                     status.find("not connected (") != std::string::npos;
+    ImGui::TextColored(ok ? kGreen : (bad ? kRed : kGrey), "%s", status.c_str());
+    if (const std::string server = Multiplayer::RyuLdnServer(); !server.empty()) {
+        ImGui::TextColored(kGrey, "Server: %s", show_server ? server.c_str() : "(hidden)");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(show_server ? "Hide##ryusrv" : "Show##ryusrv")) {
+            show_server = !show_server;
+        }
+    }
+    ImGui::TextWrapped(
+        "Lobbies are found and joined in the game itself (local wireless play), together with "
+        "Ryujinx players on the same server; the Public rooms tab lists them.");
+
+    // Where the lobbies live: Ryujinx's public server, this PC, or a friend's PC.
+    using Mode = Multiplayer::RyuLdnServerChoice::Mode;
+    static char friend_address[128]{};
+    static bool show_friend = false;
+    static std::string choice_message;
+    static bool choice_bad = false;
+    const auto choice = Multiplayer::CurrentRyuLdnServerChoice();
+    if (choice.mode == Mode::Friend && friend_address[0] == '\0') {
+        CopyTo(friend_address, choice.address);
+    }
+    const auto choose = [](Multiplayer::RyuLdnServerChoice next, const char* done) {
+        std::string error;
+        if (Multiplayer::ChooseRyuLdnServer(next, &error)) {
+            choice_message = done;
+            choice_bad = false;
+        } else {
+            choice_message = "Couldn't switch: " + error;
+            choice_bad = true;
+        }
+    };
+
+    SectionTitle("Server");
+    if (ImGui::RadioButton("Ryujinx public server", choice.mode == Mode::Public) &&
+        choice.mode != Mode::Public) {
+        choose({Mode::Public, {}}, "Using Ryujinx's public server.");
+    }
+    HelpMarker("ldn.ryujinx.app: everyone's public lobbies, no setup.");
+    if (ImGui::RadioButton("Host for friends (Radmin VPN)", choice.mode == Mode::Host) &&
+        choice.mode != Mode::Host) {
+        choose({Mode::Host, {}}, "Your server is running; friends join your address.");
+    }
+    HelpMarker("This game runs the lobby server; friends connect to your address (Radmin VPN or "
+               "home network). Works without the public server. Windows may ask to allow the "
+               "game on the network: allow it.");
+    if (ImGui::RadioButton("Join a friend's server", choice.mode == Mode::Friend) &&
+        choice.mode != Mode::Friend) {
+        if (friend_address[0] != '\0') {
+            choose({Mode::Friend, friend_address}, "Using your friend's server.");
+        } else {
+            choice_message = "Enter your friend's address below, then press Use.";
+            choice_bad = false;
+        }
+    }
+
+    if (choice.mode == Mode::Host) {
+        const auto own = Multiplayer::GetOwnServerStatus();
+        if (own.running) {
+            ImGui::TextColored(kGreen, "Your server: %zu connected, %zu lobbies (port %u)",
+                               own.connections, own.lobbies, own.port);
+        } else {
+            ImGui::TextColored(kRed, "Your server isn't running%s%s", own.error.empty() ? "" : ": ",
+                               own.error.c_str());
+        }
+        ImGui::TextUnformatted("Give friends one of these addresses:");
+        const auto addresses = Multiplayer::LocalAddresses();
+        for (std::size_t i = 0; i < addresses.size(); ++i) {
+            const auto& a = addresses[i];
+            ImGui::PushID(static_cast<int>(i) + 7000);
+            if (ImGui::SmallButton("Copy")) {
+                ImGui::SetClipboardText(a.ip.c_str());
+                Notify("Address copied to the clipboard");
+            }
+            ImGui::SameLine();
+            const bool shown = g_shown_addresses.contains(i + 7000);
+            if (ImGui::SmallButton(shown ? a.ip.c_str() : "show address")) {
+                if (shown) {
+                    g_shown_addresses.erase(i + 7000);
+                } else {
+                    g_shown_addresses.insert(i + 7000);
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(a.label.c_str());
+            ImGui::PopID();
+        }
+        ImGui::TextWrapped("Friends with this game: Join a friend's server, paste the address. "
+                           "Ryujinx friends: Multiplayer mode RyuLDN with your address as the "
+                           "LDN server. Then host or search in the game's local play.");
+    }
+
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+    const bool enter = ImGui::InputTextWithHint(
+        "##friendsrv", "friend's address, e.g. 26.12.34.56", friend_address,
+        sizeof(friend_address),
+        ImGuiInputTextFlags_EnterReturnsTrue |
+            (show_friend ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password));
+    ImGui::SameLine();
+    if (ImGui::Button(show_friend ? "Hide##fs" : "Show##fs")) {
+        show_friend = !show_friend;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Paste##fs")) {
+        if (char* clip = SDL_GetClipboardText()) {
+            CopyTo(friend_address, clip);
+            SDL_free(clip);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Use##fs") || enter) {
+        choose({Mode::Friend, friend_address}, "Using your friend's server.");
+    }
+    if (!choice_message.empty()) {
+        ImGui::TextColored(choice_bad ? kRed : kGrey, "%s", choice_message.c_str());
+    }
+}
+
+/// Public rooms: this game's lobbies on the RyuLdn servers, refreshed while the tab is open.
+void DrawPublicRooms() {
+    static char new_server[128]{};
+    static std::string server_message;
+    static bool show_servers = false;
+    constexpr auto kRefreshEvery = std::chrono::seconds(15);
+
+    const Multiplayer::PublicRooms list = Multiplayer::GetPublicRooms();
+    if (!list.refreshing &&
+        (!list.refreshed || std::chrono::steady_clock::now() - list.last_refresh > kRefreshEvery)) {
+        Multiplayer::RefreshPublicRooms();
+    }
+
+    if (!Multiplayer::UsingRyuLdn()) {
+        ImGui::TextColored(kYellow, "To join these, switch to Ryujinx LDN above and restart.");
+    }
+    if (ImGui::Button("Refresh")) {
+        Multiplayer::RefreshPublicRooms();
+    }
+    ImGui::SameLine();
+    if (list.refreshing) {
+        ImGui::TextColored(kGrey, "Looking for lobbies...");
+    } else if (list.refreshed) {
+        const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - list.last_refresh);
+        ImGui::TextColored(kGrey, "%zu lobbies%s  -  updated %lld s ago", list.rooms.size(),
+                           list.private_passphrase ? " (your passphrase)" : "",
+                           static_cast<long long>(age.count()));
+    }
+    HelpMarker("Lobbies of this game that you (and Ryujinx players) can join: open local play "
+               "in the game and search, as on a Switch. Hosting a lobby in the game puts it "
+               "here for everyone. With a passphrase set, only lobbies with the same passphrase "
+               "show up.");
+    for (const auto& error : list.errors) {
+        ImGui::TextColored(kRed, "%s", error.c_str());
+    }
+
+    const float rows_height = ImGui::GetFontSize() * 12.0f;
+    if (ImGui::BeginTable("publicrooms", 3,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                              ImGuiTableFlags_BordersInnerH,
+                          ImVec2(0.0f, rows_height))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Host");
+        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFontSize() * 5.0f);
+        ImGui::TableSetupColumn("Server", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFontSize() * 6.0f);
+        ImGui::TableHeadersRow();
+        for (const auto& room : list.rooms) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(room.host.c_str());
+            if (room.names.size() > 1 && ImGui::IsItemHovered()) {
+                std::string names;
+                for (const auto& n : room.names) {
+                    names += (names.empty() ? "" : "\n") + n;
+                }
+                ImGui::SetTooltip("%s", names.c_str());
+            }
+            ImGui::TableNextColumn();
+            ImGui::Text("%d / %d", room.players, room.max_players);
+            ImGui::TableNextColumn();
+            ImGui::TextColored(kGrey, "%s", room.server.c_str());
+        }
+        ImGui::EndTable();
+    }
+    if (list.refreshed && list.rooms.empty() && list.errors.empty()) {
+        ImGui::TextColored(kGrey, "No open lobbies right now.");
+    }
+
+    SectionTitle("Servers");
+    const std::string main_server = Multiplayer::MainRyuLdnServer();
+    if (main_server == Multiplayer::DefaultRyuLdnHost) {
+        ImGui::BulletText("Ryujinx (%s) - main", main_server.c_str());
+    } else if (Multiplayer::CurrentRyuLdnServerChoice().mode ==
+               Multiplayer::RyuLdnServerChoice::Mode::Host) {
+        ImGui::BulletText("Your server - main");
+    } else {
+        ImGui::BulletText("Server 1: %s - main", show_servers ? main_server.c_str() : "(hidden)");
+    }
+    HelpMarker("Lobbies you host go to the main server (game_settings.ini ryuldn_host; empty = "
+               "Ryujinx's public server, ldn.ryujinx.app).");
+    const auto extra = Multiplayer::ExtraRyuLdnServers();
+    for (std::size_t i = 0; i < extra.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::BulletText("Server %zu: %s", i + 2,
+                          show_servers ? extra[i].c_str() : "(hidden)");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) {
+            Multiplayer::RemoveExtraRyuLdnServer(extra[i]);
+            server_message = "Removed.";
+        }
+        ImGui::PopID();
+    }
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+    const bool enter = ImGui::InputTextWithHint(
+        "##newserver", "another server, host or host:port", new_server, sizeof(new_server),
+        ImGuiInputTextFlags_EnterReturnsTrue |
+            (show_servers ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password));
+    ImGui::SameLine();
+    if (ImGui::Button("Add") || enter) {
+        std::string error;
+        if (Multiplayer::AddExtraRyuLdnServer(new_server, &error)) {
+            new_server[0] = '\0';
+            server_message = error.empty()
+                                 ? "Added: its lobbies show up here and in the game's search."
+                                 : "Added; " + error;
+            Multiplayer::RefreshPublicRooms();
+        } else {
+            server_message = "Couldn't add: " + error;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(show_servers ? "Hide##srv" : "Show##srv")) {
+        show_servers = !show_servers;
+    }
+    HelpMarker("More RyuLdn servers (for example one your group runs): their lobbies are listed "
+               "and joinable too, next to the Ryujinx server's.");
+    if (!server_message.empty()) {
+        ImGui::TextColored(kGrey, "%s", server_message.c_str());
+    }
+}
+
+void DrawRoom();
+
 void DrawMultiplayer() {
+    // The switch: which network carries local play (read at start).
+    const bool running_ryu = Multiplayer::UsingRyuLdn();
+    const bool chosen_ryu = Multiplayer::RyuLdnChosenInSettings();
+    ImGui::TextUnformatted("Play over:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Suyu room", !chosen_ryu) && chosen_ryu) {
+        Multiplayer::ChooseBackend(false);
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Ryujinx LDN", chosen_ryu) && !chosen_ryu) {
+        Multiplayer::ChooseBackend(true);
+    }
+    HelpMarker("Suyu room: you and your friends join one room (host/invite below), e.g. over "
+               "Radmin VPN. Ryujinx LDN: lobbies on Ryujinx's public server, shared with Ryujinx "
+               "players; find them in the game's local play or in Public rooms. One at a time; "
+               "switching needs a restart.");
+    if (chosen_ryu != running_ryu) {
+        ImGui::TextColored(kYellow, "Restart the game to switch to %s.",
+                           chosen_ryu ? "Ryujinx LDN" : "suyu rooms");
+    }
+
+    if (ImGui::BeginTabBar("mptabs")) {
+        if (ImGui::BeginTabItem(running_ryu ? "Ryujinx LDN" : "Suyu room")) {
+            if (running_ryu) {
+                DrawRyuLdn();
+            } else {
+                DrawRoom();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Public rooms")) {
+            DrawPublicRooms();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+void DrawRoom() {
     const Multiplayer::Status st = Multiplayer::GetStatus();
     using Phase = Multiplayer::Status::Phase;
     switch (st.phase) {

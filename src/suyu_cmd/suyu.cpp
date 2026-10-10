@@ -924,6 +924,7 @@ int main(int argc, char** argv) {
         load_parameters.applet_id = Service::AM::AppletId::Application;
     }
     Multiplayer::Init();
+    Multiplayer::SetupLdnBackend(); // before Load: the socket services bind to the LDN backend
     // The game's text input (chat, names) comes from the PC keyboard; the other applets keep
     // their defaults (null entries aren't replaced).
     {
