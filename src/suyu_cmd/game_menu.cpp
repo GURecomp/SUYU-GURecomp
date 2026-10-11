@@ -724,6 +724,16 @@ void DrawMultiplayer() {
                            chosen_ryu ? "Ryujinx LDN" : "suyu rooms");
     }
 
+    // One name for both networks: suyu rooms and Ryujinx lobbies (Public rooms lists).
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+    ImGui::InputText("Name", g_nick, sizeof(g_nick));
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        Multiplayer::Save(FieldsToConfig());
+    }
+    HelpMarker("Shown to other players in suyu rooms and Ryujinx lobbies (Public rooms). "
+               "4-20 characters: letters, digits, space, . _ -. Applies to the next room or "
+               "lobby you host or join.");
+
     if (ImGui::BeginTabBar("mptabs")) {
         if (ImGui::BeginTabItem(running_ryu ? "Ryujinx LDN" : "Suyu room")) {
             if (running_ryu) {
@@ -882,12 +892,6 @@ void DrawRoom() {
     }
 
     SectionTitle("You");
-    ImGui::SetNextItemWidth(field);
-    ImGui::InputText("Nickname", g_nick, sizeof(g_nick));
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        Multiplayer::Save(FieldsToConfig());
-    }
-    HelpMarker("4-20 characters: letters, digits, space, . _ -");
     ImGui::TextUnformatted("When the game starts:");
     ImGui::SameLine();
     bool startup_changed = ImGui::RadioButton("Stay offline", &g_startup, 0);

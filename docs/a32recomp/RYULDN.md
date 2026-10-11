@@ -25,7 +25,7 @@ server can't be in the same lobby (a host can't serve both at once).
   RyuLDN with the host's address as their LDN server. Then everyone hosts or searches in the
   game's local play as usual.
 - **Public rooms** lists this game's open lobbies on the current server and any extra
-  servers, with host name, players and server; it refreshes every 15 s while open. Join them
+  servers, with host name (the **Name** at the top of the Multiplayer tab), players and server; it refreshes every 15 s while open. Join them
   from the game's own local play search. Below the list you can add or remove extra servers
   (their addresses stay hidden until **Show**).
 

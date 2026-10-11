@@ -172,7 +172,7 @@ Mods go in the export's `mods\0100770008DD8000\` folder, one folder per mod:
 This is the game's own local play, carried over a suyu room. It works over the internet
 through a VPN such as Radmin VPN or ZeroTier.
 
-1. Everyone sets a nickname in the game menu's **Multiplayer** tab (**4-20 characters**:
+1. Everyone sets a **Name** at the top of the game menu's **Multiplayer** tab (**4-20 characters**:
    letters, digits, space, `. _ -`; each player a different one).
 2. The host presses **Host**, then **Copy invite** next to their VPN address (for example
    Radmin VPN) and sends that invite to the others. Addresses stay hidden on screen until

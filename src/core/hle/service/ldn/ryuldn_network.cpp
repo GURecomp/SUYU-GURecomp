@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "common/logging.h"
+#include "core/arm/recomp/game_settings.h"
 #include "core/hle/service/ldn/ldn_results.h"
 #include "core/hle/service/ldn/ryuldn_network.h"
 #include "network/ryuldn/backend.h"
@@ -22,6 +23,19 @@ static_assert(sizeof(NetworkConfig) == sizeof(RL::NetworkConfigBlob));
 namespace {
 
 constexpr u64 kDefaultLocalCommunicationId = ~u64{0}; // "this application's own id"
+
+/// The menu's Name ([Multiplayer] nickname) replaces the console account name the game passes,
+/// so lobby lists show the same name as suyu rooms. Empty = keep the game's.
+UserConfig WithPlayerName(const UserConfig& user_config) {
+    UserConfig out = user_config;
+    const std::string name = Core::GameSettings::Value("Multiplayer", "nickname");
+    if (!name.empty()) {
+        out.user_name.fill(0);
+        std::memcpy(out.user_name.data(), name.data(),
+                    std::min(name.size(), out.user_name.size() - 1));
+    }
+    return out;
+}
 
 const char* StateName(State state) {
     switch (state) {
@@ -349,7 +363,7 @@ Result RyuLdnNetwork::CreateNetwork(const SecurityConfig& security_config,
             config.channel = WifiChannel::Wifi24_6; // as LANDiscovery picks
         }
         request.security_config = Blob<RL::SecurityConfigBlob>(security_config);
-        request.user_config = Blob<RL::UserConfigBlob>(user_config);
+        request.user_config = Blob<RL::UserConfigBlob>(WithPlayerName(user_config));
         request.network_config = Blob<RL::NetworkConfigBlob>(config);
         advert = advertise_data;
         LOG_INFO(Service_LDN, "ryuldn: creating a lobby (id {:016X}, scene {}, {} players max)",
@@ -401,7 +415,7 @@ Result RyuLdnNetwork::Connect(const NetworkInfo& network_info_, const UserConfig
         SecurityConfig security{};
         security.security_mode = target.ldn.security_mode;
         request.security_config = Blob<RL::SecurityConfigBlob>(security);
-        request.user_config = Blob<RL::UserConfigBlob>(user_config);
+        request.user_config = Blob<RL::UserConfigBlob>(WithPlayerName(user_config));
         request.local_communication_version = local_communication_version;
         request.network_info = Blob<RL::NetworkInfoBlob>(target);
     }

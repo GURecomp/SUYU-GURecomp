@@ -103,7 +103,8 @@ constexpr Option kOptions[] = {
      "; Local play over a suyu room (e.g. through Radmin VPN). off | host | join: what to do at\n"
      "; start. Also in the game menu (F10), which saves its fields here.\n"},
     {"Multiplayer", "nickname", "Hunter",
-     "; Your name in the room: 4-20 characters (letters, digits, space, . _ -).\n"},
+     "; Your name in suyu rooms and Ryujinx lobbies (the game menu's Name): 4-20\n"
+     "; characters (letters, digits, space, . _ -).\n"},
     {"Multiplayer", "address", "",
      "; join: the host's address (their Radmin VPN IP, for example).\n"},
     {"Multiplayer", "port", "24872", "; Room port (host and join must match).\n"},
