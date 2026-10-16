@@ -323,7 +323,7 @@ bool IsTrue(const std::string& s) {
 
 std::atomic<u32> g_aspect_pc{0};
 
-bool NativeGpuSet(bool* on) {
+static bool NativeGpuSet(bool* on) {
     bool present = false;
     const std::string v = ReadValue("Graphics", "native_gpu", &present);
     *on = v == "true" || v == "1" || v == "yes" || v == "on";
