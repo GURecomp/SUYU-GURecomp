@@ -75,6 +75,12 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#ifdef _MSC_VER
+#define NVN_VK_NOINLINE __declspec(noinline)
+#else
+#define NVN_VK_NOINLINE __attribute__((noinline))
+#endif
+
 namespace Vulkan {
 
 namespace {
@@ -640,9 +646,8 @@ constexpr const char* kProfCountNames[PC_Count] = {"programs", "pipelines", "lat
                                                    "b_vb", "b_ib", "b_cb1", "b_ub", "dup_vb", "dup_ib", "dup_cb1", "dup_ub", "rebuilt_file", "rebuilt_run", "warm_run_hits", "prog_miss"};
 
 inline u64 ProfNow() {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return static_cast<u64>(t.QuadPart);
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 struct Prof {
@@ -659,12 +664,11 @@ struct Prof {
 
     /// Returns an empty string on success, else what failed (the caller stops loudly).
     std::string Open(const std::filesystem::path& path) {
-        LARGE_INTEGER f;
-        if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0) return "QueryPerformanceFrequency failed";
-        ms_per_tick = 1000.0 / static_cast<double>(f.QuadPart);
-        slow_frame_ticks = static_cast<u64>(f.QuadPart) * 25 / 1000;
-        slow_event_ticks = static_cast<u64>(f.QuadPart) * 10 / 1000;
-        second_ticks = static_cast<u64>(f.QuadPart);
+        constexpr u64 kTicksPerSecond = 1'000'000'000; // ProfNow() counts nanoseconds
+        ms_per_tick = 1000.0 / static_cast<double>(kTicksPerSecond);
+        slow_frame_ticks = kTicksPerSecond * 25 / 1000;
+        slow_event_ticks = kTicksPerSecond * 10 / 1000;
+        second_ticks = kTicksPerSecond;
         out.open(path, std::ios::trunc);
         if (!out) return "cannot open " + path.string();
         out << "# nvn_prof: F = slow frame (wall > 25 ms or one event > 10 ms), S = one-second summary. Bucket = total ms/max single ms.\n";
@@ -1171,8 +1175,13 @@ public:
         Note("FATAL: " + what);
         WriteStats();
         const std::string text = "NVN Vulkan renderer: " + what + "\nSee nvn_vk.txt / nvn_vk_crash.txt in the user folder.";
+#ifdef _WIN32
         MessageBoxA(nullptr, text.c_str(), "HEY - something is missing", MB_OK | MB_ICONERROR | MB_TOPMOST);
         TerminateProcess(GetCurrentProcess(), 3);
+#else
+        std::fprintf(stderr, "%s\n", text.c_str());
+        std::_Exit(3);
+#endif
         for (;;) {
         }
     }
@@ -1533,7 +1542,7 @@ private:
         return at;
     }
     /// A guest buffer that could not be used: counted per kind and reason, with the first addresses, in nvn_vk.txt.
-    __declspec(noinline) void UploadFailure(const char* what, u64 va, u32 size) {
+    NVN_VK_NOINLINE void UploadFailure(const char* what, u64 va, u32 size) {
         const std::string key = fmt::format("{}: {}", what, upload_fail);
         const u64 n = ++stats.notes[key];
         if (n <= 6) {
@@ -1817,7 +1826,7 @@ private:
         const bool astc = VideoCore::Surface::IsPixelFormatASTC(info.format);
         const bool converted = (bcn && !device.IsOptimalBcnSupported()) || (astc && !device.IsOptimalAstcSupported());
         const u32 guest_size = CalculateGuestSizeInBytes(info);
-        if (guest_size == 0 || guest_size > avail || info.layer_stride == 0 && info.resources.layers > 1) {
+        if (guest_size == 0 || guest_size > avail || (info.layer_stride == 0 && info.resources.layers > 1)) {
             ++stats.notes["texture: size not in pool"];
             return nullptr;
         }
@@ -1867,7 +1876,7 @@ private:
         img->image = allocator.CreateImage({
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,
-            .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : VkImageCreateFlags{0},
+            .flags = cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : VkImageCreateFlags{0},
             .imageType = VK_IMAGE_TYPE_2D,
             .format = img->format,
             .extent = {img->width, img->height, 1},
@@ -1990,7 +1999,7 @@ private:
 
     /// Diagnostics (capture): everything one draw is fed, for the comparison with suyu. Kept out of the draw
     /// function so its locals do not add to the guest fiber stack while shaders translate.
-    __declspec(noinline) void DumpDrawState(Core::Memory::Memory& mem, const State& ds, const std::array<u32, 8> (&handles)[2],
+    NVN_VK_NOINLINE void DumpDrawState(Core::Memory::Memory& mem, const State& ds, const std::array<u32, 8> (&handles)[2],
                                             const PipelineKey& key, u32 count) {
         std::string o = fmt::format("DRAW vs={:x} fs={:x} count {} rt {}x{}\n", ds.prog[0], ds.prog[1], count, pass_w, pass_h);
         for (u32 ss = 0; ss < 2; ++ss) {
@@ -2207,7 +2216,7 @@ private:
     /// replay) or on a pool thread (prescan). It touches no shared renderer state except Vulkan object
     /// creation and the dump counters (under dump_lock); notes go to `notes`, failures throw.
     /// capture: record what the environment answered (cold build). replay: build from a record (prewarm).
-    __declspec(noinline) std::unique_ptr<Program> BuildProgram(Core::Memory::Memory* mem, u64 vs_addr, u64 fs_addr, u32 tex_pool,
+    NVN_VK_NOINLINE std::unique_ptr<Program> BuildProgram(Core::Memory::Memory* mem, u64 vs_addr, u64 fs_addr, u32 tex_pool,
                                                                 const ShaderKey& sk, const std::array<u32, 8> (&handles)[2],
                                                                 const bool (&attrib_enabled)[16], std::vector<std::string>& notes,
                                                                 ProgramRecord* capture, const ProgramRecord* replay) {
@@ -2422,7 +2431,7 @@ private:
 
     /// The recorded stage that is the program at this guest address, by content hash; 0 if none. Exact:
     /// every instruction word the recorded translation read must read the same now.
-    __declspec(noinline) const StageTranscript* MatchStage(Core::Memory::Memory& mem, u64 nvn_addr, Shader::Stage stage, bool* had_candidates = nullptr) {
+    NVN_VK_NOINLINE const StageTranscript* MatchStage(Core::Memory::Memory& mem, u64 nvn_addr, Shader::Stage stage, bool* had_candidates = nullptr) {
         const u64 sph_va = nvn_addr + 0x30;
         const u32 start = static_cast<u32>(sph_va & 0xff);
         const u64 base = sph_va - start;
@@ -2451,7 +2460,7 @@ private:
 
     /// One-time diagnostic (capped at 50 lines): a program missed the warm cache although the file has an
     /// entry for the same stage code. Says which part of the key differs.
-    __declspec(noinline) void DiagWarmMiss(u64 vs_addr, u64 fs_addr, bool vs_cand, bool fs_cand, const StageTranscript* vt,
+    NVN_VK_NOINLINE void DiagWarmMiss(u64 vs_addr, u64 fs_addr, bool vs_cand, bool fs_cand, const StageTranscript* vt,
                                            const StageTranscript* ft, const ShaderKey& sk, const u8 (&ae8)[16], const u32 (&slots)[2][8][3]) {
         if (warm_diag_lines >= 50) return;
         const auto line = [&](const std::string& s) {
@@ -2502,7 +2511,7 @@ private:
     }
 
     /// The prewarmed program for this draw's program pair, or null when the cache does not have it.
-    __declspec(noinline) std::shared_ptr<Program> WarmProgramFor(Core::Memory::Memory& mem, u64 vs_addr, u64 fs_addr, u32 tex_pool,
+    NVN_VK_NOINLINE std::shared_ptr<Program> WarmProgramFor(Core::Memory::Memory& mem, u64 vs_addr, u64 fs_addr, u32 tex_pool,
                                                                  const ShaderKey& sk, const std::array<u32, 8> (&handles)[2],
                                                                  const bool (&ae)[16]) {
         if (warm_programs.empty()) {
@@ -2959,7 +2968,7 @@ private:
 
     /// The Vulkan pipeline for `key` from `prog`. Used on the guest thread (a miss during the replay) and
     /// on pool threads (prescan): it reads only immutable renderer state; failures throw.
-    __declspec(noinline) vk::Pipeline CreatePipelineObject(const PipelineKey& key, const Program& prog,
+    NVN_VK_NOINLINE vk::Pipeline CreatePipelineObject(const PipelineKey& key, const Program& prog,
                                                        std::vector<VkVertexInputAttributeDescription> attributes, VkRenderPass rp) {
         std::erase_if(attributes, [&](const auto& a) { return !(prog.vs_in_mask & (1u << a.location)); });
         std::vector<VkVertexInputBindingDescription> bindings;
@@ -3183,7 +3192,7 @@ private:
     /// on the worker pool. The replay then finds everything in the caches. The objects are the ones the
     /// replay would have built itself (same keys, same inputs, first use in list order), so the output does
     /// not change. The walk creates no Vulkan resources, records nothing and leaves `st` alone.
-    __declspec(noinline) void PrebuildForSubmit(Core::Memory::Memory& mem, const std::vector<std::unique_ptr<NR::List>>& lists) {
+    NVN_VK_NOINLINE void PrebuildForSubmit(Core::Memory::Memory& mem, const std::vector<std::unique_ptr<NR::List>>& lists) {
         PHASE("prescan", 0);
         const u64 t_scan = ProfNow();
         auto s = std::make_unique<State>(st); // heap: the guest fiber stack is small
@@ -5047,6 +5056,7 @@ private:
     }
 
     void WriteStats() {
+#ifdef _WIN32
         PROCESS_MEMORY_COUNTERS_EX pmc{};
         pmc.cb = sizeof(pmc);
         GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
@@ -5055,6 +5065,9 @@ private:
         GlobalMemoryStatusEx(&ms);
         const std::string memory_line = fmt::format("process private {} MB, peak pagefile {} MB; system commit free {} MB, address space free {} MB\n",
                                                     pmc.PrivateUsage >> 20, pmc.PeakPagefileUsage >> 20, ms.ullAvailPageFile >> 20, ms.ullAvailVirtual >> 20);
+#else
+        const std::string memory_line = "process memory: not reported on this platform\n";
+#endif
         std::ofstream out(Common::FS::GetSuyuPath(Common::FS::SuyuPath::SuyuDir) / "nvn_vk.txt", std::ios::trunc);
         out << memory_line;
         if (last_mem) {
