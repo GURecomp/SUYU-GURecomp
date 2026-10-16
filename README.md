@@ -34,13 +34,22 @@ top of the export:
 
 - **Runtime settings** in `game_settings.ini` beside the exe, read at every start, never needing
   a new export: frame rate (30, 60, 90, 120 or auto), resolution and aspect ratio (ultrawide),
-  native render resolution, fullscreen, draw distance, an FPS readout in the title bar. Defaults
-  are the original game.
+  native render resolution and render scale, fullscreen, draw distance, an FPS readout in the
+  title bar. Defaults are the original game.
+- **Faster running and loading**: the recompiled code runs natively with block chaining, a
+  pipeline manifest builds the game's shaders at start so they don't stutter in play, and the
+  optional *Decompress game archives* export setting loads areas faster than an emulator does.
+- **A replacement Vulkan renderer** for the game's NVN graphics, with real render scaling
+  (scaled targets, viewports and scissors), checked draw by draw against suyu's GPU emulation.
 - **Game menu** (F10, or Minus + Plus on the controller) in its own window: controller choice
-  and rebinding, multiplayer, every `game_settings.ini` option, folders. The first controller
+  and rebinding, multiplayer, every `game_settings.ini` option, an Advanced tab with suyu's
+  settings, folders. The first controller
   plugged in is used automatically, and the export can copy your suyu controller setup.
 - **Local multiplayer** over a suyu room (for example through Radmin VPN): host, copy an invite,
-  join, automatic reconnect.
+  join, automatic reconnect, and the host can kick players.
+- **Crossplay rooms** (RyuLdn): the game's local play can also go through a RyuLdn server, so
+  exported-game players and Ryujinx players can share lobbies. See
+  [RyuLdn guide](docs/a32recomp/RYULDN.md).
 - **File mods** such as texture packs (`romfs` folders) work as in suyu.
 - **PC keyboard input** wherever the game asks for text.
 - **A drop-in mod host**: a loader DLL such as Forge PC is loaded from the export's `mods` folder,
@@ -52,6 +61,13 @@ You need your own Switch keys and your own dump of the game.
 
 The rest of suyu is still here and works as before: it runs as an emulator, and upstream's
 experimental AArch64 recompiler path is kept.
+
+## AI disclosure
+
+This project was built with an AI coding assistant, under the maintainer's direction and
+testing. What the AI did, what the maintainer did, and how the output is checked are written
+down in [AI_DISCLOSURE.md](docs/a32recomp/AI_DISCLOSURE.md). Pull requests are limited for now:
+only large contributions are being accepted.
 
 ## Requirements
 
@@ -107,13 +123,17 @@ Test builds for **Windows** (x64, Visual Studio 2022 17.14 or newer, or Visual S
 
 Upstream suyu's Android build path is still in the tree, but this fork doesn't build or test it.
 
-Known issues are listed with each release. Report problems as described in
+A machine-readable project description is in
+[`suyu-gurecomp.recomp.json`](suyu-gurecomp.recomp.json). Known issues are listed with each release. Report problems as described in
 [INSTALL.md, section 10](docs/a32recomp/INSTALL.md#10-reporting-a-problem).
 
 ## Documentation
 
 - [Install and export guide](docs/a32recomp/INSTALL.md): prerequisites step by step, keys,
   exporting, settings, mods, multiplayer, troubleshooting
+- [Crossplay with Ryujinx players (RyuLdn)](docs/a32recomp/RYULDN.md): servers, rooms, playing
+  with both at once
+- [AI disclosure](docs/a32recomp/AI_DISCLOSURE.md): how AI was used here and what it did not do
 - [Linux install and export guide](docs/a32recomp/INSTALL-LINUX.md): the same for Linux (gcc or
   clang instead of Visual Studio)
 - [Building from source](docs/a32recomp/BUILDING.md): tools, the build script, release packages,
