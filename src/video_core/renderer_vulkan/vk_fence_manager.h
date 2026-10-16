@@ -34,6 +34,9 @@ public:
 
     void Wait();
 
+    /// Like Wait, but polls with short sleeps (the driver's own wait spins a CPU core).
+    void WaitSleeping();
+
 private:
     Scheduler& scheduler;
     u64 wait_tick = 0;
@@ -62,6 +65,7 @@ protected:
     void QueueFence(Fence& fence) override;
     bool IsFenceSignaled(Fence& fence) const override;
     void WaitFence(Fence& fence) override;
+    void WaitFenceSlow(Fence& fence) override;
 
 private:
     Scheduler& scheduler;

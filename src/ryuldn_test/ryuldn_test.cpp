@@ -6,12 +6,15 @@
 // fixtures.json = tools/ryuldn/fixtures/probe_session.json (frames of a passing probe run
 // against a real LdnServer). Exit code 0 = all checks passed.
 
+#include <algorithm>
+#include <exception>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -19,9 +22,15 @@
 #include <thread>
 #include <vector>
 
+#include "common/zstd_compression.h"
+#include "network/network.h"
+#include "network/room.h"
+#include "network/room_member.h"
 #include "network/ryuldn/backend.h"
 #include "network/ryuldn/protocol.h"
+#include "network/ryuldn/room_bridge.h"
 #include "network/ryuldn/server.h"
+#include "network/verify_user.h"
 
 using namespace Network::RyuLdn;
 
@@ -757,14 +766,366 @@ void TestOwnServerP2pRequest(const std::string& host, u16 port) {
     server.Stop();
 }
 
+
+// ---- the room bridge: a suyu room player, a RyuLdn player and the host game in one lobby ----
+
+/// A suyu player: a room member that speaks LANDiscovery's LDN packets and proxies datagrams.
+struct SuyuNode {
+    SuyuNode(const char* nick, u16 room_port) : member(std::make_shared<Network::RoomMember>()) {
+        ldn_handle = member->BindOnLdnPacketReceived([this](const Network::LDNPacket& p) {
+            std::scoped_lock lk{m};
+            ldn.push_back(p);
+            cv.notify_all();
+        });
+        proxy_handle = member->BindOnProxyPacketReceived([this](const Network::ProxyPacket& p) {
+            Network::ProxyPacket plain = p;
+            plain.data = Common::Compression::DecompressDataZSTD(p.data);
+            std::scoped_lock lk{m};
+            packets.push_back(std::move(plain));
+            cv.notify_all();
+        });
+        member->Join(nick, "127.0.0.1", room_port);
+        for (int i = 0; i < 100 && !(member->IsConnected() && member->GetFakeIpAddress()[0] == 192);
+             i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ~SuyuNode() {
+        member->Unbind(ldn_handle);
+        member->Unbind(proxy_handle);
+        member->Leave();
+    }
+    template <typename Pred>
+    bool WaitFor(Pred pred, int ms = 5000) {
+        std::unique_lock lk{m};
+        return cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return pred(); });
+    }
+    Network::IPv4Address ip() const {
+        return member->GetFakeIpAddress();
+    }
+    void SendLdn(Network::LDNPacketType type, const Network::IPv4Address& to, bool broadcast,
+                 std::vector<u8> data = {}) {
+        Network::LDNPacket p;
+        p.type = type;
+        p.local_ip = ip();
+        p.remote_ip = to;
+        p.broadcast = broadcast;
+        p.data = std::move(data);
+        member->SendLdnPacket(p);
+    }
+    void SendUdp(u16 sport, const Network::IPv4Address& to, u16 dport, std::vector<u8> data,
+                 bool broadcast = false) {
+        Network::ProxyPacket p = Udp(ip(), sport, to, dport, {}, broadcast);
+        p.data = Common::Compression::CompressDataZSTDDefault(data.data(), data.size());
+        member->SendProxyPacket(p);
+    }
+    /// The newest LDN packet of a type (nullopt: none yet). Call under m.
+    std::optional<Network::LDNPacket> Last(Network::LDNPacketType type) {
+        for (auto it = ldn.rbegin(); it != ldn.rend(); ++it) {
+            if (it->type == type) {
+                return *it;
+            }
+        }
+        return std::nullopt;
+    }
+    /// The newest packet of a type with a NetworkInfo that lists `nodes` nodes.
+    bool HasInfo(Network::LDNPacketType type, int nodes) {
+        const auto p = Last(type);
+        return p && p->data.size() == sizeof(NetworkInfoBlob) && p->data[0x67] == nodes;
+    }
+    std::vector<u8> LastData(Network::LDNPacketType type) {
+        std::scoped_lock lk{m};
+        const auto p = Last(type);
+        return p ? p->data : std::vector<u8>{};
+    }
+    std::size_t CountFrom(const Network::IPv4Address& from, u16 dport) {
+        std::scoped_lock lk{m};
+        return static_cast<std::size_t>(
+            std::count_if(packets.begin(), packets.end(), [&](const Network::ProxyPacket& p) {
+                return p.local_endpoint.ip == from && p.remote_endpoint.portno == dport;
+            }));
+    }
+
+    std::shared_ptr<Network::RoomMember> member;
+    Network::RoomMember::CallbackHandle<Network::LDNPacket> ldn_handle;
+    Network::RoomMember::CallbackHandle<Network::ProxyPacket> proxy_handle;
+    std::recursive_mutex m; // predicates run under WaitFor's lock and may use the helpers above
+    std::condition_variable_any cv;
+    std::vector<Network::LDNPacket> ldn;
+    std::vector<Network::ProxyPacket> packets;
+};
+
+Network::IPv4Address NodeIp(const std::vector<u8>& info, int slot) {
+    u32 ip;
+    std::memcpy(&ip, info.data() + 0x68 + slot * 0x40, 4);
+    return Network::RyuLdn::Backend::ToAddress(ip);
+}
+
+std::string NodeNameOf(const std::vector<u8>& info, int slot) {
+    return reinterpret_cast<const char*>(info.data() + 0x68 + slot * 0x40 + 0xC);
+}
+
+std::vector<u8> SuyuNodeInfo(const char* name) {
+    std::vector<u8> node(0x40);
+    node[4] = 0x02;
+    node[5] = 0xAA;
+    std::memcpy(node.data() + 0x0C, name, std::strlen(name));
+    return node;
+}
+
+template <typename N>
+bool HasPacket(N& n, const Network::IPv4Address& from, u16 dport, const std::vector<u8>& data) {
+    std::scoped_lock lk{n.m};
+    return std::any_of(n.packets.begin(), n.packets.end(), [&](const Network::ProxyPacket& p) {
+        return p.local_endpoint.ip == from && p.remote_endpoint.portno == dport && p.data == data;
+    });
+}
+
+template <typename N, typename Pred>
+bool AnyPacket(N& n, Pred pred) {
+    std::scoped_lock lk{n.m};
+    return std::any_of(n.packets.begin(), n.packets.end(), pred);
+}
+
+void TestBridge() {
+    std::printf("room bridge: suyu room + RyuLdn server in one lobby\n");
+    constexpr u16 kServerPort = 30480, kRoomPort = 24990;
+    Server server;
+    std::string error;
+    Check(server.Start("127.0.0.1", kServerPort, error), "server starts");
+    Check(Network::Init(), "network init");
+    const auto room = Network::GetRoom().lock();
+    const auto host_member = Network::GetRoomMember().lock();
+    Check(room && host_member, "room objects");
+    if (!room || !host_member) {
+        return;
+    }
+    Check(room->Create("BridgeRoom", "", "", kRoomPort, "", 8, "HostGame", {},
+                       std::make_unique<Network::VerifyUser::NullBackend>(), {}),
+          "room opens");
+    room->SetHostGateway(true);
+    host_member->Join("HostGame", "127.0.0.1", kRoomPort);
+    for (int i = 0;
+         i < 100 && !(host_member->IsConnected() && host_member->GetFakeIpAddress()[0] == 192); i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const auto host_room_ip = host_member->GetFakeIpAddress();
+
+    // The host game: a RyuLdn lobby on the server, plus the bridge.
+    Client::Settings settings{"127.0.0.1", kServerPort, "", "1.4.0"};
+    Node host{settings};
+    Check(host.backend->CreateNetwork(CreateRequest("HostGame", 8), std::vector<u8>{'a'}) == NetworkError::None,
+          "host game creates the lobby");
+    Check(host.backend->IsHosting(), "backend knows it hosts");
+    const auto host_ip = host.backend->GetFakeIpAddress();
+    RoomBridge bridge(host.backend);
+
+    {
+        SuyuNode x{"SuyuPlayer", kRoomPort};
+        Check(x.member->IsConnected(), "suyu player joins the room");
+
+        // 1. Scan like LANDiscovery: broadcast Scan, wait for ScanResp.
+        for (int i = 0; i < 3; i++) {
+            x.SendLdn(Network::LDNPacketType::Scan, {255, 255, 255, 255}, true);
+            if (x.WaitFor([&] { return x.Last(Network::LDNPacketType::ScanResp).has_value(); },
+                          1000)) {
+                break;
+            }
+        }
+        const std::vector<u8> lobby = x.LastData(Network::LDNPacketType::ScanResp);
+        Check(lobby.size() == sizeof(NetworkInfoBlob), "ScanResp carries a NetworkInfo");
+        if (lobby.size() != sizeof(NetworkInfoBlob)) {
+            return;
+        }
+        {
+            std::scoped_lock lk{x.m};
+            const auto resp = x.Last(Network::LDNPacketType::ScanResp);
+            Check(resp->remote_ip == x.ip() && resp->local_ip == host_room_ip,
+                  "ScanResp is addressed to the player, from the host's room address");
+        }
+        Check(NodeIp(lobby, 0) == host_room_ip,
+              "the lobby's host node shows the host's room address");
+        Check(lobby[0x67] == 1, "1 node before the suyu player joins");
+        {
+            std::scoped_lock lk{host.m};
+            Check(std::memcmp(lobby.data() + 0x10, host.last_info.data() + 0x10, 16) == 0,
+                  "same session id as the server's lobby");
+        }
+
+        // 2. Connect like LANDiscovery: Connect packet to the host address.
+        x.SendLdn(Network::LDNPacketType::Connect, host_room_ip, false, SuyuNodeInfo("SuyuPlayer"));
+        Check(x.WaitFor([&] { return x.HasInfo(Network::LDNPacketType::SyncNetwork, 2); }),
+              "SyncNetwork: 2 nodes");
+        std::vector<u8> sync = x.LastData(Network::LDNPacketType::SyncNetwork);
+        Check(sync.size() == sizeof(NetworkInfoBlob) && NodeIp(sync, 0) == host_room_ip &&
+                  NodeIp(sync, 1) == x.ip(),
+              "the player sees the host and itself at room addresses");
+        Check(sync.size() == sizeof(NetworkInfoBlob) && sync[0x68 + 0x40 + 4] == 0x02 &&
+                  sync[0x68 + 0x40 + 5] == 0xAA && sync[0x68 + 4] == 0x02 && sync[0x68 + 5] == 0x00,
+              "nodes carry the MACs LANDiscovery uses (the player's own, 02:00+address for the host)");
+        Check(host.WaitFor([&] { return NodeCount(host.last_info) == 2; }) &&
+                  NodeName(host.last_info, 1) == "SuyuPlayer",
+              "the host game's lobby has the suyu player as node 1");
+        NetworkInfoBlob host_view;
+        {
+            std::scoped_lock lk{host.m};
+            host_view = host.last_info;
+        }
+        u32 raw;
+        std::memcpy(&raw, host_view.data() + 0x68 + 0x40, 4);
+        const auto x_ryu = Network::RyuLdn::Backend::ToAddress(raw);
+        Check(x_ryu[0] == 10 && x_ryu[1] == 114, "the suyu player has a 10.114.x.x lobby address");
+        Check(bridge.GetStatus().players == 1, "bridge status: 1 suyu player");
+
+        // 3. A RyuLdn player joins the lobby normally.
+        Node y{settings};
+        const auto found = y.backend->Scan(Filter(kLcid));
+        Check(found && found->size() == 1, "the RyuLdn player sees one lobby");
+        if (!found || found->empty()) {
+            return;
+        }
+        Check(y.backend->Connect(JoinRequest("RyujinxPlayer", (*found)[0])) == NetworkError::None,
+              "the RyuLdn player joins");
+        const auto y_ip = y.backend->GetFakeIpAddress();
+        Check(x.WaitFor([&] { return x.HasInfo(Network::LDNPacketType::SyncNetwork, 3); }),
+              "the suyu player is told about the third node");
+        sync = x.LastData(Network::LDNPacketType::SyncNetwork);
+        Check(sync.size() == sizeof(NetworkInfoBlob) &&
+                  NodeIp(sync, 2) == RoomBridge::AliasAddress(2),
+              "the RyuLdn player appears as 192.168.250.2");
+        Check(sync.size() == sizeof(NetworkInfoBlob) && NodeNameOf(sync, 2) == "RyujinxPlayer",
+              "with its name");
+
+        // 4. Data both ways.
+        x.SendUdp(5000, host_room_ip, 6000, {1, 2, 3});
+        Check(host.WaitFor([&] {
+            return std::any_of(host.packets.begin(), host.packets.end(), [&](const auto& p) {
+                return p.local_endpoint.ip == x_ryu && p.remote_endpoint.portno == 6000 &&
+                       p.data == std::vector<u8>{1, 2, 3};
+            });
+        }), "host game receives the suyu player's datagram from its lobby address");
+        host.backend->SendProxyPacket(Udp(host_ip, 6000, x_ryu, 5000, {7, 7}));
+        Check(x.WaitFor([&] { return HasPacket(x, host_room_ip, 5000, {7, 7}); }),
+              "suyu player receives the host game's reply from the host's room address");
+
+        y.backend->SendProxyPacket(Udp(y_ip, 7000, x_ryu, 5001, {8}));
+        Check(x.WaitFor([&] { return HasPacket(x, RoomBridge::AliasAddress(2), 5001, {8}); }),
+              "suyu player receives the RyuLdn player's datagram from the stand-in address");
+        x.SendUdp(5002, RoomBridge::AliasAddress(2), 7001, {9});
+        Check(y.WaitFor([&] {
+            return std::any_of(y.packets.begin(), y.packets.end(), [&](const auto& p) {
+                return p.local_endpoint.ip == x_ryu && p.remote_endpoint.portno == 7001 &&
+                       p.data == std::vector<u8>{9};
+            });
+        }), "RyuLdn player receives the suyu player's datagram from its lobby address");
+
+        // Broadcasts reach everyone once.
+        x.SendUdp(5003, {192, 168, 1, 255}, 7002, {4}, true);
+        Check(y.WaitFor([&] {
+            return std::any_of(y.packets.begin(), y.packets.end(), [&](const auto& p) {
+                return p.remote_endpoint.portno == 7002 && p.local_endpoint.ip == x_ryu;
+            });
+        }), "suyu broadcast reaches the RyuLdn player");
+        Check(host.WaitFor([&] {
+            return std::any_of(host.packets.begin(), host.packets.end(), [&](const auto& p) {
+                return p.remote_endpoint.portno == 7002 && p.broadcast;
+            });
+        }), "suyu broadcast reaches the host game (flagged broadcast)");
+        host.backend->SendProxyPacket(Udp(host_ip, 7003, {10, 114, 255, 255}, 7003, {5}, true));
+        Check(x.WaitFor([&] { return x.CountFrom(host_room_ip, 7003) >= 1; }),
+              "the host's broadcast reaches the suyu player");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        Check(x.CountFrom(host_room_ip, 7003) == 1, "...exactly once");
+        // Not echoed back to its own sender.
+        x.SendUdp(5004, {192, 168, 1, 255}, 7004, {6}, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        Check(x.CountFrom(x.ip(), 7004) == 0 && x.CountFrom(x_ryu, 7004) == 0,
+              "a suyu player's broadcast doesn't come back to it");
+
+        // 5. A second suyu player: room traffic stays in the room, no duplicates.
+        SuyuNode x2{"SuyuTwo", kRoomPort};
+        x2.SendLdn(Network::LDNPacketType::Scan, {255, 255, 255, 255}, true);
+        Check(x2.WaitFor([&] { return x2.Last(Network::LDNPacketType::ScanResp).has_value(); }),
+              "second suyu player sees the lobby too");
+        x2.SendLdn(Network::LDNPacketType::Connect, host_room_ip, false, SuyuNodeInfo("SuyuTwo"));
+        Check(x2.WaitFor([&] { return x2.HasInfo(Network::LDNPacketType::SyncNetwork, 4); }),
+              "second suyu player joins: 4 nodes");
+        sync = x2.LastData(Network::LDNPacketType::SyncNetwork);
+        Check(sync.size() == sizeof(NetworkInfoBlob) && NodeIp(sync, 1) == x.ip() &&
+                  NodeIp(sync, 2) == RoomBridge::AliasAddress(2) && NodeIp(sync, 3) == x2.ip(),
+              "it sees the other suyu player, the stand-in and itself");
+        x.SendUdp(5005, x2.ip(), 7005, {3});
+        Check(x2.WaitFor([&] { return HasPacket(x2, x.ip(), 7005, {3}); }),
+              "suyu to suyu goes straight through the room");
+        host.backend->SendProxyPacket(Udp(host_ip, 7006, {10, 114, 255, 255}, 7006, {2}, true));
+        Check(x2.WaitFor([&] { return x2.CountFrom(host_room_ip, 7006) >= 1; }) &&
+                  x.WaitFor([&] { return x.CountFrom(host_room_ip, 7006) >= 1; }),
+              "host broadcast reaches both suyu players");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        Check(x2.CountFrom(host_room_ip, 7006) == 1 && x.CountFrom(host_room_ip, 7006) == 1,
+              "...once each");
+        x.SendUdp(5007, {192, 168, 1, 255}, 7007, {1}, true);
+        Check(x2.WaitFor([&] { return x2.CountFrom(x.ip(), 7007) >= 1; }),
+              "suyu broadcast reaches the other suyu player");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        Check(x2.CountFrom(x.ip(), 7007) == 1 && x2.CountFrom(x_ryu, 7007) == 0,
+              "...once, not again from the bridge");
+
+        // 6. Leaving.
+        x2.SendLdn(Network::LDNPacketType::Disconnect, host_room_ip, false,
+                   SuyuNodeInfo("SuyuTwo"));
+        Check(host.WaitFor([&] { return NodeCount(host.last_info) == 3; }),
+              "a suyu player's Disconnect frees its slot");
+        y.backend->client().DisconnectNetwork();
+        Check(host.WaitFor([&] { return NodeCount(host.last_info) == 2; }),
+              "the RyuLdn player leaving is seen");
+        Check(x.WaitFor([&] { return x.HasInfo(Network::LDNPacketType::SyncNetwork, 2); }),
+              "and the suyu player is told");
+
+        // A suyu player that vanishes (closes the game, no Disconnect packet) is noticed too.
+        {
+            SuyuNode x3{"SuyuThree", kRoomPort};
+            x3.SendLdn(Network::LDNPacketType::Connect, host_room_ip, false,
+                       SuyuNodeInfo("SuyuThree"));
+            Check(host.WaitFor([&] { return NodeCount(host.last_info) == 3; }),
+                  "a third suyu player joins");
+            x3.member->Leave();
+            Check(host.WaitFor([&] { return NodeCount(host.last_info) == 2; }, 8000),
+                  "a suyu player that left the room is dropped from the lobby");
+        }
+
+        // 7. The host closes the lobby: the suyu player is told it's gone.
+        host.backend->client().DisconnectNetwork();
+        Check(x.WaitFor([&] { return x.Last(Network::LDNPacketType::DestroyNetwork).has_value(); },
+                        8000),
+              "closing the lobby sends DestroyNetwork to the suyu player");
+        Check(server.GetStatus().lobbies == 0, "the server has no lobby left");
+        Check(bridge.GetStatus().players == 0, "bridge status: nobody");
+    }
+    room->Destroy();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0); // progress shows even if a check hangs
+    std::set_terminate([] {
+        try {
+            if (const auto e = std::current_exception()) {
+                std::rethrow_exception(e);
+            }
+        } catch (const std::exception& ex) {
+            std::printf("terminate: uncaught exception: %s\n", ex.what());
+        } catch (...) {
+            std::printf("terminate: uncaught non-standard exception\n");
+        }
+        std::abort();
+    });
     std::string fixtures, server, multi;
     bool server_loss = false;
     bool p2p_join = false;
     bool own_server = false;
+    bool bridge = false;
     int serve_port = 0, serve_seconds = 0;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -779,6 +1140,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--serve" && i + 2 < argc) {
             serve_port = std::stoi(argv[++i]); // run the in-game server for a while (probe)
             serve_seconds = std::stoi(argv[++i]);
+        } else if (arg == "--bridge") {
+            bridge = true; // suyu room + RyuLdn server in one lobby (this process)
         } else if (arg == "--p2p-join") {
             p2p_join = true;
         } else {
@@ -825,6 +1188,8 @@ int main(int argc, char** argv) {
         two.Stop();
         TestOwnServerStop("127.0.0.1", kBase + 2);
         TestOwnServerP2pRequest("127.0.0.1", kBase + 3);
+    } else if (bridge) {
+        TestBridge();
     } else if (!multi.empty()) {
         const auto comma = multi.find(',');
         const auto [h1, p1] = split(multi.substr(0, comma));

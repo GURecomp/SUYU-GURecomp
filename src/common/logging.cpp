@@ -393,7 +393,14 @@ void Initialize() {
         using namespace Common::FS;
         const auto& log_dir = GetSuyuPath(SuyuPath::LogDir);
         void(CreateDir(log_dir));
-        logging_instance->file_backend.emplace(log_dir / LOG_FILE);
+        // One log per run, named after the process: several instances can run from one folder
+        // (and a restart no longer overwrites the run you wanted to read).
+#ifdef _WIN32
+        const auto pid = static_cast<unsigned long long>(GetCurrentProcessId());
+#else
+        const auto pid = static_cast<unsigned long long>(getpid());
+#endif
+        logging_instance->file_backend.emplace(log_dir / (std::to_string(pid) + "_" + LOG_FILE));
 #endif
     }
 }

@@ -8,6 +8,7 @@
 
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/ldn/hybrid_network.h"
 #include "core/hle/service/ldn/lan_discovery.h"
 #include "core/hle/service/ldn/ldn_types.h"
 #include "core/hle/service/ldn/ryuldn_network.h"
@@ -91,6 +92,10 @@ private:
     /// Callback to parse and handle a received LDN packet.
     void OnLDNPacketReceived(const Network::LDNPacket& packet);
     void OnEventFired();
+    /// Hosting a lobby opens this PC's room and/or server (frontend hook; the hybrid network
+    /// does it itself).
+    void StartHostingHook();
+    void StopHostingHook();
     /// The game's LocalCommunicationId and display version (RyuLdn lobbies carry them).
     RyuLdnNetwork::AppInfo ReadAppInfo() const;
 
@@ -100,12 +105,16 @@ private:
     std::unique_ptr<ILdnNetwork> network;
     /// The same object when it is a LANDiscovery: it takes the room's LDN packets.
     LANDiscovery* lan_discovery{};
+    /// The same object when it is the room + RyuLdn network (auto mode): it takes the room's
+    /// LDN packets as well.
+    HybridLdnNetwork* hybrid_network{};
     std::shared_ptr<Network::LdnBackend> ldn_backend;
 
     // Callback identifier for the OnLDNPacketReceived event.
     Network::LdnBackend::CallbackHandle<Network::LDNPacket> ldn_packet_received;
 
     bool is_initialized{};
+    bool hosting_hooked{};
 };
 
 } // namespace Service::LDN

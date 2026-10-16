@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include "core/hle/kernel/stall_ring.h"
+#include "video_core/renderer_vulkan/nvn_vk.h"
 #include <sstream>
 
 #include <boost/range/algorithm_ext/erase.hpp>
@@ -30,7 +33,7 @@
 namespace Service {
 
 SessionRequestHandler::SessionRequestHandler(Kernel::KernelCore& kernel_, const char* service_name_)
-    : kernel{kernel_} {}
+    : probe_name{service_name_}, kernel{kernel_} {}
 
 SessionRequestHandler::~SessionRequestHandler() = default;
 
@@ -58,6 +61,7 @@ bool SessionRequestManager::HasSessionRequestHandler(const HLERequestContext& co
 Result SessionRequestManager::CompleteSyncRequest(Kernel::KServerSession* server_session,
                                                   HLERequestContext& context) {
     Result result = ResultSuccess;
+    const auto probe_start = Kernel::StallRing::On() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     // If the session has been converted to a domain, handle the domain request
     if (this->HasSessionRequestHandler(context)) {
@@ -78,6 +82,22 @@ Result SessionRequestManager::CompleteSyncRequest(Kernel::KServerSession* server
         ASSERT_MSG(!IsDomain(), "ServerSession is already a domain instance.");
         this->ConvertToDomain();
         convert_to_domain = false;
+    }
+
+    if (Kernel::StallRing::On()) {
+        // Wiggle-hitch probe: name any HLE service call that takes over 10 ms.
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - probe_start).count();
+        if (ms > 10.0) {
+            Vulkan::NvnVkDumpLine(
+                "nvn_gaps.txt",
+                fmt::format("HLE gtid {} {} cmd {} took {:.1f} ms domain {} ended {:.1f}",
+                            context.GetThread().GetThreadId(),
+                            this->HasSessionHandler() ? (this->SessionHandler().probe_name ? this->SessionHandler().probe_name : "?")
+                                                      : "(domain object)",
+                            context.GetCommand(), ms, this->IsDomain(),
+                            Vulkan::NvnVkNowMs()));
+        }
     }
 
     return result;

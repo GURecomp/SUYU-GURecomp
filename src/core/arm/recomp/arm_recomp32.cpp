@@ -39,6 +39,7 @@
 #include "core/fs_monitor.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/stall_ring.h"
 #include "core/memory.h"
 
 namespace Core {
@@ -172,9 +173,21 @@ void ProfileLoop() {
     }
 }
 
+std::string ProbeDetail(double from_ms, double to_ms);
+void FallbackCounters(u64 (&out)[4]);
+void PresentProbe(u32 lr, u32 gtid);
+void StartFrameWriter();
+Core::System* g_probe_system = nullptr;
+
 void StartProfiler() {
     static std::once_flag once;
-    std::call_once(once, [] { std::thread(ProfileLoop).detach(); });
+    std::call_once(once, [] {
+        std::thread(ProfileLoop).detach();
+        Kernel::StallRing::g_guest_probe = &ProbeDetail;
+        Kernel::StallRing::g_fallback_counters = &FallbackCounters;
+        Kernel::StallRing::g_present_probe = &PresentProbe;
+        StartFrameWriter();
+    });
 }
 
 /// Publishes a core's r15 to the sampler for the duration of a RunThread call.
@@ -429,6 +442,304 @@ std::string ProbeSpan(std::chrono::steady_clock::time_point from,
     return out;
 }
 
+std::string BlockName(u32 pc) {
+    std::scoped_lock lk{g_miss_lock};
+    if (g_module_list.empty() || pc < g_module_list.front().first) {
+        return fmt::format("{:08x}", pc);
+    }
+    const auto loc = Locate(pc);
+    return fmt::format("{}:{:x}", loc.index, loc.offset);
+}
+
+// Wiggle-hitch probe: what each core ran in [from, to] (steady_clock ms), from the 1 ms profile
+// ring. Verdict: a handful of blocks covering 90% of the samples is a tight loop (spin-wait),
+// many blocks is real work. Also the top block per 10 ms bin as a timeline.
+std::string ProbeDetail(double from_ms, double to_ms) {
+    using Clock = std::chrono::steady_clock;
+    const auto tp = [](double ms) {
+        return Clock::time_point{std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double, std::milli>(ms))};
+    };
+    const auto from = tp(from_ms), to = tp(to_ms);
+    std::array<u64, kProfileCores> busy{};
+    std::array<std::unordered_map<u32, u64>, kProfileCores> blocks;
+    std::array<std::map<int, std::unordered_map<u32, u64>>, kProfileCores> bins;
+    u64 ticks = 0;
+    {
+        std::scoped_lock lk{g_profile_lock};
+        for (const ProfileTick& row : g_profile_ring) {
+            if (row.at < from || row.at > to) {
+                continue;
+            }
+            ++ticks;
+            const int bin = static_cast<int>(
+                std::chrono::duration<double, std::milli>(row.at - from).count() / 10.0);
+            for (size_t c = 0; c < kProfileCores; ++c) {
+                if (row.pc[c] != 0) {
+                    ++busy[c];
+                    ++blocks[c][row.pc[c]];
+                    ++bins[c][bin][row.pc[c]];
+                }
+            }
+        }
+    }
+    if (ticks == 0) {
+        return "guest profile: no samples\n";
+    }
+    static u32 gaps_seen = 0;
+    static std::map<std::string, u32> recurring;
+    ++gaps_seen;
+    std::string out = fmt::format("guest profile: {} samples (1 ms)\n", ticks);
+    for (size_t c = 0; c < kProfileCores; ++c) {
+        if (busy[c] == 0) {
+            continue;
+        }
+        std::vector<std::pair<u64, u32>> top;
+        for (const auto& [pc, n] : blocks[c]) {
+            top.emplace_back(n, pc);
+        }
+        std::sort(top.rbegin(), top.rend());
+        u64 cum = 0;
+        size_t cover90 = 0;
+        for (; cover90 < top.size() && cum * 10 < busy[c] * 9; ++cover90) {
+            cum += top[cover90].first;
+        }
+        out += fmt::format(" core {}: in guest code {:.0f}% ({} samples), {} distinct blocks, {} blocks cover 90% -> {}\n   top:",
+                           c, 100.0 * busy[c] / ticks, busy[c], top.size(), cover90,
+                           cover90 <= 12 && busy[c] >= 20 ? "TIGHT LOOP / SPIN-WAIT" : "spread: real work");
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+            out += fmt::format(" {}x{}", top[i].first, BlockName(top[i].second));
+        }
+        {
+            out += " | recurring across gaps:";
+            for (size_t i = 0; i < std::min<size_t>(top.size(), 3); ++i) {
+                const std::string nm = BlockName(top[i].second);
+                out += fmt::format(" {} in {}/{}", nm, ++recurring[nm], gaps_seen);
+            }
+        }
+        out += "\n   10 ms bins (top block):";
+        for (const auto& [bin, m] : bins[c]) {
+            u32 best = 0;
+            u64 bn = 0, tot = 0;
+            for (const auto& [pc, n] : m) {
+                tot += n;
+                if (n > bn) {
+                    bn = n;
+                    best = pc;
+                }
+            }
+            out += fmt::format(" [{}:{}/{} {}]", bin * 10, bn, tot, BlockName(best));
+        }
+        out += "\n";
+    }
+    return out;
+}
+
+// ---- Run M: per-present frame probe (identical in every render mode) ----------------------------
+// One line per nvnQueuePresentTexture call into user\nvn_frames.txt: wall time and guest-visible
+// tick since the previous present, the guest thread and caller, the hottest core 0 blocks since the
+// previous present, and what the guest could see from suyu's GPU thread in that span (host1x
+// syncpoint increments, report/semaphore writes, nvhost event waits), each with its offset from this
+// present call. A gap frame (> 60 ms) also gets the previous four frame times and its top 10 blocks.
+std::mutex g_frame_lock;
+std::string g_frame_buf;
+
+void StartFrameWriter() {
+    std::thread([] {
+        bool first = true;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            std::string out;
+            {
+                std::scoped_lock lk{g_frame_lock};
+                out.swap(g_frame_buf);
+            }
+            if (out.empty()) {
+                continue;
+            }
+            std::ofstream f(UserFile("nvn_frames.txt"), first ? std::ios::trunc : std::ios::app);
+            first = false;
+            f << out;
+        }
+    }).detach();
+}
+
+std::string TopBlocks(double from_ms, double to_ms, size_t core, size_t n, u64& busy, u64& total) {
+    std::unordered_map<u32, u32> blocks;
+    busy = total = 0;
+    {
+        std::scoped_lock lk{g_profile_lock};
+        for (size_t k = 0; k < kProfileRing; ++k) {
+            const ProfileTick& row =
+                g_profile_ring[(g_profile_ring_next + kProfileRing - 1 - k) % kProfileRing];
+            const double at =
+                std::chrono::duration<double, std::milli>(row.at.time_since_epoch()).count();
+            if (at < from_ms) {
+                break;
+            }
+            if (at > to_ms) {
+                continue;
+            }
+            ++total;
+            if (row.pc[core] != 0) {
+                ++busy;
+                ++blocks[row.pc[core]];
+            }
+        }
+    }
+    std::vector<std::pair<u32, u32>> top;
+    for (const auto& [pc, c] : blocks) {
+        top.emplace_back(c, pc);
+    }
+    std::sort(top.rbegin(), top.rend());
+    std::string out;
+    for (size_t i = 0; i < std::min(top.size(), n); ++i) {
+        out += fmt::format(" {}x{}", top[i].first, BlockName(top[i].second));
+    }
+    return out;
+}
+
+void PresentProbe(u32 lr, u32 gtid) {
+    namespace SR = Kernel::StallRing;
+    static std::mutex m;
+    static double prev_ms = 0;
+    static u64 prev_tick = 0;
+    static u64 frame = 0;
+    static std::array<double, 8> hist{};
+    static std::array<double, 8> hist_tick{};
+    std::scoped_lock lk{m};
+    const double now = SR::NowMs();
+    const u64 tick = g_probe_system ? g_probe_system->CoreTiming().GetClockTicks() : 0;
+    ++frame;
+    SR::Add(SR::Present, gtid, 0, 0, lr, static_cast<u32>(frame), now, now);
+    if (prev_ms == 0) {
+        prev_ms = now;
+        prev_tick = tick;
+        std::scoped_lock fl{g_frame_lock};
+        g_frame_buf += fmt::format("# nvn_vulkan mode {} (NvnVulkanMode value of this run)\n",
+                                   static_cast<int>(GameSettings::NvnVulkanMode()));
+        return;
+    }
+    const double dt = now - prev_ms;
+    const double dtick = static_cast<double>(tick - prev_tick) / 19200.0; // CNTFREQ 19.2 MHz
+    u64 busy = 0, total = 0;
+    const std::string top = TopBlocks(prev_ms, now, 0, dt > 60.0 ? 10 : 5, busy, total);
+    std::string line = fmt::format("F{} t{:.3f} dt {:.2f} tick {:.2f} g{} lr {} | c0 {}/{}:{}", frame, now, dt,
+                                   dtick, gtid, BlockName(lr), busy, total, top);
+
+    // Guest-visible events since the previous present.
+    struct Agg {
+        u32 n = 0, nz = 0, maxv = 0;
+        double first = 1e18, last = -1e18; // offsets from this present call (ms, <= 0)
+        u32 lastv = 0;
+    };
+    std::map<u32, Agg> hs, gs, rp;
+    std::array<Agg, 5> cw{};
+    double stall_ms = 0;
+    const u64 head = SR::g_index.load(std::memory_order_acquire);
+    for (u64 k = 0; k < std::min<u64>(head, SR::kSize); ++k) {
+        const SR::Event& e = SR::g_events[(head - 1 - k) & (SR::kSize - 1)];
+        if (e.t1 < prev_ms - 20.0) {
+            break;
+        }
+        if (e.t1 < prev_ms || e.t1 > now) {
+            continue;
+        }
+        const double off = e.t1 - now;
+        const auto put = [&](Agg& a, u32 v) {
+            ++a.n;
+            a.nz += v != 0;
+            a.maxv = std::max(a.maxv, v);
+            a.first = std::min(a.first, off);
+            if (off > a.last) {
+                a.last = off;
+                a.lastv = v;
+            }
+        };
+        switch (e.kind) {
+        case SR::Sync:
+            put(e.core == 0 ? hs[e.a] : gs[e.a], e.b);
+            break;
+        case SR::Report:
+            put(rp[e.a], e.b);
+            break;
+        case SR::CtrlWait:
+            if (e.core < 5) {
+                put(cw[e.core], e.a);
+                if (e.core == 3) {
+                    stall_ms += e.t1 - e.t0;
+                }
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    const auto dump = [&](const char* name, const std::map<u32, Agg>& mp, bool vals) {
+        if (mp.empty()) {
+            return;
+        }
+        line += fmt::format(" | {}", name);
+        size_t shown = 0;
+        for (const auto& [id, a] : mp) {
+            if (shown++ >= 4) {
+                line += " ...";
+                break;
+            }
+            line += fmt::format(" id{}:n{}", id, a.n);
+            if (vals) {
+                line += fmt::format(" nz{} max{} last{}", a.nz, a.maxv, a.lastv);
+            } else {
+                line += fmt::format(" v{}", a.lastv);
+            }
+            line += fmt::format(" [{:.1f}..{:.1f}ms]", a.first, a.last);
+        }
+    };
+    dump("hsync", hs, false);
+    dump("gsync", gs, false);
+    dump("report", rp, true);
+    {
+        static const char* const kNames[5] = {"signalled", "registered", "timeout0", "stall", "fired"};
+        std::string w;
+        for (size_t i = 0; i < 5; ++i) {
+            if (cw[i].n) {
+                w += fmt::format(" {}:{}[{:.1f}..{:.1f}ms]", kNames[i], cw[i].n, cw[i].first, cw[i].last);
+            }
+        }
+        if (!w.empty()) {
+            line += " | ctrlwait" + w;
+        }
+        if (stall_ms > 0) {
+            line += fmt::format(" STALLWAIT {:.2f} ms", stall_ms);
+        }
+    }
+    if (dt > 60.0) {
+        std::array<double, 8> sorted = hist;
+        std::sort(sorted.begin(), sorted.end());
+        const double med = sorted[4];
+        const double p1 = hist[(frame - 1) % 8];
+        line += fmt::format(
+            " <<< GAP prev4 wall {:.1f} {:.1f} {:.1f} {:.1f} tick {:.1f} {:.1f} {:.1f} {:.1f} median8 {:.1f} -> {}",
+            hist[(frame - 1) % 8], hist[(frame - 2) % 8], hist[(frame - 3) % 8], hist[(frame - 4) % 8],
+            hist_tick[(frame - 1) % 8], hist_tick[(frame - 2) % 8], hist_tick[(frame - 3) % 8],
+            hist_tick[(frame - 4) % 8], med, p1 > 1.5 * med ? "FOLLOWS A LONGER FRAME" : "OUT OF NOWHERE");
+    }
+    hist[frame % 8] = dt;
+    hist_tick[frame % 8] = dtick;
+    prev_ms = now;
+    prev_tick = tick;
+    line += "\n";
+    std::scoped_lock fl{g_frame_lock};
+    g_frame_buf += line;
+}
+
+void FallbackCounters(u64 (&out)[4]) {
+    out[0] = g_miss.load(std::memory_order_relaxed);
+    out[1] = g_fb_steps.load(std::memory_order_relaxed);
+    out[2] = g_fb_returned.load(std::memory_order_relaxed);
+    out[3] = g_fb_full_runs.load(std::memory_order_relaxed);
+}
+
 void MaybeWriteReportLocked() {
     if (Uptime() - g_last_report >= kReportInterval) {
         WriteReportLocked();
@@ -614,6 +925,7 @@ struct ArmRecomp32::Impl {
             return;
         }
         bases_registered = true;
+        g_probe_system = &system;
         auto* process = thread->GetOwnerProcess();
         const auto setter = GetRecompBaseSetter();
         if (!process || !setter) {
@@ -651,6 +963,8 @@ struct ArmRecomp32::Impl {
                 StartReportTimer();
                 if (GameSettings::DiagnosticsEnabled()) {
                     FsMonitor::SetHitchProbe(&ProbeSpan);
+                    Kernel::StallRing::g_guest_probe = &ProbeDetail;
+                    Kernel::StallRing::g_fallback_counters = &FallbackCounters;
                     FsMonitor::Enable();
                 }
             }
@@ -659,6 +973,9 @@ struct ArmRecomp32::Impl {
             NvnTrace::Get().Attach(system, modules);
             TimingWatch::Attach(system, modules);
         } else {
+            if (GameSettings::NativeNvn() || GameSettings::NvnVulkanMode() != 0) {
+                NvnTrace::Get().Attach(system, modules, true);
+            }
             LOG_INFO(Core_ARM, "recomp32: diagnostics off (game_settings.ini [Debug])");
         }
         GameSettings::Start(system, modules);
@@ -885,9 +1202,7 @@ HaltReason ArmRecomp32::RunThread(Kernel::KThread* thread) {
     }
     impl->RefreshPageTable();
     impl->RegisterBases(thread);
-    if (GameSettings::DiagnosticsEnabled()) {
-        StartProfiler();
-    }
+    if (Kernel::StallRing::On() || GameSettings::DiagnosticsEnabled()) StartProfiler(); // the stall dump needs the guest profile
     const ProfileScope profile_scope{impl->core_index, &impl->ctx.r[15]};
     ModHost::SetCaller(&impl->mod_caller);
     const struct ModCallerReset {

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -79,6 +80,12 @@ constexpr Option kOptions[] = {
      "; 21:9, 32:9, 16:10, 4:3 or a number such as 2.39.\n"},
     {"Display", "fullscreen", "false",
      "; true = start fullscreen. F11 or Alt+Enter switches while playing.\n"},
+    {"Display", "vsync", "on",
+     "; on = frames are locked to the monitor's refresh rate (tear-free, lowest power).\n"
+     "; mailbox = no lock, the newest frame is shown at each refresh (tear-free); lets the game\n"
+     "; run above the refresh rate: set fps higher than your monitor to use it.\n"
+     "; off = no lock and no waiting (can tear). relaxed = on, but a late frame is shown at once.\n"
+     "; Needs a restart. Leave on for the smoothest picture; the others are for testing speed.\n"},
     {"Display", "show_fps", "false",
      "; true = show the frame rate in the window title. The game menu (F10) always shows it.\n"},
     {"Display", "console_mode", "docked",
@@ -86,13 +93,20 @@ constexpr Option kOptions[] = {
      "; handheld = the game renders at 1280x720, as on the Switch's own screen: much lighter on\n"
      "; weak PCs and integrated graphics. The picture is scaled up to the window either way;\n"
      "; native_render doesn't raise the handheld render size.\n"},
+    {"Graphics", "native_gpu", "false",
+     "; false = suyu draws the game (its own renderer, the original behaviour).\n"
+     "; true = the replacement renderer: the game's graphics calls are replayed natively on\n"
+     "; Vulkan on its own thread (faster on the CPU side). Needs a restart.\n"},
     {"Graphics", "native_render", "true",
      "; With a resolution set: the game renders at that resolution itself (up to 3840x2160)\n"
      "; instead of suyu scaling a 1920x1080 picture. Keep suyu's resolution scale at 1x then.\n"
      "; false = keep the 1920x1080 render (use suyu's resolution scale instead).\n"},
     {"Debug", "diagnostics", "false",
-     "; Run reports for development (profiler, graphics call census, timing watch, file\n"
-     "; monitor; written to the user folder). true = write them (a little slower).\n"},
+     "; Run reports for development that apply to every graphics mode (profiler, call census,\n"
+     "; timing watch, file monitor; written to the user folder). true = write them (a little slower).\n"},
+    {"Debug", "gpu_diagnostics", "false",
+     "; Reports for the replacement renderer only (native_gpu = true): per-second timing buckets\n"
+     "; (nvn_prof.txt) and NVN call recording samples. true = write them (a little slower).\n"},
     {"Debug", "rtss_overlay", "false",
      "; RivaTuner Statistics Server's Vulkan overlay crashes the game at start, so it is kept\n"
      "; out of this game (RivaTuner itself keeps working elsewhere). true = let it load.\n"},
@@ -136,6 +150,9 @@ constexpr Option kOptions[] = {
      "; Controller buttons held together for 1 s to open the menu (SDL names: back, start,\n"
      "; guide, leftstick, rightstick, leftshoulder, ...). back+start = Minus + Plus on a\n"
      "; Switch layout, View + Menu on Xbox. none = off.\n"},
+    {"Menu", "show_advanced", "false",
+     "; true = the game menu gets an Advanced tab with every setting of the emulator\n"
+     "; (resolution scale, GPU accuracy, ...). Most of them need a restart of the game.\n"},
     {"Mods", "loader", kDefaultModLoader,
      "; Mod loader library (forge.dll on Windows, forge.so on Linux), relative to\n"
      "; mods/<title id>/ (install Forge PC there for code mods).\n"
@@ -306,9 +323,133 @@ bool IsTrue(const std::string& s) {
 
 std::atomic<u32> g_aspect_pc{0};
 
+bool NativeGpuSet(bool* on) {
+    bool present = false;
+    const std::string v = ReadValue("Graphics", "native_gpu", &present);
+    *on = v == "true" || v == "1" || v == "yes" || v == "on";
+    return present;
+}
+
+bool FenceThreadSleep() {
+    static const bool enabled = [] {
+        const std::string v = ReadValue("Debug", "fence_thread_sleep");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return enabled;
+}
+
+std::string ProbePcs() {
+    return ReadValue("Debug", "probe_pcs");
+}
+
+u32 RenderWidth() {
+    return g_render_w;
+}
+
+bool NativeNvn() {
+    static const bool enabled = [] {
+        if (bool on; NativeGpuSet(&on)) return on;
+        const std::string v = ReadValue("Debug", "native_nvn");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return enabled;
+}
+
+int NvnVulkanMode() {
+    static const int mode = [] {
+        // [Graphics] native_gpu decides when present; the [Debug] keys are for development (record, shadow)
+        if (bool on; NativeGpuSet(&on)) return on ? 3 : 0;
+        const std::string v = ReadValue("Debug", "nvn_vulkan");
+        return v == "present" ? 3 : (v == "shadow" ? 2 : (v == "record" ? 1 : 0));
+    }();
+    return mode;
+}
+
+int NvnVkDebug() {
+    static const int v = [] {
+        const std::string t = ReadValue("Debug", "nvn_vk_debug");
+        return t.empty() ? 0 : std::atoi(t.c_str());
+    }();
+    return v;
+}
+
+bool SuyuRender() {
+    static const bool on = [] {
+        if (bool ng; NativeGpuSet(&ng)) return !ng;
+        const std::string v = ReadValue("Debug", "suyu_render");
+        return NvnVulkanMode() != 3 || !(v == "false" || v == "0" || v == "no" || v == "off");
+    }();
+    return on;
+}
+
+bool PresentNoDrain() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "present_nodrain");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
+int PresRing() {
+    static const int n = [] {
+        const std::string v = ReadValue("Debug", "pres_ring");
+        const int x = v.empty() ? 3 : std::atoi(v.c_str());
+        return x < 2 ? 3 : (x > 16 ? 16 : x);
+    }();
+    return n;
+}
+
+bool FenceHold() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "fence_hold");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
+bool PresentFifo() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "present_fifo");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
+bool OrderProbe() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "order_probe");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
+bool VulkanValidation() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "vulkan_validation");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
 bool DiagnosticsEnabled() {
     static const bool enabled = [] {
         const std::string v = ReadValue("Debug", "diagnostics");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return enabled;
+}
+
+bool GpuDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const std::string v = ReadValue("Debug", "gpu_diagnostics");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return enabled;
+}
+
+bool ProbesEnabled() {
+    static const bool enabled = [] {
+        const std::string v = ReadValue("Debug", "probes");
         return v == "true" || v == "1" || v == "yes" || v == "on";
     }();
     return enabled;
@@ -441,6 +582,15 @@ void SetDesktopMode(u32 width, u32 height, u32 refresh_hz) {
 }
 std::atomic<u32> g_render_default_pc{0};
 std::atomic<u32> g_render_create_pc{0};
+std::atomic<u32> g_motion_blur_pc{0};
+std::atomic<u32> g_vp_probe_pc{0};
+std::atomic<u32> g_main_base{0};
+namespace {
+// uMotionBlurFilter render function (STATIC-REVIEW-motionblur-velocity.md): r0 = filter, r1 = draw context.
+constexpr u32 kMotionBlurRender = 0x8BCD84;
+constexpr u32 kMbStretch = 0x64, kMbCamera = 0x65, kMbMedian = 0x66, kMbTemp = 0x3C, kMbVelocity = 0x44;
+bool g_mb_force = false;
+} // namespace
 
 void Start(System& system, const std::map<u64, std::string>& modules) {
     static std::atomic<bool> started{false};
@@ -523,7 +673,20 @@ void Start(System& system, const std::map<u64, std::string>& modules) {
     Settings::values.aspect_ratio.SetValue(
         stretch && wide ? Settings::AspectRatio::Stretch
                         : (wide ? OutputAspect(g_aspect) : Settings::AspectRatio::R16_9));
+    g_main_base.store(main_base);
+    if (main_base != 0 && (ProbesEnabled() || g_render_w != 0)) {
+        RecompHooks::Mark(main_base + 0xBC1204);
+        g_vp_probe_pc.store(main_base + 0xBC1204);
+    }
     if (main_base != 0) {
+        if (const std::string mb = ReadValue("Debug", "motion_blur"); mb == "probe" || mb == "force") {
+            g_mb_force = mb == "force";
+            RecompHooks::Mark(main_base + kMotionBlurRender);
+            g_motion_blur_pc.store(main_base + kMotionBlurRender);
+            LOG_INFO(Core_ARM, "game settings: motion_blur = {} (hook at {:#x})", mb, main_base + kMotionBlurRender);
+        } else if (!mb.empty() && mb != "off") {
+            LOG_WARNING(Core_ARM, "game settings: motion_blur = {} is not off, probe or force; using off", mb);
+        }
         if (wide || g_draw_distance != 1.0f) {
             RecompHooks::Mark(main_base + kProjection);
             g_aspect_pc.store(main_base + kProjection);
@@ -546,6 +709,57 @@ void Start(System& system, const std::map<u64, std::string>& modules) {
 
 void OnHookedEntry(u32 pc, u32* regs) {
     auto& mem = g_system->ApplicationMemory();
+    if (pc == g_vp_probe_pc.load(std::memory_order_relaxed)) {
+        // [Debug] probes: draw-state object r10 of the viewport/scissor setter (main+0xBC12D0/0xBC13BC)
+        const u32 o = regs[10];
+        if (!mem.IsValidVirtualAddressRange(o, 0x60)) {
+            return;
+        }
+        // Only for our own renderer: suyu's draws already fill the window texture, widening the rect there breaks it.
+        if (g_render_w != 0 && !SuyuRender() && mem.Read32(o + 0x58) == ((g_render_h << 16) | g_render_w) &&
+            mem.Read32(o + 0x20) == kDockedW && mem.Read32(o + 0x24) == kDockedH) {
+            // The pass draws into the custom-size window texture, but its viewport rect still holds the docked size,
+            // so the picture only fills the top-left corner. Widen the rect (and its half-size twin) to the target.
+            mem.Write32(o + 0x20, g_render_w);
+            mem.Write32(o + 0x24, g_render_h);
+            mem.Write32(o + 0x30, g_render_w / 2);
+            mem.Write32(o + 0x34, g_render_h / 2);
+        }
+        static std::mutex m;
+        static std::set<std::string> seen;
+        std::string line;
+        for (u32 off = 0x18; off <= 0x58; off += 4) {
+            line += fmt::format(" +{:x}={}", off, static_cast<s32>(mem.Read32(o + off)));
+        }
+        std::scoped_lock lk{m};
+        if (ProbesEnabled() && seen.size() < 60 && seen.insert(line).second) {
+            LOG_INFO(Core_ARM, "viewport setter state {:#x}:{}", o, line);
+        }
+        return;
+    }
+    if (pc == g_motion_blur_pc.load(std::memory_order_relaxed)) {
+        // r0 = uMotionBlurFilter. force: switch on camera and stretch blur so the velocity pass runs.
+        const u32 self = regs[0];
+        if (!mem.IsValidVirtualAddressRange(self, 0x90)) {
+            return;
+        }
+        static std::atomic<u32> calls{0};
+        static std::atomic<u64> last_log{0};
+        const u32 n = ++calls;
+        const u8 was_stretch = mem.Read8(self + kMbStretch), was_camera = mem.Read8(self + kMbCamera);
+        if (g_mb_force) {
+            mem.Write8(self + kMbStretch, 1);
+            mem.Write8(self + kMbCamera, 1);
+        }
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (last_log.exchange(now) != now) {
+            LOG_INFO(Core_ARM, "motion blur filter: call {} this {:#x} stretch {} camera {} median {} temp {:#x} velocity {:#x}{}",
+                     n, self, was_stretch, was_camera, mem.Read8(self + kMbMedian),
+                     mem.Read32(self + kMbTemp), mem.Read32(self + kMbVelocity), g_mb_force ? " (forced on after this read)" : "");
+        }
+        return;
+    }
     if (pc == g_render_default_pc.load(std::memory_order_relaxed)) {
         g_render_dest.store(regs[5]); // the block is about to store 1920x1080 there
         return;

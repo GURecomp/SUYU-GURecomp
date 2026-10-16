@@ -33,6 +33,9 @@ namespace Controls {
 
 void Init(Core::System& system, InputCommon::InputSubsystem* input, SdlConfig* config);
 
+/// Writes the emulator's config file now (otherwise it is only written when the game exits).
+void SaveConfig();
+
 /// Connected controllers (no keyboard/mouse/"any" entries).
 std::vector<Common::ParamPackage> Devices();
 

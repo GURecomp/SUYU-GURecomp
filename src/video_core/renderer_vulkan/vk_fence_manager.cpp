@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <memory>
+#include <thread>
+#include "core/arm/recomp/game_settings.h"
 
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
@@ -58,8 +61,29 @@ bool FenceManager::IsFenceSignaled(Fence& fence) const {
     return fence->IsSignaled();
 }
 
+void InnerFence::WaitSleeping() {
+    if (is_stubbed) {
+        return;
+    }
+    for (;;) {
+        scheduler.RefreshGpuTick();
+        if (scheduler.IsFree(wait_tick)) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+    }
+}
+
 void FenceManager::WaitFence(Fence& fence) {
     fence->Wait();
+}
+
+void FenceManager::WaitFenceSlow(Fence& fence) {
+    if (Core::GameSettings::FenceThreadSleep()) {
+        fence->WaitSleeping();
+    } else {
+        fence->Wait();
+    }
 }
 
 } // namespace Vulkan

@@ -31,8 +31,24 @@ using Observer = void (*)(const u32* regs, Memory::Memory& mem);
 /// The observer for a named entry point, or null if the shadow layer ignores it.
 Observer Find(const std::string& name);
 
+/// Maxwell words a native entry point records for one call (up to 32).
+struct NativeWords {
+    u32 n{};
+    u32 v[32]{};
+};
+/// Builds the words for a call from r0-r3/sp; false = not one of the observed forms.
+using NativeBuilder = bool (*)(const u32* regs, Memory::Memory& mem, NativeWords& out);
+/// The builder for a named entry point, or null (used by the verify census).
+NativeBuilder FindBuilder(const std::string& name);
+
 /// Starts receiving the GPU emulation's draws.
 void Start();
+
+/// G3c native entry points (nvnBufferGetAddress ...): registered with NvnTrace::Replace.
+void RegisterNative();
+
+/// Calls served by native entry points so far.
+u64 NativeCalls();
 
 void Flush(const std::filesystem::path& file);
 

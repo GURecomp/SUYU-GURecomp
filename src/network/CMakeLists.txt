@@ -15,6 +15,8 @@ add_library(network STATIC
     ryuldn/client.h
     ryuldn/protocol.cpp
     ryuldn/protocol.h
+    ryuldn/room_bridge.cpp
+    ryuldn/room_bridge.h
     ryuldn/server.cpp
     ryuldn/server.h
     ryuldn/socket_util.cpp

@@ -117,6 +117,11 @@ public:
         return master_semaphore->IsFree(tick);
     }
 
+    /// Reads the GPU's current tick (timeline semaphore) without waiting.
+    void RefreshGpuTick() {
+        master_semaphore->Refresh();
+    }
+
     /// Waits for the given GPU tick, optionally pacing frames.
     void Wait(u64 tick, double target_fps = 0.0) {
         if (tick > 0) {

@@ -7,6 +7,13 @@
 // Parts of this implementation were based on:
 // https://cs.android.com/android/platform/superproject/+/android-5.1.1_r38:frameworks/native/libs/gui/BufferQueueProducer.cpp
 
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <fmt/format.h>
+#include "core/hle/kernel/stall_ring.h"
+#include "video_core/renderer_vulkan/nvn_vk.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -217,10 +224,26 @@ Status BufferQueueProducer::WaitForFreeSlotThenRelock(bool async, s32* found, St
                 return Status::WouldBlock;
             }
 
+            // Wiggle-hitch probe: record the slot states we are blocking on.
+            std::string states;
+            for (s32 s{}; Kernel::StallRing::On() && s < max_buffer_count; ++s) {
+                states += fmt::format(" {}:{}/f{}", s, static_cast<int>(slots[s].buffer_state),
+                                      slots[s].frame_number);
+            }
+            const double wait_start = Vulkan::NvnVkNowMs();
+            if (Kernel::StallRing::On()) Vulkan::NvnVkDumpLine("nvn_bq.txt",
+                                  fmt::format("WAIT start t {:.3f} qsize {} frame {} slots{}",
+                                              wait_start, core->queue.size(), core->frame_counter,
+                                              states));
             if (!core->WaitForDequeueCondition(lk)) {
                 // We are no longer running
                 return Status::NoError;
             }
+            const double wait_end = Vulkan::NvnVkNowMs();
+            if (Kernel::StallRing::On()) Vulkan::NvnVkDumpLine("nvn_bq.txt",
+                                  fmt::format("WAIT end t {:.3f} waited {:.2f} ms qsize {} frame {}",
+                                              wait_end, wait_end - wait_start, core->queue.size(),
+                                              core->frame_counter));
         }
     }
 
@@ -485,6 +508,9 @@ Status BufferQueueProducer::QueueBuffer(s32 slot, const QueueBufferInput& input,
         }
 
         ++core->frame_counter;
+        if (Kernel::StallRing::On()) Vulkan::NvnVkDumpLine("nvn_bq.txt", fmt::format("QUEUE t {:.3f} slot {} frame {}",
+                                                        Vulkan::NvnVkNowMs(), slot,
+                                                        core->frame_counter));
         slots[slot].buffer_state = BufferState::Queued;
         slots[slot].frame_number = core->frame_counter;
         slots[slot].queue_time = timestamp;
@@ -792,6 +818,42 @@ void BufferQueueProducer::Transact(u32 code, std::span<const u8> parcel_data,
         SetPreallocatedBuffer = 14,
         GetBufferHistory = 17,
     };
+
+    // Wiggle-hitch probe: time every transaction. Over 3 ms is logged individually; ordinary
+    // dequeue times get a per-second min/median/max.
+    struct TransactProbe {
+        u32 code;
+        double start = Kernel::StallRing::On() ? Vulkan::NvnVkNowMs() : 0.0;
+        ~TransactProbe() {
+            if (!Kernel::StallRing::On()) return;
+            static std::mutex m;
+            static std::vector<double> deq;
+            static double window_start = 0.0;
+            const double end = Vulkan::NvnVkNowMs();
+            const double ms = end - start;
+            std::scoped_lock lk{m};
+            if (ms > 3.0) {
+                Vulkan::NvnVkDumpLine("nvn_bq.txt",
+                                      fmt::format("TX code {} took {:.2f} ms start {:.3f} end {:.3f}",
+                                                  code, ms, start, end));
+            }
+            if (code == 3) {
+                deq.push_back(ms);
+            }
+            if (window_start == 0.0) {
+                window_start = end;
+            }
+            if (end - window_start >= 1000.0 && !deq.empty()) {
+                std::sort(deq.begin(), deq.end());
+                Vulkan::NvnVkDumpLine(
+                    "nvn_bq.txt",
+                    fmt::format("DEQSTATS t {:.3f} n {} min {:.3f} median {:.3f} max {:.3f}", end,
+                                deq.size(), deq.front(), deq[deq.size() / 2], deq.back()));
+                deq.clear();
+                window_start = end;
+            }
+        }
+    } transact_probe{code};
 
     Status status{Status::NoError};
     InputParcel parcel_in{parcel_data};

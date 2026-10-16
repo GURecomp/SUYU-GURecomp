@@ -7,6 +7,9 @@
 // Parts of this implementation were based on:
 // https://cs.android.com/android/platform/superproject/+/android-5.1.1_r38:frameworks/native/libs/gui/BufferQueueConsumer.cpp
 
+#include <fmt/format.h>
+#include "core/hle/kernel/stall_ring.h"
+#include "video_core/renderer_vulkan/nvn_vk.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "core/hle/service/nvnflinger/buffer_item.h"
@@ -90,6 +93,9 @@ Status BufferQueueConsumer::AcquireBuffer(BufferItem* out_buffer,
     }
 
     const auto slot = front->slot;
+    if (Kernel::StallRing::On()) Vulkan::NvnVkDumpLine("nvn_bq.txt", fmt::format("ACQUIRE t {:.3f} slot {} frame {}",
+                                                    Vulkan::NvnVkNowMs(), slot,
+                                                    front->frame_number));
     *out_buffer = *front;
 
     LOG_DEBUG(Service_Nvnflinger, "acquiring slot={}", slot);
@@ -149,6 +155,9 @@ Status BufferQueueConsumer::ReleaseBuffer(s32 slot, u64 frame_number, const Fenc
             // by properly waiting for the fence in the BufferItemConsumer.
             // slots[slot].fence = release_fence;
             slots[slot].buffer_state = BufferState::Free;
+            if (Kernel::StallRing::On()) Vulkan::NvnVkDumpLine("nvn_bq.txt", fmt::format("RELEASE t {:.3f} slot {} frame {}",
+                                                            Vulkan::NvnVkNowMs(), slot,
+                                                            frame_number));
 
             listener = core->connected_producer_listener;
 

@@ -622,6 +622,82 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
 }
 
 template <class P>
+void TextureCache<P>::HashCompressedImages(
+    const std::function<void(u64 gpu_addr, u32 w, u32 h, u32 layers, u32 levels, int format, size_t bytes, u64 hash)>& callback) {
+    for (auto&& entry : slot_images) {
+        Image& image = *entry.second;
+        const auto& info = image.info;
+        if (info.type != ImageType::e2D || info.num_samples != 1 || !VideoCore::Surface::IsPixelFormatBCn(info.format) ||
+            image.unswizzled_size_bytes == 0 || image.unswizzled_size_bytes > 600 * 1024) {
+            continue;
+        }
+        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+        const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+        image.DownloadMemory(map, copies);
+        runtime.Finish();
+        u64 hash = 1469598103934665603ull;
+        for (size_t i = 0; i < image.unswizzled_size_bytes && i < map.mapped_span.size(); ++i) {
+            hash = (hash ^ map.mapped_span[i]) * 1099511628211ull;
+        }
+        callback(image.gpu_addr, info.size.width, info.size.height, static_cast<u32>(info.resources.layers),
+                 static_cast<u32>(info.resources.levels), static_cast<int>(info.format), image.unswizzled_size_bytes, hash);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::DownloadRegion(u64 gpu_addr, u32 x, u32 y, u32 w, u32 h, std::vector<u8>& out) {
+    for (auto&& entry : slot_images) {
+        Image& image = *entry.second;
+        const auto& info = image.info;
+        if (image.gpu_addr != gpu_addr || info.type != ImageType::e2D || info.size.width != 1920 || info.size.height != 1080 ||
+            info.num_samples != 1 || VideoCore::Surface::BytesPerBlock(info.format) != 4) {
+            continue;
+        }
+        auto map = runtime.DownloadStagingBuffer(size_t{w} * h * 4);
+        const std::array<BufferImageCopy, 1> copies{BufferImageCopy{
+            .buffer_offset = 0,
+            .buffer_size = size_t{w} * h * 4,
+            .buffer_row_length = w,
+            .buffer_image_height = h,
+            .image_subresource = {.base_level = 0, .base_layer = 0, .num_layers = 1},
+            .image_offset = {static_cast<s32>(x), static_cast<s32>(y), 0},
+            .image_extent = {w, h, 1},
+        }};
+        image.DownloadMemory(map, copies);
+        runtime.Finish();
+        out.assign(map.mapped_span.begin(), map.mapped_span.begin() + size_t{w} * h * 4);
+        return true;
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::DumpImages(
+    const std::function<void(u64 gpu_addr, u32 width, u32 height, int format, std::span<const u8> pixels)>& callback,
+    u64 only_gpu_addr) {
+    for (auto&& entry : slot_images) {
+        Image& image = *entry.second;
+        const auto& info = image.info;
+        if (only_gpu_addr != 0 && image.gpu_addr != only_gpu_addr) {
+            continue;
+        }
+        if (info.type != ImageType::e2D || info.size.width < 240 || info.num_samples != 1 || info.resources.levels != 1 ||
+            info.resources.layers != 1) {
+            continue;
+        }
+        if (VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture ||
+            VideoCore::Surface::BytesPerBlock(info.format) != 4 || VideoCore::Surface::IsPixelFormatBCn(info.format)) {
+            continue;
+        }
+        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+        const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+        image.DownloadMemory(map, copies);
+        runtime.Finish();
+        callback(image.gpu_addr, info.size.width, info.size.height, static_cast<int>(info.format), map.mapped_span);
+    }
+}
+
+template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(DAddr cpu_addr,
                                                                                u64 size) {
     std::optional<VideoCore::RasterizerDownloadArea> area{};

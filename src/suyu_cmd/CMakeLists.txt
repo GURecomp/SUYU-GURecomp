@@ -131,6 +131,9 @@ if (SUYU_CMD OR YUZU_CMD)
             target_link_libraries(${_t} PRIVATE getopt)
         endif()
         target_link_libraries(${_t} PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
+        if (UNIX AND NOT APPLE AND NOT ANDROID)
+            target_link_libraries(${_t} PRIVATE ${CMAKE_DL_LIBS}) # dlopen: system SDL3 redirect (suyu.cpp)
+        endif()
 
         target_include_directories(${_t} PRIVATE ${RESOURCES_DIR})
 

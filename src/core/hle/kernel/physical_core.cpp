@@ -13,6 +13,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
+#include "core/hle/kernel/stall_ring.h"
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel {
@@ -108,7 +109,18 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                     thread->SetStepState(StepState::StepPerformed);
                 }
             } else {
+                StallRing::t_gtid = static_cast<u32>(thread->GetThreadId());
+                if (!StallRing::On()) {
+                    hr = interface->RunThread(thread);
+                } else {
+                const double run_t0 = StallRing::NowMs();
+                const u64 cyc0 = StallRing::ThreadCycles();
                 hr = interface->RunThread(thread);
+                StallRing::Add(StallRing::Run, static_cast<u32>(thread->GetThreadId()), static_cast<u8>(m_core_index),
+                               static_cast<u16>(thread->GetPriority()),
+                               static_cast<u32>(hr), static_cast<u32>((StallRing::ThreadCycles() - cyc0) / 1000),
+                               run_t0, StallRing::NowMs());
+                }
             }
 
             ExitContext();

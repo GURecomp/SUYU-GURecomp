@@ -24,6 +24,11 @@ std::shared_ptr<Backend> GetActiveBackend() {
     return g_active;
 }
 
+void Register(std::shared_ptr<Backend> backend) {
+    std::scoped_lock lk{g_active_lock};
+    g_active = std::move(backend);
+}
+
 void Activate(std::shared_ptr<Backend> backend) {
     {
         std::scoped_lock lk{g_active_lock};
@@ -219,7 +224,10 @@ NetworkError Backend::CreateNetwork(const CreateAccessPointRequest& request,
                                     std::span<const u8> advertise) {
     const auto set = Current();
     active = 0; // hosted lobbies live on the main server
-    return set->clients[0]->CreateNetwork(request, advertise);
+    hosting = false;
+    const NetworkError error = set->clients[0]->CreateNetwork(request, advertise);
+    hosting = error == NetworkError::None;
+    return error;
 }
 
 NetworkError Backend::Connect(const ConnectRequest& request) {
@@ -239,6 +247,7 @@ NetworkError Backend::Connect(const ConnectRequest& request) {
                  set->settings[server].host, set->settings[server].port);
     }
     active = server;
+    hosting = false;
     return set->clients[server]->Connect(request);
 }
 
@@ -258,10 +267,45 @@ bool Backend::ClearNetworkListener(const void* owner) {
     return true;
 }
 
-void Backend::OnNetworkChange(const NetworkInfoBlob& info, bool connected) {
+Backend::ObserverHandle Backend::AddNetworkObserver(NetworkListener observer) {
+    auto handle = std::make_shared<NetworkListener>(std::move(observer));
     std::scoped_lock lk{listener_lock};
-    if (network_listener) {
-        network_listener(info, connected);
+    observers.push_back(handle);
+    return handle;
+}
+
+void Backend::RemoveNetworkObserver(const ObserverHandle& handle) {
+    std::scoped_lock lk{listener_lock};
+    std::erase(observers, handle);
+}
+
+bool Backend::IsHosting() const {
+    return hosting.load() && Active().InNetwork();
+}
+
+NetworkInfoBlob Backend::LobbyInfo() const {
+    std::scoped_lock lk{lobby_lock};
+    return lobby_info;
+}
+
+void Backend::OnNetworkChange(const NetworkInfoBlob& info, bool connected) {
+    {
+        std::scoped_lock lk{lobby_lock};
+        lobby_info = connected ? info : NetworkInfoBlob{};
+    }
+    if (!connected) {
+        hosting = false;
+    }
+    std::vector<ObserverHandle> watchers;
+    {
+        std::scoped_lock lk{listener_lock};
+        if (network_listener) {
+            network_listener(info, connected);
+        }
+        watchers = observers;
+    }
+    for (const auto& watcher : watchers) {
+        (*watcher)(info, connected);
     }
 }
 

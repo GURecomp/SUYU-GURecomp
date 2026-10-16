@@ -3045,6 +3045,7 @@ public:
             u32 base_instance{};
             u32 instance_count{};
             std::vector<u8> inline_index_draw_indexes;
+            size_t inline_index_skipped{};
         };
         struct DrawTextureState {
             f32 dst_x0;

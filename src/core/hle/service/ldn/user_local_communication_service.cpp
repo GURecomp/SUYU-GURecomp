@@ -18,6 +18,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
+#include "core/hle/service/ldn/hybrid_network.h"
 #include "network/ryuldn/backend.h"
 #include "network/network.h"
 
@@ -30,7 +31,21 @@ IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& sys
     : ServiceFramework{system_, "IUserLocalCommunicationService"},
       service_context{system, "IUserLocalCommunicationService"},
       ldn_backend{Network::GetLdnBackend()} {
-    if (auto ryu = Network::RyuLdn::GetActiveBackend()) {
+    // Which LDN state machine serves this session follows the mode the menu set last (it can
+    // change while the game runs; the next local-play session picks it up). Without the hybrid
+    // backend (other frontends) a RyuLdn backend means RyuLdn only, none means the room.
+    const auto hybrid_backend = Network::GetHybridLdnBackend();
+    const auto ryu = Network::RyuLdn::GetActiveBackend();
+    Network::LdnMode mode = ryu ? Network::LdnMode::RyuLdn : Network::LdnMode::Room;
+    if (hybrid_backend) {
+        mode = ryu ? hybrid_backend->GetMode() : Network::LdnMode::Room;
+    }
+    if (mode == Network::LdnMode::Auto && hybrid_backend) {
+        auto hybrid = std::make_unique<HybridLdnNetwork>(hybrid_backend, ryu,
+                                                         [this] { return ReadAppInfo(); });
+        hybrid_network = hybrid.get();
+        network = std::move(hybrid);
+    } else if (mode == Network::LdnMode::RyuLdn) {
         network = std::make_unique<RyuLdnNetwork>(ryu, [this] { return ReadAppInfo(); });
     } else {
         auto lan = std::make_unique<LANDiscovery>();
@@ -80,6 +95,7 @@ IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& sys
 }
 
 IUserLocalCommunicationService::~IUserLocalCommunicationService() {
+    StopHostingHook();
     if (is_initialized) {
         ldn_backend->Unbind(ldn_packet_received);
     }
@@ -221,14 +237,22 @@ Result IUserLocalCommunicationService::OpenAccessPoint() {
 Result IUserLocalCommunicationService::CloseAccessPoint() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(network->CloseAccessPoint());
+    const Result rc = network->CloseAccessPoint();
+    StopHostingHook();
+    R_RETURN(rc);
 }
 
 Result IUserLocalCommunicationService::CreateNetwork(const CreateNetworkConfig& create_config) {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(network->CreateNetwork(create_config.security_config, create_config.user_config,
-                                         create_config.network_config));
+    StartHostingHook();
+    const Result rc = network->CreateNetwork(create_config.security_config,
+                                             create_config.user_config,
+                                             create_config.network_config);
+    if (rc.IsError()) {
+        StopHostingHook();
+    }
+    R_RETURN(rc);
 }
 
 Result IUserLocalCommunicationService::CreateNetworkPrivate(
@@ -236,14 +260,22 @@ Result IUserLocalCommunicationService::CreateNetworkPrivate(
     InArray<AddressEntry, BufferAttr_HipcPointer> address_list) {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(network->CreateNetwork(create_config.security_config, create_config.user_config,
-                                         create_config.network_config));
+    StartHostingHook();
+    const Result rc = network->CreateNetwork(create_config.security_config,
+                                             create_config.user_config,
+                                             create_config.network_config);
+    if (rc.IsError()) {
+        StopHostingHook();
+    }
+    R_RETURN(rc);
 }
 
 Result IUserLocalCommunicationService::DestroyNetwork() {
     LOG_INFO(Service_LDN, "called");
 
-    R_RETURN(network->DestroyNetwork());
+    const Result rc = network->DestroyNetwork();
+    StopHostingHook();
+    R_RETURN(rc);
 }
 
 Result IUserLocalCommunicationService::SetAdvertiseData(
@@ -300,7 +332,7 @@ Result IUserLocalCommunicationService::Initialize(ClientProcessId aruid) {
     const auto network_interface = Network::GetSelectedNetworkInterface();
     R_UNLESS(network_interface, ResultAirplaneModeEnabled);
 
-    if (lan_discovery) {
+    if (lan_discovery || hybrid_network) {
         ldn_packet_received = ldn_backend->BindOnLdnPacketReceived(
             [this](const Network::LDNPacket& packet) { OnLDNPacketReceived(packet); });
         if (!ldn_packet_received) {
@@ -320,7 +352,9 @@ Result IUserLocalCommunicationService::Finalize() {
 
     is_initialized = false;
 
-    R_RETURN(network->Finalize());
+    const Result rc = network->Finalize();
+    StopHostingHook();
+    R_RETURN(rc);
 }
 
 Result IUserLocalCommunicationService::Initialize2(u32 version, ClientProcessId process_id) {
@@ -329,8 +363,25 @@ Result IUserLocalCommunicationService::Initialize2(u32 version, ClientProcessId 
 }
 
 void IUserLocalCommunicationService::OnLDNPacketReceived(const Network::LDNPacket& packet) {
-    if (lan_discovery) {
+    if (hybrid_network) {
+        hybrid_network->ReceivePacket(packet);
+    } else if (lan_discovery) {
         lan_discovery->ReceivePacket(packet);
+    }
+}
+
+void IUserLocalCommunicationService::StartHostingHook() {
+    // The hybrid network runs the hook itself (it decides between server and room first).
+    if (!hybrid_network && !hosting_hooked) {
+        hosting_hooked = true;
+        Network::RunHostingHook(true);
+    }
+}
+
+void IUserLocalCommunicationService::StopHostingHook() {
+    if (hosting_hooked) {
+        hosting_hooked = false;
+        Network::RunHostingHook(false);
     }
 }
 

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <functional>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -204,6 +205,15 @@ public:
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
+
+    /// Diagnostics: pixels of one rectangle of the 1920x1080 colour image at `gpu_addr` (small staging buffer).
+    /// Diagnostics: hash of every block-compressed image up to 600 KB (all levels and layers) as downloaded from the GPU.
+    void HashCompressedImages(const std::function<void(u64 gpu_addr, u32 w, u32 h, u32 layers, u32 levels, int format, size_t bytes, u64 hash)>& callback);
+    bool DownloadRegion(u64 gpu_addr, u32 x, u32 y, u32 w, u32 h, std::vector<u8>& out);
+
+    /// Diagnostics: calls back with the pixels of every plain 4-byte colour image of at least 240 pixels width.
+    void DumpImages(const std::function<void(u64 gpu_addr, u32 width, u32 height, int format, std::span<const u8> pixels)>& callback,
+                    u64 only_gpu_addr = 0);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr cpu_addr, u64 size);
 

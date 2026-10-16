@@ -21,10 +21,12 @@
 #include "core/core.h"
 #include "core/hle/service/ldn/ldn_types.h"
 #include "core/internal_network/network_interface.h"
+#include "network/ldn_backend.h"
 #include "network/network.h"
 #include "network/room.h"
 #include "network/room_member.h"
 #include "network/ryuldn/backend.h"
+#include "network/ryuldn/room_bridge.h"
 #include "network/ryuldn/server.h"
 #include "network/verify_user.h"
 #include "suyu_cmd/multiplayer.h"
@@ -211,8 +213,32 @@ void Init() {
 }
 
 namespace {
-bool g_ryuldn_chosen{false};
+LdnMode g_mode{LdnMode::Room};
+std::shared_ptr<Network::HybridLdnBackend> g_hybrid;
+std::unique_ptr<Network::RyuLdn::RoomBridge> g_bridge; // auto mode only
 std::string g_ryuldn_problem; // why ryuldn isn't usable this run ("" = fine)
+
+Network::LdnMode ToNetworkMode(LdnMode mode) {
+    switch (mode) {
+    case LdnMode::RyuLdn:
+        return Network::LdnMode::RyuLdn;
+    case LdnMode::Auto:
+        return Network::LdnMode::Auto;
+    default:
+        return Network::LdnMode::Room;
+    }
+}
+
+const char* ModeText(LdnMode mode) {
+    switch (mode) {
+    case LdnMode::RyuLdn:
+        return "ryuldn";
+    case LdnMode::Auto:
+        return "auto";
+    default:
+        return "room";
+    }
+}
 } // namespace
 
 namespace {
@@ -237,7 +263,11 @@ std::optional<std::pair<std::string, u16>> ParseServer(const std::string& text) 
     return std::pair{host, port};
 }
 
-/// Main server first, then the extra ones (duplicates dropped), all with the passphrase.
+std::string g_friend_server; // the host we joined a room of: its server too (until we leave)
+
+/// Where lobbies are hosted and found, in order: [0] the main server (lobbies this game hosts live
+/// there): this PC's own server unless ryuldn_host names another; then the server of the friend
+/// whose room we joined; Ryujinx's public server (ryuldn_public = off leaves it out); the extras.
 std::vector<Network::RyuLdn::Client::Settings> ConfiguredRyuLdnServers() {
     std::vector<Network::RyuLdn::Client::Settings> out;
     const std::string passphrase = Trimmed(GS::Value("Multiplayer", "ryuldn_passphrase"));
@@ -256,13 +286,31 @@ std::vector<Network::RyuLdn::Client::Settings> ConfiguredRyuLdnServers() {
     const u16 port = static_cast<u16>(
         ParseU32(GS::Value("Multiplayer", "ryuldn_port"), Network::RyuLdn::DefaultPort));
     const std::string main_host = Trimmed(GS::Value("Multiplayer", "ryuldn_host"));
-    if (main_host.empty()) {
-        add(DefaultRyuLdnHost, port);
-    } else if (main_host == SelfHostKeyword) {
-        add("127.0.0.1", port); // the server this game runs (StartOwnServer)
+    if (main_host == DefaultRyuLdnHost) {
+        add(DefaultRyuLdnHost, port); // hosted lobbies go to Ryujinx's public server
+    } else if (main_host.empty() || main_host == SelfHostKeyword) {
+        add("127.0.0.1", port); // the server this game runs while it hosts (OwnServerIsMain)
     } else if (const auto server = ParseServer(main_host)) {
-        add(server->first, main_host.find(':') == std::string::npos ? port : server->second);
+        // This PC's own address (e.g. the Radmin one) names the server it runs itself.
+        bool own = server->first == "localhost" || server->first == "127.0.0.1";
+        for (const auto& a : LocalAddresses()) {
+            own |= a.ip == server->first;
+        }
+        if (own) {
+            add("127.0.0.1", port);
+        } else {
+            add(server->first, main_host.find(':') == std::string::npos ? port : server->second);
+        }
     } else {
+        add("127.0.0.1", port);
+    }
+    if (!g_friend_server.empty()) {
+        if (const auto server = ParseServer(g_friend_server)) {
+            add(server->first, g_friend_server.find(':') == std::string::npos ? port
+                                                                               : server->second);
+        }
+    }
+    if (Trimmed(GS::Value("Multiplayer", "ryuldn_public")) != "off") {
         add(DefaultRyuLdnHost, port);
     }
     for (const auto& entry : ExtraRyuLdnServers()) {
@@ -271,6 +319,11 @@ std::vector<Network::RyuLdn::Client::Settings> ConfiguredRyuLdnServers() {
         }
     }
     return out;
+}
+
+/// Lobbies this game hosts go to a server it runs itself.
+bool OwnServerIsMain() {
+    return ConfiguredRyuLdnServers().front().host == "127.0.0.1";
 }
 
 } // namespace
@@ -379,10 +432,10 @@ bool ApplyServersLive(std::string* error) {
 
 RyuLdnServerChoice CurrentRyuLdnServerChoice() {
     const std::string host = Trimmed(GS::Value("Multiplayer", "ryuldn_host"));
-    if (host.empty() || host == DefaultRyuLdnHost) {
+    if (host == DefaultRyuLdnHost) {
         return {RyuLdnServerChoice::Mode::Public, {}};
     }
-    if (host == SelfHostKeyword) {
+    if (host.empty() || host == SelfHostKeyword) {
         return {RyuLdnServerChoice::Mode::Host, {}};
     }
     return {RyuLdnServerChoice::Mode::Friend, host};
@@ -433,24 +486,88 @@ OwnServerStatus GetOwnServerStatus() {
     return out;
 }
 
+bool HostLocked(Core::System* system, const Config& c, std::string* error);
+void LeaveLocked();
+
+namespace {
+
+bool g_auto_hosted{false}; // the room is open because the game hosts a lobby
+bool g_auto_server{false}; // so is this PC's RyuLdn server
+
+/// The game starts (true) or stops (false) hosting a lobby: hosting means a room for suyu players
+/// and a server for Ryujinx players, both of this PC, and the bridge links them. Nothing to press.
+void OnGameHosting(bool start) {
+    std::scoped_lock lock{g_mutex};
+    if (start) {
+        std::string error;
+        if (g_mode != LdnMode::Room && OwnServerIsMain() && !g_auto_server) {
+            if (StartOwnServer(&error)) {
+                g_auto_server = true;
+            } else {
+                LOG_ERROR(Network, "multiplayer: opening the RyuLdn server failed: {}", error);
+            }
+        }
+        const auto member = EnsureNetwork() ? Network::GetRoomMember().lock() : nullptr;
+        if (g_mode != LdnMode::RyuLdn && member && !member->IsConnected() && !g_hosting) {
+            if (HostLocked(nullptr, Load(), &error)) {
+                g_auto_hosted = true;
+            } else {
+                LOG_ERROR(Network, "multiplayer: opening the room failed: {}", error);
+            }
+        }
+    } else {
+        if (g_auto_hosted) {
+            LeaveLocked();
+            g_auto_hosted = false;
+        }
+        if (g_auto_server) {
+            StopOwnServer();
+            g_auto_server = false;
+        }
+    }
+}
+
+/// Applies mode to the running game (lock held): the sockets, the next LDN session and the
+/// room bridge follow at once; a lobby that is open keeps working until it is left.
+void ApplyModeLocked(LdnMode mode) {
+    g_mode = mode;
+    if (g_hybrid) {
+        g_hybrid->SetMode(ToNetworkMode(mode));
+    }
+    // Hosting in the game opens what the mode needs: the room (Suyu room), this PC's server
+    // (Ryujinx LDN), or both (Both).
+    Network::SetHostingHook(OnGameHosting);
+    if (mode == LdnMode::Auto) {
+        if (!g_bridge) {
+            if (const auto ryu = Network::RyuLdn::GetActiveBackend()) {
+                g_bridge = std::make_unique<Network::RyuLdn::RoomBridge>(ryu);
+            }
+        }
+    } else {
+        g_bridge.reset();
+    }
+}
+
+} // namespace
+
 bool SetupLdnBackend() {
     std::scoped_lock lock{g_mutex};
     const std::string backend = Trimmed(GS::Value("Multiplayer", "backend"));
-    if (backend.empty() || backend == "room") {
-        return true;
-    }
-    if (backend != "ryuldn") {
-        LOG_ERROR(Network, "multiplayer: unknown [Multiplayer] backend '{}' (room or ryuldn)",
+    LdnMode mode = LdnMode::Auto; // default: whatever the lobby needs, no switching
+    bool known = true;
+    if (backend == "ryuldn") {
+        mode = LdnMode::RyuLdn;
+    } else if (backend == "room") {
+        mode = LdnMode::Room;
+    } else if (!backend.empty() && backend != "auto") {
+        LOG_ERROR(Network,
+                  "multiplayer: unknown [Multiplayer] backend '{}' (room, ryuldn or auto)",
                   backend);
-        return false;
+        known = false;
     }
-    g_ryuldn_chosen = true;
-    if (CurrentRyuLdnServerChoice().mode == RyuLdnServerChoice::Mode::Host) {
-        std::string error;
-        if (!StartOwnServer(&error)) {
-            LOG_ERROR(Network, "multiplayer: hosting the RyuLdn server failed: {}", error);
-        }
-    }
+
+    // Both transports are always set up (a RyuLdn server is only contacted once it is used), so
+    // the mode can change while the game runs.
     auto servers = ConfiguredRyuLdnServers();
     const std::string& passphrase = servers[0].passphrase;
     if (!passphrase.empty() &&
@@ -459,25 +576,64 @@ bool SetupLdnBackend() {
                              "server treats it as empty (public lobbies)",
                     passphrase);
     }
-    LOG_INFO(Network, "multiplayer: local play through the RyuLdn server {}:{}{}{}",
+    LOG_INFO(Network, "multiplayer: local play over {} (RyuLdn server {}:{}{}{})", ModeText(mode),
              servers[0].host, servers[0].port,
              servers.size() > 1 ? fmt::format(" + {} more", servers.size() - 1) : std::string{},
-             passphrase.empty() ? "" : " (private passphrase)");
-    Network::RyuLdn::Activate(std::make_shared<Network::RyuLdn::Backend>(std::move(servers)));
-    return true;
+             passphrase.empty() ? "" : ", private passphrase");
+    const auto ryu = std::make_shared<Network::RyuLdn::Backend>(std::move(servers));
+    Network::RyuLdn::Register(ryu);
+    g_hybrid = std::make_shared<Network::HybridLdnBackend>(
+        std::make_shared<Network::RoomLdnBackend>(), ryu);
+    Network::SetHybridLdnBackend(g_hybrid);
+    ApplyModeLocked(mode);
+    return known;
+}
+
+LdnMode CurrentLdnMode() {
+    std::scoped_lock lock{g_mutex};
+    return g_mode;
 }
 
 bool UsingRyuLdn() {
     std::scoped_lock lock{g_mutex};
-    return g_ryuldn_chosen;
+    return g_mode != LdnMode::Room;
 }
 
-bool RyuLdnChosenInSettings() {
-    return Trimmed(GS::Value("Multiplayer", "backend")) == "ryuldn";
+bool SetLdnMode(LdnMode mode, std::string* error) {
+    std::scoped_lock lock{g_mutex};
+    if (!g_hybrid) {
+        *error = "local play isn't set up";
+        return false;
+    }
+    if (mode != g_mode) {
+        const auto ryu = Network::RyuLdn::GetActiveBackend();
+        if (g_hybrid->GetActive() != Network::LdnTransport::None ||
+            (ryu && ryu->client().InNetwork())) {
+            *error = "leave the lobby first";
+            return false;
+        }
+    }
+    GS::SetValue("Multiplayer", "backend", ModeText(mode));
+    ApplyModeLocked(mode);
+    LOG_INFO(Network, "multiplayer: local play now over {}", ModeText(mode));
+    return true;
 }
 
-void ChooseBackend(bool ryuldn) {
-    GS::SetValue("Multiplayer", "backend", ryuldn ? "ryuldn" : "room");
+std::string BridgeStatusText() {
+    std::scoped_lock lock{g_mutex};
+    if (!g_bridge) {
+        return {};
+    }
+    const auto status = g_bridge->GetStatus();
+    if (!status.active) {
+        return "Bridge: ready (a lobby you host is open to this room too)";
+    }
+    std::string out = fmt::format("Bridge: lobby open to the room, {} room player{} in it",
+                                  status.players, status.players == 1 ? "" : "s");
+    for (const auto& name : status.names) {
+        out += "\n  - " + name;
+    }
+    return out;
 }
 
 std::string RyuLdnServer() {
@@ -506,15 +662,8 @@ std::string ServerLabel(const std::string& host, std::size_t index) {
     if (host == DefaultRyuLdnHost) {
         return "Ryujinx";
     }
-    if (index == 0) {
-        switch (CurrentRyuLdnServerChoice().mode) {
-        case RyuLdnServerChoice::Mode::Host:
-            return "Your server";
-        case RyuLdnServerChoice::Mode::Friend:
-            return "Friend's server";
-        default:
-            break;
-        }
+    if (host == "127.0.0.1") {
+        return "This PC";
     }
     return fmt::format("Server {}", index + 1);
 }
@@ -559,7 +708,9 @@ void ScanPublicRooms(std::shared_ptr<RoomsState> state, u64 local_communication_
     for (std::size_t i = 0; i < servers.size(); i++) {
         const std::string label = ServerLabel(servers[i].host, i);
         if (!found[i]) {
-            result.errors.push_back(label + ": " + errors[i]);
+            if (servers[i].host != "127.0.0.1") { // our own server only runs while we host
+                result.errors.push_back(label + ": " + errors[i]);
+            }
             continue;
         }
         for (const auto& blob : *found[i]) {
@@ -616,7 +767,7 @@ PublicRooms GetPublicRooms() {
 
 std::string RyuLdnStatusText() {
     std::scoped_lock lock{g_mutex};
-    if (!g_ryuldn_chosen) {
+    if (g_mode == LdnMode::Room) {
         return {};
     }
     if (!g_ryuldn_problem.empty()) {
@@ -667,10 +818,9 @@ void Save(const Config& c) {
     GS::SetValue("Multiplayer", "max_players", std::to_string(c.max_players));
 }
 
-bool Host(Core::System& system, const Config& c, std::string* error) {
-    std::scoped_lock lock{g_mutex};
-    if (g_ryuldn_chosen) {
-        *error = "this run uses the RyuLdn server ([Multiplayer] backend = ryuldn)";
+bool HostLocked(Core::System* system, const Config& c, std::string* error) {
+    if (g_mode == LdnMode::RyuLdn) {
+        *error = "local play is set to Ryujinx LDN only; pick Both or Suyu room first";
         return false;
     }
     if (!ValidNickname(c.nickname, error)) {
@@ -692,15 +842,29 @@ bool Host(Core::System& system, const Config& c, std::string* error) {
     if (room->GetState() == Network::Room::State::Open) {
         room->Destroy();
     }
-    Network::GameInfo game;
-    [[maybe_unused]] auto _ = system.GetGameName(game.name);
-    game.id = system.GetApplicationProcessProgramID();
-    g_game = game;
-    if (!room->Create(c.room_name, "", "", c.port, c.password, c.max_players, c.nickname, game,
+    if (system != nullptr) {
+        Network::GameInfo game;
+        [[maybe_unused]] auto _ = system->GetGameName(game.name);
+        game.id = system->GetApplicationProcessProgramID();
+        g_game = game;
+    }
+    if (!room->Create(c.room_name, "", "", c.port, c.password, c.max_players, c.nickname, g_game,
                       std::make_unique<Network::VerifyUser::NullBackend>(), {})) {
         *error = fmt::format("could not open a room on port {} (already in use?)", c.port);
         LOG_ERROR(Network, "multiplayer: {}", *error);
         return false;
+    }
+    // Players of this room may need addresses that belong to the Ryujinx side (the bridge).
+    room->SetHostGateway(true);
+    // A room hosted in a mode that includes Ryujinx LDN brings this PC's LDN server up too, however
+    // the room was started (game, ini or the dev panel), so Ryujinx friends can join.
+    if (g_mode != LdnMode::Room && OwnServerIsMain() && !g_auto_server) {
+        std::string server_error;
+        if (StartOwnServer(&server_error)) {
+            g_auto_server = true;
+        } else {
+            LOG_ERROR(Network, "multiplayer: opening the RyuLdn server failed: {}", server_error);
+        }
     }
     g_hosting = true;
     g_target.reset();
@@ -712,10 +876,15 @@ bool Host(Core::System& system, const Config& c, std::string* error) {
     return true;
 }
 
+bool Host(Core::System& system, const Config& c, std::string* error) {
+    std::scoped_lock lock{g_mutex};
+    return HostLocked(&system, c, error);
+}
+
 bool Join(const Config& c, std::string* error) {
     std::scoped_lock lock{g_mutex};
-    if (g_ryuldn_chosen) {
-        *error = "this run uses the RyuLdn server ([Multiplayer] backend = ryuldn)";
+    if (g_mode == LdnMode::RyuLdn) {
+        *error = "local play is set to Ryujinx LDN only; pick Both or Suyu room first";
         return false;
     }
     if (!ValidNickname(c.nickname, error)) {
@@ -743,13 +912,19 @@ bool Join(const Config& c, std::string* error) {
     g_attempt = 0;
     g_hosting = false;
     RememberHost(c.address, c.port);
+    // A friend who hosts runs their RyuLdn server on the same address: lobbies there are
+    // found and joined too (Ryujinx players use that server).
+    g_friend_server = c.address;
+    {
+        std::string ignored;
+        ApplyServersLive(&ignored);
+    }
     LOG_INFO(Network, "multiplayer: joining {}:{} as {}", c.address, c.port, c.nickname);
     member->Join(c.nickname, c.address.c_str(), c.port, 0, Network::NoPreferredIP, c.password);
     return true;
 }
 
-void Leave() {
-    std::scoped_lock lock{g_mutex};
+void LeaveLocked() {
     if (!g_network_ready) {
         return;
     }
@@ -765,6 +940,25 @@ void Leave() {
     g_reconnecting = false;
     g_known_members.clear();
     LOG_INFO(Network, "multiplayer: left the room");
+}
+
+void Leave() {
+    std::scoped_lock lock{g_mutex};
+    LeaveLocked();
+    if (!g_friend_server.empty()) {
+        g_friend_server.clear();
+        std::string ignored;
+        ApplyServersLive(&ignored);
+    }
+}
+
+void Shutdown() {
+    std::scoped_lock lock{g_mutex};
+    g_bridge.reset();
+    if (g_auto_server) {
+        StopOwnServer();
+        g_auto_server = false;
+    }
 }
 
 std::string StatusText() {
@@ -808,7 +1002,7 @@ void AutoStart(Core::System& system) {
     SetGame(system);
     const Config c = Load();
     std::string error;
-    if (UsingRyuLdn()) {
+    if (CurrentLdnMode() == LdnMode::RyuLdn) {
         if (c.mode != "off") {
             LOG_INFO(Network, "multiplayer: [Multiplayer] mode = {} ignored (backend = ryuldn)",
                      c.mode);
@@ -826,6 +1020,20 @@ void AutoStart(Core::System& system) {
     }
 }
 
+bool Kick(const std::string& nickname) {
+    std::scoped_lock lock{g_mutex};
+    if (!g_hosting) {
+        return false;
+    }
+    const auto room = Network::GetRoom().lock();
+    if (!room || room->GetState() != Network::Room::State::Open) {
+        return false;
+    }
+    LOG_INFO(Network, "multiplayer: kicking {}", nickname);
+    room->KickMember(nickname);
+    return true;
+}
+
 Status GetStatus() {
     std::scoped_lock lock{g_mutex};
     Status st;
@@ -839,6 +1047,7 @@ Status GetStatus() {
         st.slots = info.member_slots;
         st.nickname = member->GetNickname();
         for (const auto& m : member->GetMemberInformation()) {
+            st.names.push_back(m.nickname);
             st.members.push_back(m.game_info.name.empty()
                                      ? m.nickname
                                      : fmt::format("{}  ({})", m.nickname, m.game_info.name));

@@ -139,6 +139,19 @@ public:
     BanList GetBanList() const;
 
     /**
+     * With the gateway on, the host's member also receives unicast packets (proxy and LDN)
+     * addressed to an IP no member owns, instead of them being dropped. The suyu/Ryujinx bridge
+     * uses it to answer for the addresses of the other network.
+     */
+    void SetHostGateway(bool enabled);
+
+    /**
+     * Removes a member from the room (the host's own call: needs no moderator rights). Done on
+     * the room's thread shortly after; the member sees "kicked by the host".
+     */
+    void KickMember(const std::string& nickname);
+
+    /**
      * Destroys the socket
      */
     void Destroy();

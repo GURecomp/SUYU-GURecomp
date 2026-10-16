@@ -271,6 +271,13 @@ public:
     }
 
     /// Returns the main present queue.
+    vk::Queue GetNvnQueue() const {
+        return nvn_queue;
+    }
+    bool HasSeparateNvnQueue() const {
+        return nvn_queue_separate;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
@@ -1018,6 +1025,9 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue nvn_queue;         ///< Second graphics queue for the NVN renderer (same as graphics_queue if the family has one).
+    bool nvn_queue_separate{};
+    mutable u32 nvn_queue_count_requested{1};
     u32 instance_version{};      ///< Vulkan instance version.
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.

@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <dlfcn.h>
+#include <cstdlib>
+#endif
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -390,6 +394,20 @@ static int ProbeIsaList(const std::string& list_path, const std::string& out_pat
 }
 
 int main(int argc, char** argv) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // The bundled SDL3 can come without the render subsystem the game menu window needs
+    // ("SDL not built with rendering support"). SDL3 can redirect all its calls to the system
+    // library through SDL3_DYNAMIC_API; this has to be set before the first SDL call. The soname
+    // is resolved by the dynamic linker, so it works on every distro that ships SDL3 (a system
+    // library that is older than the bundled headers is ignored by SDL itself). An existing
+    // SDL3_DYNAMIC_API is left alone.
+    if (std::getenv("SDL3_DYNAMIC_API") == nullptr) {
+        if (void* lib = dlopen("libSDL3.so.0", RTLD_LAZY | RTLD_LOCAL)) {
+            dlclose(lib);
+            setenv("SDL3_DYNAMIC_API", "libSDL3.so.0", 0);
+        }
+    }
+#endif
 #ifdef _WIN32
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "wb", stdout);
@@ -826,6 +844,16 @@ int main(int argc, char** argv) {
         SetEnvironmentVariableW(L"DISABLE_RTSS_LAYER", L"1");
         LOG_INFO(Frontend, "RivaTuner Vulkan overlay kept out (game_settings.ini [Debug] "
                            "rtss_overlay = true lets it load)");
+    } else {
+        // RTSS alone: other implicit Vulkan layers on the PC (Overwolf, Steam, GOG, Epic, OBS) sit in the
+        // same chain, and RTSS's layer crashed in vkCreateDevice when called through Overwolf's. The
+        // loader keeps only RTSS among the implicit layers (needs a Vulkan loader 1.3.234 or newer).
+        if (wchar_t probe[2]; GetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", probe, 2) == 0) {
+            SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", L"~implicit~");
+            SetEnvironmentVariableW(L"VK_LOADER_LAYERS_ENABLE", L"VK_LAYER_RTSS");
+            LOG_INFO(Frontend, "RivaTuner Vulkan overlay allowed; the other implicit Vulkan layers are off "
+                               "(set VK_LOADER_LAYERS_DISABLE yourself to change that)");
+        }
     }
 #endif
 
@@ -1061,6 +1089,7 @@ int main(int argc, char** argv) {
     system.DetachDebugger();
     void(system.Pause());
     Multiplayer::Leave();
+    Multiplayer::Shutdown();
     system.ShutdownMainProcess();
 
 #ifdef __unix__

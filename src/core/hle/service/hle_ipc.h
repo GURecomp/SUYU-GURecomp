@@ -65,6 +65,7 @@ class SessionRequestHandler : public std::enable_shared_from_this<SessionRequest
 public:
     SessionRequestHandler(Kernel::KernelCore& kernel_, const char* service_name_);
     virtual ~SessionRequestHandler();
+    const char* probe_name{}; // service name, for the slow-call probe
 
     /**
      * Handles a sync request from the emulated application.

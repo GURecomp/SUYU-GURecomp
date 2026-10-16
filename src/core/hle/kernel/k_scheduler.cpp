@@ -17,6 +17,7 @@
 #include "core/hle/kernel/k_interrupt_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/stall_ring.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
@@ -369,6 +370,13 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
     // if (KProcess *next_process = next_thread->GetOwnerProcess(); next_process != cur_process) {
     //     KProcess::Switch(cur_process, next_process);
     // }
+
+    if (StallRing::On()) {
+        const double now = StallRing::NowMs();
+        StallRing::Add(StallRing::Switch, static_cast<u32>(next_thread->GetThreadId()), static_cast<u8>(m_core_id),
+                       static_cast<u16>(next_thread->GetPriority()), static_cast<u32>(cur_thread->GetThreadId()), 0,
+                       now, now);
+    }
 
     // Set the new thread.
     SetCurrentThread(kernel, next_thread);

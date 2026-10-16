@@ -33,6 +33,13 @@ public:
 
     std::string password; ///< The password required to connect to this room.
 
+    /// The host's member takes the unicast packets nobody else in the room owns (the
+    /// Ryujinx/suyu bridge answers for addresses of the other network).
+    std::atomic<bool> host_gateway{false};
+    std::mutex kick_mutex;
+    std::vector<std::string> kick_queue; ///< host-requested kicks, run on the room thread
+    void KickNow(const std::string& nickname);
+
     struct Member {
         std::string nickname; ///< The nickname of the member.
         GameInfo game_info;   ///< The current game of the member
@@ -204,6 +211,9 @@ public:
      */
     IPv4Address GenerateFakeIPAddress();
 
+    /// The gateway's peer for a packet from sender (member_mutex held); null when there is none.
+    ENetPeer* GatewayPeer(const ENetPeer* sender) const;
+
     /**
      * Broadcasts this packet to all members except the sender.
      * @param event The ENet event containing the data
@@ -239,6 +249,14 @@ public:
 void Room::RoomImpl::StartLoop() {
     room_thread.emplace([&](std::stop_token stoken) {
         while (state != State::Closed) {
+            std::vector<std::string> kicks;
+            {
+                std::lock_guard lock(kick_mutex);
+                kicks.swap(kick_queue);
+            }
+            for (const auto& nickname : kicks) {
+                KickNow(nickname);
+            }
             ENetEvent event;
             if (enet_host_service(server, &event, 5) > 0) {
                 switch (event.type) {
@@ -400,6 +418,28 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
     } else {
         SendJoinSuccess(event->peer, preferred_fake_ip);
     }
+}
+
+void Room::RoomImpl::KickNow(const std::string& nickname) {
+    std::string username, ip;
+    {
+        std::lock_guard lock(member_mutex);
+        const auto target_member =
+            std::find_if(members.begin(), members.end(),
+                         [&nickname](const auto& member) { return member.nickname == nickname; });
+        if (target_member == members.end()) {
+            return;
+        }
+        SendUserKicked(target_member->peer);
+        username = target_member->user_data.username;
+        std::array<char, 256> ip_raw{};
+        enet_address_get_host_ip(&target_member->peer->address, ip_raw.data(), sizeof(ip_raw) - 1);
+        ip = ip_raw.data();
+        enet_peer_disconnect(target_member->peer, 0);
+        members.erase(target_member);
+    }
+    SendStatusMessage(IdMemberKicked, nickname, username, ip);
+    BroadcastRoomInformation();
 }
 
 void Room::RoomImpl::HandleModKickPacket(const ENetEvent* event) {
@@ -816,6 +856,18 @@ IPv4Address Room::RoomImpl::GenerateFakeIPAddress() {
     return IPv4Address{192, 168, 0, 0};
 }
 
+ENetPeer* Room::RoomImpl::GatewayPeer(const ENetPeer* sender) const {
+    if (!host_gateway.load() || room_information.host_username.empty()) {
+        return nullptr;
+    }
+    for (const auto& member : members) {
+        if (member.nickname == room_information.host_username && member.peer != sender) {
+            return member.peer;
+        }
+    }
+    return nullptr;
+}
+
 void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
     Packet in_packet;
     in_packet.Append(event->packet->data, event->packet->dataLength);
@@ -862,6 +914,8 @@ void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
                                    });
         if (member != members.end()) {
             enet_peer_send(member->peer, 0, enet_packet);
+        } else if (ENetPeer* gateway = GatewayPeer(event->peer)) {
+            enet_peer_send(gateway, 0, enet_packet);
         } else {
             LOG_ERROR(Network,
                       "Attempting to send to unknown IP address: "
@@ -916,6 +970,8 @@ void Room::RoomImpl::HandleLdnPacket(const ENetEvent* event) {
                                    });
         if (member != members.end()) {
             enet_peer_send(member->peer, 0, enet_packet);
+        } else if (ENetPeer* gateway = GatewayPeer(event->peer)) {
+            enet_peer_send(gateway, 0, enet_packet);
         } else {
             LOG_ERROR(Network,
                       "Attempting to send to unknown IP address: "
@@ -1123,6 +1179,15 @@ bool Room::HasPassword() const {
 void Room::SetVerifyUID(const std::string& uid) {
     std::lock_guard lock(room_impl->verify_uid_mutex);
     room_impl->verify_uid = uid;
+}
+
+void Room::KickMember(const std::string& nickname) {
+    std::lock_guard lock(room_impl->kick_mutex);
+    room_impl->kick_queue.push_back(nickname);
+}
+
+void Room::SetHostGateway(bool enabled) {
+    room_impl->host_gateway = enabled;
 }
 
 void Room::Destroy() {

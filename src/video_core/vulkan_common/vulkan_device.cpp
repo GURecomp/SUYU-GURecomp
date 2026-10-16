@@ -718,6 +718,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    nvn_queue = graphics_queue;
+    if (nvn_queue_count_requested > 1) {
+        nvn_queue = logical.GetQueue(graphics_family, 1);
+        nvn_queue_separate = true;
+    }
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
@@ -1525,7 +1530,7 @@ void Device::CollectToolingInfo() {
 }
 
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
-    static constexpr float QUEUE_PRIORITY = 1.0f;
+    static constexpr float QUEUE_PRIORITY[2] = {1.0f, 1.0f};
 
     ankerl::unordered_dense::set<u32> unique_queue_families{graphics_family, present_family};
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
@@ -1540,7 +1545,14 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
             .queueCount = 1,
             .pQueuePriorities = nullptr,
         });
-        ci.pQueuePriorities = &QUEUE_PRIORITY;
+        if (queue_family == graphics_family) {
+            const auto props = physical.GetQueueFamilyProperties();
+            if (queue_family < props.size() && props[queue_family].queueCount >= 2) {
+                ci.queueCount = 2;
+                nvn_queue_count_requested = 2;
+            }
+        }
+        ci.pQueuePriorities = QUEUE_PRIORITY;
     }
 
     return queue_cis;

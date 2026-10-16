@@ -1,0 +1,16 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Monster Hunter Generations Ultimate",
+  "system": "Switch",
+  "type": "recomp",
+  "original": { "region": "All", "revision": "1.4.0" },
+  "project": "SUYU-GURecomp",
+  "status": "playable",
+  "targets": ["Windows", "Linux"],
+  "toolchain": "a32recomp",
+  "approach": "Static recompilation of the 32-bit ARM executables (a32recomp lifter, built on suyu's recompiler mode), with an NVN to Vulkan replacement renderer",
+  "maintainers": [{ "name": "GURecomp", "link": "https://github.com/GURecomp" }],
+  "links": [],
+  "help": [],
+  "notes": "Exports a native executable from the user's own game dump; no game files are distributed. Working: 100% code coverage, native render resolution, ultrawide and frame rate options, in-game F10 menu, drag-and-drop mod loading (Forge), crossplay rooms (RyuLdn). Next: performance work (GPU is close to suyu's efficiency; loading is already faster than suyu thanks to unpacked game archives), and modding tools, which live in Forge. Parts of this project were written with AI assistance; see docs/a32recomp/AI_DISCLOSURE.md."
+}

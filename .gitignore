@@ -90,3 +90,6 @@ build-console.txt
 # local publish/package output
 publish/
 pkgwork/
+
+__pycache__/
+*.pyc

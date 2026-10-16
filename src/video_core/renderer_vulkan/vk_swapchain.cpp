@@ -16,6 +16,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "core/arm/recomp/game_settings.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
@@ -47,7 +48,19 @@ static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
     // FIFO present mode locks the framerate to the monitor's refresh rate
     Settings::VSyncMode setting = [has_imm, has_mailbox]() {
         // Choose Mailbox or Immediate if unlocked and those modes are supported
-        const auto mode = Settings::values.vsync_mode.GetValue();
+        auto mode = Settings::values.vsync_mode.GetValue();
+        // exported games: game_settings.ini [Display] vsync decides
+        if (const std::string v = Core::GameSettings::Value("Display", "vsync"); !v.empty()) {
+            if (v == "off" || v == "false" || v == "0" || v == "immediate") {
+                return Settings::VSyncMode::Immediate;
+            } else if (v == "mailbox") {
+                return Settings::VSyncMode::Mailbox;
+            } else if (v == "relaxed") {
+                return Settings::VSyncMode::FifoRelaxed;
+            } else if (v == "on" || v == "true" || v == "1" || v == "fifo") {
+                return Settings::VSyncMode::Fifo;
+            }
+        }
         if (Settings::values.use_speed_limit.GetValue() &&
             Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo) {
             return mode;
@@ -273,6 +286,7 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
     surface_format = ChooseSwapSurfaceFormat(formats);
     present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+    LOG_INFO(Render_Vulkan, "present mode {} (mailbox {}, immediate {}, vsync setting \"{}\")", static_cast<int>(present_mode), has_mailbox, has_imm, Core::GameSettings::Value("Display", "vsync"));
 
     u32 requested_image_count{capabilities.minImageCount + 1};
     // Ensure Triple buffering if possible.

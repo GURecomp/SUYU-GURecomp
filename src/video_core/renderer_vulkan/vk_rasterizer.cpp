@@ -42,6 +42,9 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/renderer_vulkan/nvn_vk.h"
+#include "core/arm/recomp/game_settings.h"
+#include <set>
 
 namespace Vulkan {
 
@@ -256,7 +259,100 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 }
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    if (!Core::GameSettings::SuyuRender()) return;
+    // Must run before the draw is prepared: it records its own copy outside any render pass.
+    if (Core::GameSettings::NvnVulkanMode() != 0 && NvnVkCaptureActive()) CompareRegionFlush();
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+        if (Core::GameSettings::NvnVulkanMode() != 0 && NvnVkCaptureActive()) {
+            // Comparison dump: what suyu's own path feeds each distinct shader pair.
+            static std::set<std::pair<u64, u64>> dumped_pairs;
+            const auto& regs = maxwell3d->regs;
+            const u64 base = regs.program_region.Address();
+            const u64 vs = base + regs.pipelines[1].offset, fs = base + regs.pipelines[5].offset;
+            if (regs.rt_control.count > 0 && regs.rt[0].width == 1920) {
+                cmp_pending_addr = regs.rt[0].Address();
+                ++cmp_pn;
+            }
+            if (regs.rt_control.count > 0) {
+                const auto& ds = maxwell3d->draw_manager.draw_state;
+                NvnVkDumpLine("suyu_rtdraws.txt", fmt::format("rt {:x} vs {:x} fs {:x} count {}", regs.rt[0].Address(), vs, fs,
+                                                               is_indexed ? ds.index_buffer.count : ds.vertex_buffer.count));
+            }
+            if (dumped_pairs.insert({vs, fs}).second || true) {
+                std::string o = fmt::format("DRAW vs={:x} fs={:x} count {}\n", vs, fs, maxwell3d->draw_manager.draw_state.vertex_buffer.count);
+                const u32 stages[2] = {0, 4};
+                for (u32 si = 0; si < 2; ++si) {
+                    const auto& cbs = maxwell3d->state.shader_stages[stages[si]].const_buffers;
+                    for (u32 ii = 0; ii < cbs.size() && ii < 16; ++ii) {
+                        if (!cbs[ii].enabled) continue;
+                        std::array<u8, 256> ub{};
+                        gpu_memory->ReadBlockUnsafe(cbs[ii].address, ub.data(), 256);
+                        std::string hex;
+                        for (const u8 v : ub) hex += fmt::format("{:02x}", v);
+                        o += fmt::format("  s{} cb{} size {:x} {}\n", si, ii, cbs[ii].size, hex);
+                        o += fmt::format("  s{} bindaddr{} {:x} size {:x}\n", si, ii, cbs[ii].address, cbs[ii].size);
+                    }
+                    const auto& c2 = cbs[2];
+                    if (c2.enabled) {
+                        for (u32 slot = 0; slot < 8; ++slot) {
+                            u32 handle = 0;
+                            gpu_memory->ReadBlockUnsafe(c2.address + 0x20 + 8 * slot, &handle, 4);
+                            if (handle == 0) continue;
+                            std::array<u32, 8> tw{};
+                            gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * 32, tw.data(), 32);
+                            o += fmt::format("  s{} slot{} handle {:x} tic {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n", si, slot, handle,
+                                             tw[0], tw[1], tw[2], tw[3], tw[4], tw[5], tw[6], tw[7]);
+                        }
+                    }
+                }
+                {
+                    std::array<u32, 16> bl{}, vp{}, sc{};
+                    std::memcpy(bl.data(), &regs.blend, std::min(sizeof(bl), sizeof(regs.blend)));
+                    std::memcpy(vp.data(), &regs.viewport_transform[0], std::min(sizeof(vp), sizeof(regs.viewport_transform[0])));
+                    std::memcpy(sc.data(), &regs.scissor_test[0], std::min(sizeof(sc), sizeof(regs.scissor_test[0])));
+                    o += fmt::format("  state dtest {} dwrite {} dfunc {:x} cull {} face {:x} front {:x} cmask {:x} alpha {} {:x} stencil {} dbias {} slope {} poly_fill {}\n",
+                                     regs.depth_test_enable, regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func), regs.gl_cull_test_enabled,
+                                     static_cast<u32>(regs.gl_cull_face), static_cast<u32>(regs.gl_front_face), regs.color_mask[0].raw,
+                                     regs.alpha_test_enabled, static_cast<u32>(regs.alpha_test_func), regs.stencil_enable, regs.depth_bias,
+                                     regs.slope_scale_depth_bias, regs.polygon_offset_fill_enable);
+                    o += "  stateraw blend";
+                    for (u32 w : bl) o += fmt::format(" {:08x}", w);
+                    o += " vp0";
+                    for (u32 w : vp) o += fmt::format(" {:08x}", w);
+                    o += " sc0";
+                    for (u32 w : sc) o += fmt::format(" {:08x}", w);
+                    o += "\n";
+                }
+                for (u32 si2 = 0; si2 < 2; ++si2) {
+                    const auto& c2 = maxwell3d->state.shader_stages[si2 == 0 ? 0 : 4].const_buffers[2];
+                    if (!c2.enabled) continue;
+                    for (u32 slot = 0; slot < 8; ++slot) {
+                        u32 handle = 0;
+                        gpu_memory->ReadBlockUnsafe(c2.address + 0x20 + 8 * slot, &handle, 4);
+                        if (handle == 0) continue;
+                        std::array<u32, 8> sw{};
+                        gpu_memory->ReadBlockUnsafe(regs.tex_sampler.Address() + u64{(handle >> 20) & 0xfff} * 32, sw.data(), 32);
+                        o += fmt::format("  s{} samp{} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n", si2, slot, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
+                    }
+                }
+                for (u32 a = 0; a < 16; ++a) {
+                    const auto& f = regs.vertex_attrib_format[a];
+                    if (f.size.Value() == Maxwell::VertexAttribute::Size::Invalid) continue;
+                    const u32 w = (static_cast<u32>(f.size.Value()) << 1) | (static_cast<u32>(f.type.Value()) << 7);
+                    o += fmt::format("  attr {} buf {} off {} word {:x}\n", a, f.buffer.Value(), f.offset.Value(), w & 0xfe7e);
+                }
+                for (u32 b = 0; b < 4; ++b) {
+                    const auto& vs_ = regs.vertex_streams[b];
+                    if (!vs_.IsEnabled()) continue;
+                    std::array<u8, 48> vbytes{};
+                    gpu_memory->ReadBlockUnsafe(vs_.Address(), vbytes.data(), 48);
+                    std::string hex;
+                    for (const u8 v : vbytes) hex += fmt::format("{:02x}", v);
+                    o += fmt::format("  vb {} stride {} {}\n", b, vs_.stride.Value(), hex);
+                }
+                NvnVkDumpLine("suyu_draws.txt", o);
+            }
+        }
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
@@ -289,6 +385,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    if (!Core::GameSettings::SuyuRender()) return;
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
@@ -347,6 +444,7 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    if (!Core::GameSettings::SuyuRender()) return;
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -394,6 +492,7 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    if (!Core::GameSettings::SuyuRender()) return;
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -839,6 +938,48 @@ void RasterizerVulkan::FlushCommands() {
     }
     draw_counter = 0;
     scheduler.Flush();
+}
+
+void RasterizerVulkan::CompareRegionFlush() {
+    if (cmp_pending_addr == 0) return;
+    const u64 addr = cmp_pending_addr;
+    const u32 pn = cmp_pn - 1;
+    cmp_pending_addr = 0;
+    constexpr u32 x0 = 100, y0 = 600, rw = 128, rh = 64;
+    std::vector<u8> pixels;
+    if (!texture_cache.DownloadRegion(addr, x0, y0, rw, rh, pixels)) return;
+    u64 hash = 1469598103934665603ull;
+    u64 sum[4]{};
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        for (u32 k = 0; k < 4; ++k) {
+            hash = (hash ^ pixels[i + k]) * 1099511628211ull;
+            sum[k] += pixels[i + k];
+        }
+    }
+    const u8* c = pixels.data() + (size_t{50} * rw + 150) * 4;
+    NvnVkDumpLine("suyu_regions.txt", fmt::format("pn {} hash {:016x} mean {} {} {} {} px250,650 {:02x}{:02x}{:02x}{:02x}", pn, hash,
+                                                  sum[0] / (rw * rh), sum[1] / (rw * rh), sum[2] / (rw * rh), sum[3] / (rw * rh), c[0], c[1],
+                                                  c[2], c[3]));
+}
+
+void RasterizerVulkan::DumpCompareImages() {
+    CompareRegionFlush();
+    texture_cache.HashCompressedImages([](u64 gpu_addr, u32 w, u32 h, u32 layers, u32 levels, int format, size_t bytes, u64 hash) {
+        NvnVkDumpLine("suyu_texhash.txt", fmt::format("gpu {:x} {}x{} layers {} levels {} pixelformat {} bytes {} hash {:016x}", gpu_addr, w, h, layers,
+                                                      levels, format, bytes, hash));
+    });
+    using VideoCore::Surface::PixelFormat;
+    texture_cache.DumpImages([](u64 gpu_addr, u32 w, u32 h, int format, std::span<const u8> pixels) {
+        const auto f = static_cast<PixelFormat>(format);
+        const bool bgra = f == PixelFormat::B8G8R8A8_UNORM || f == PixelFormat::B8G8R8A8_SRGB;
+        if (!bgra && f != PixelFormat::A8B8G8R8_UNORM && f != PixelFormat::A8B8G8R8_SRGB) return;
+        if (pixels.size() < size_t{w} * h * 4) return;
+        std::vector<u8> rgba(pixels.begin(), pixels.begin() + size_t{w} * h * 4);
+        if (bgra) {
+            for (size_t i = 0; i + 3 < rgba.size(); i += 4) std::swap(rgba[i], rgba[i + 2]);
+        }
+        NvnVkSavePng(fmt::format("suyu_rt_{:x}_{}x{}.png", gpu_addr, w, h).c_str(), w, h, rgba.data());
+    });
 }
 
 void RasterizerVulkan::TickFrame() {

@@ -118,6 +118,12 @@ void Init(Core::System& system, InputCommon::InputSubsystem* input, SdlConfig* c
     LOG_INFO(Frontend, "Controls: Player 1 = {} ({})", PlayerOneText(), SetByText());
 }
 
+void SaveConfig() {
+    if (g_config != nullptr) {
+        g_config->SaveAllValues();
+    }
+}
+
 std::vector<Common::ParamPackage> Devices() {
     std::vector<Common::ParamPackage> out;
     if (g_input == nullptr) {

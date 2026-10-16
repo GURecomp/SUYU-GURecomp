@@ -121,6 +121,12 @@ public:
     void TiledCacheBarrier() override;
     void FlushCommands() override;
     void TickFrame() override;
+    /// Diagnostics (nvn compare): writes suyu's render targets of the frame just captured as PNGs.
+    void DumpCompareImages();
+    /// Diagnostics: hashes a screen region of the previous capture draw's render target (pairs with nvn_vk.cpp "pick").
+    void CompareRegionFlush();
+    u64 cmp_pending_addr{};
+    u32 cmp_pn{};
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,

@@ -3307,7 +3307,21 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // folder. Delete it; a repeat export just recompiles (fast, thanks
         // to the /O1 + /MP codegen flags) rather than reusing this cache.
         if (has_static_launcher) {
-            QDir(cache_dir).removeRecursively();
+            // SUYU_KEEP_AOT_CACHE=<folder>: move the compiled game (objects, libs) there instead
+            // of deleting it, so GPU-only changes can relink without recompiling the game.
+            const QString keep = qEnvironmentVariable("SUYU_KEEP_AOT_CACHE");
+            if (!keep.isEmpty()) {
+                QDir(keep).removeRecursively();
+                if (!QDir().rename(cache_dir, keep)) {
+                    LOG_WARNING(Frontend, "Export: could not keep the AOT cache in {}",
+                                keep.toStdString());
+                    QDir(cache_dir).removeRecursively();
+                } else {
+                    LOG_INFO(Frontend, "Export: AOT cache kept in {}", keep.toStdString());
+                }
+            } else {
+                QDir(cache_dir).removeRecursively();
+            }
         } else {
             QDir(pkg_dir + QStringLiteral("/aot_cache/launcher")).removeRecursively();
         }

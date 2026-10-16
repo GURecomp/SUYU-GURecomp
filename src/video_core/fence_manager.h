@@ -158,6 +158,10 @@ protected:
     virtual bool IsFenceSignaled(TFence& fence) const = 0;
     /// Waits until a fence has been signalled by the host GPU.
     virtual void WaitFence(TFence& fence) = 0;
+    /// The fencing thread's wait; a backend may poll instead of blocking.
+    virtual void WaitFenceSlow(TFence& fence) {
+        WaitFence(fence);
+    }
 
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::GPU& gpu;
@@ -211,7 +215,7 @@ private:
                 pending_operations.pop_front();
             }
             if (!current_fence->IsStubbed()) {
-                WaitFence(current_fence);
+                WaitFenceSlow(current_fence);
             }
             PopAsyncFlushes();
             for (auto& operation : current_operations) {

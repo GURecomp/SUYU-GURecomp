@@ -85,6 +85,48 @@ bool ShowFps();
 /// game_settings.ini [Debug] diagnostics: the run reports beyond recomp_report.txt's misses
 /// (profiler, NVN census/trace, timing watch, file monitor). On unless set to false.
 bool DiagnosticsEnabled();
+/// [Debug] gpu_diagnostics (default off): reports of the replacement renderer only (nvn_prof.txt timing
+/// buckets, NVN call recording samples). Independent of `diagnostics`, which is for every graphics mode.
+bool GpuDiagnosticsEnabled();
+/// [Debug] probes (default off): the wiggle-hitch probes (stall ring, SVC/HLE/hook timing, buffer-queue log, run K/L/M frame lines).
+bool ProbesEnabled();
+
+/// game_settings.ini [Debug] fence_thread_sleep: the GPU fencing thread polls the GPU with short
+/// sleeps instead of blocking in the Vulkan driver (which spins a core). Off unless set to true.
+bool FenceThreadSleep();
+
+/// game_settings.ini [Debug] native_nvn: G3c native NVN entry points replace the guest driver's.
+/// Off unless set to true.
+bool NativeNvn();
+/// Width the game is made to render at ([Display] resolution + native_render), 0 = the game's own.
+u32 RenderWidth();
+
+/// game_settings.ini [Debug] nvn_vulkan: 0 off, 1 record (NVN recorder only), 2 shadow (recorder + our
+/// Vulkan renderer beside the guest driver).
+int NvnVulkanMode();
+/// [Debug] vulkan_validation = true turns the Vulkan validation layer and its log messages on.
+bool VulkanValidation();
+/// [Debug] nvn_vk_debug bit flags for the NVN Vulkan renderer: 1 no blend, 2 full write mask, 4 no alpha test, 8 no depth test, 16 no cull.
+int NvnVkDebug();
+/// [Debug] suyu_render = false (only with nvn_vulkan = present): suyu's own renderer skips draws and clears, since the
+/// native renderer draws the frame. Default true.
+bool SuyuRender();
+/// [Debug] present_nodrain = true (present mode, TEST): Present does not wait for the GPU; the blit for frame N is
+/// published one present later. Default false.
+bool PresentNoDrain();
+
+/// [Debug] pres_ring = N (present mode): number of images in the ring suyu's compositor reads. Default 3.
+int PresRing();
+/// [Debug] fence_hold = true (present mode): guest-visible fence completion waits for our replay of that submit.
+bool FenceHold();
+/// [Debug] present_fifo = true (present mode): suyu's compositor takes our finished copies in order, one per composite
+/// (repeat the last one if none is ready; drop the oldest beyond 3), instead of "the latest copy". Default false.
+bool PresentFifo();
+/// [Debug] order_probe = true (present mode): F8 logs 60 presents' order and image signature to nvn_present.txt.
+bool OrderProbe();
+
+/// game_settings.ini [Debug] probe_pcs: nnSdk offsets (hex, comma separated) the trace observes.
+std::string ProbePcs();
 
 /// Called once with the process's modules (base -> name) before guest code runs.
 void Start(System& system, const std::map<u64, std::string>& modules);
@@ -100,13 +142,18 @@ float DisplayRateScale();
 extern std::atomic<u32> g_aspect_pc;
 extern std::atomic<u32> g_render_default_pc;
 extern std::atomic<u32> g_render_create_pc;
+extern std::atomic<u32> g_main_base; // guest address of the main module (0 until known)
+extern std::atomic<u32> g_motion_blur_pc; // [Debug] motion_blur = probe|force: uMotionBlurFilter render function
+extern std::atomic<u32> g_vp_probe_pc; // [Debug] probes: viewport setter, after its first call (main+0xBC1204)
 void OnHookedEntry(u32 pc, u32* regs);
 
 /// Hot path: every block the dispatcher is about to run.
 inline void OnDispatch(u32 pc, u32* regs) {
     if (pc == g_aspect_pc.load(std::memory_order_relaxed) ||
         pc == g_render_default_pc.load(std::memory_order_relaxed) ||
-        pc == g_render_create_pc.load(std::memory_order_relaxed)) {
+        pc == g_render_create_pc.load(std::memory_order_relaxed) ||
+        pc == g_motion_blur_pc.load(std::memory_order_relaxed) ||
+        pc == g_vp_probe_pc.load(std::memory_order_relaxed)) {
         OnHookedEntry(pc, regs);
     }
 }

@@ -3,12 +3,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <utility>
 #include <cmath>
 #include <cstring>
 #include <deque>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -16,7 +19,11 @@
 #include <fmt/format.h>
 
 #include "common/gpu_probe.h"
+#include "core/arm/recomp/game_settings.h"
+#include "core/hle/kernel/stall_ring.h"
+#include "core/arm/recomp/nvn_rec.h"
 #include "core/arm/recomp/nvn_shadow.h"
+#include "core/arm/recomp/nvn_trace.h"
 #include "core/memory.h"
 
 namespace Core::NvnShadow {
@@ -183,7 +190,7 @@ void Record(Side& side, const Draw& d) {
 }
 
 void GpuDraw(const Draw& d, const DrawState& g) {
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     Record(s_gpu, d);
     const auto it = s_pending.find(d);
     if (it == s_pending.end() || it->second.empty()) {
@@ -206,13 +213,13 @@ void SetShaders(const u32* r, Memory::Memory& mem) {
         const u32 e = r[2] + 16 * s;
         p.stage[s] = mem.Read32(e) | (u64{mem.Read32(e + 4)} << 32);
     }
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     s_programs[r[0]] = p;
 }
 
 // nvnCommandBufferBindProgram(cmd, program, stage bits)
 void BindProgram(const u32* r, Memory::Memory&) {
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     s_cmds[r[0]].program = r[1];
 }
 
@@ -238,11 +245,127 @@ void RecordNvnDraw(u32 cmd, Draw& d) {
     ++s_pending_count;
 }
 
+
+// Buffer object probe (G3c): what the guest keeps in a Buffer object, found by matching
+// addresses the game later binds against fields of the objects handed to nvnBufferGetAddress
+// (and of the object their pointer field leads to).
+constexpr u32 kProbeWords = 16, kPoolWords = 32;
+constexpr size_t kProbeMaxObjs = 20000, kProbeMaxBinds = 300000;
+std::map<u32, std::array<u32, kProbeWords>> s_probe_objs;
+std::map<u32, std::array<u32, kPoolWords>> s_probe_pools; // by the object's word 2
+std::unordered_set<u64> s_probe_binds;
+struct ProbePair {
+    u64 addr;
+    std::array<u32, kProbeWords> obj;
+    std::array<u32, kProbeWords> target; // what object word 3 points at
+};
+std::vector<ProbePair> s_probe_pairs;
+std::map<std::thread::id, ProbePair> s_probe_last; // last GetAddress per thread
+
+void ProbeGetAddress(const u32* r, Memory::Memory& mem) {
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
+    if (s_probe_objs.size() >= kProbeMaxObjs && !s_probe_objs.count(r[0])) return;
+    auto& o = s_probe_objs[r[0]];
+    for (u32 k = 0; k < kProbeWords; ++k) o[k] = mem.Read32(r[0] + 4 * k);
+    auto& last = s_probe_last[std::this_thread::get_id()];
+    last = ProbePair{};
+    last.obj = o;
+    if (o[3] != 0 && mem.IsValidVirtualAddressRange(o[3], kProbeWords * 4)) {
+        for (u32 k = 0; k < kProbeWords; ++k) last.target[k] = mem.Read32(o[3] + 4 * k);
+    }
+    const u32 pool = o[2];
+    if (pool != 0 && !s_probe_pools.count(pool) && mem.IsValidVirtualAddressRange(pool, kPoolWords * 4)) {
+        auto& pw = s_probe_pools[pool];
+        for (u32 k = 0; k < kPoolWords; ++k) pw[k] = mem.Read32(pool + 4 * k);
+    }
+}
+
+void ProbeBind(u64 addr) {
+    if (s_probe_binds.size() < kProbeMaxBinds) s_probe_binds.insert(addr);
+    const auto it = s_probe_last.find(std::this_thread::get_id());
+    if (it != s_probe_last.end() && s_probe_pairs.size() < 3000) {
+        it->second.addr = addr;
+        s_probe_pairs.push_back(it->second);
+    }
+}
+
+void WriteProbe(const std::filesystem::path& file) {
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
+    if (s_probe_objs.empty()) return;
+    std::ofstream out(file, std::ios::trunc);
+    out << fmt::format("# buffer objects: {}, pools: {}, distinct bound addresses: {}\n", s_probe_objs.size(),
+                       s_probe_pools.size(), s_probe_binds.size());
+    std::map<std::string, u32> hits;
+    for (const auto& [obj, w] : s_probe_objs) {
+        for (u32 k = 0; k + 1 < kProbeWords; ++k) {
+            const u64 v = w[k] | (u64{w[k + 1]} << 32);
+            if (s_probe_binds.count(v)) ++hits[fmt::format("obj u64 at word {} is a bound address", k)];
+        }
+        const auto pit = s_probe_pools.find(w[2]);
+        if (pit == s_probe_pools.end()) continue;
+        const auto& pw = pit->second;
+        for (u32 j = 0; j + 1 < kPoolWords; ++j) {
+            const u64 base = pw[j] | (u64{pw[j + 1]} << 32);
+            if (base == 0) continue;
+            for (u32 k = 0; k < kProbeWords; ++k) {
+                if (s_probe_binds.count(base + w[k]))
+                    ++hits[fmt::format("pool u64 word {} + obj u32 word {} is a bound address", j, k)];
+            }
+            for (u32 k = 0; k + 1 < kProbeWords; ++k) {
+                if (s_probe_binds.count(base + (w[k] | (u64{w[k + 1]} << 32))))
+                    ++hits[fmt::format("pool u64 word {} + obj u64 word {} is a bound address", j, k)];
+            }
+        }
+    }
+    for (const auto& [name, n] : hits) out << fmt::format("{:7} x  {}\n", n, name);
+    out << "\n# pairs: bound addr | object words | words at object word 3's target\n";
+    for (const auto& pr : s_probe_pairs) {
+        out << fmt::format("P {:x} |", pr.addr);
+        for (const u32 v : pr.obj) out << fmt::format(" {:x}", v);
+        out << " |";
+        for (const u32 v : pr.target) out << fmt::format(" {:x}", v);
+        out << "\n";
+    }
+    out << "\n# first pools (ptr then 32 words)\n";
+    u32 shown = 0;
+    for (const auto& [ptr, pw] : s_probe_pools) {
+        if (shown++ >= 8) break;
+        out << fmt::format("{:08x}:", ptr);
+        for (const u32 v : pw) out << fmt::format(" {:08x}", v);
+        out << "\n";
+    }
+    out << "\n# first objects (addr then 16 words)\n";
+    shown = 0;
+    for (const auto& [obj, w] : s_probe_objs) {
+        if (shown++ >= 6) break;
+        out << fmt::format("{:08x}:", obj);
+        for (const u32 v : w) out << fmt::format(" {:08x}", v);
+        out << "\n";
+    }
+}
+
+
+// ---- G3c native entry points. Layouts are from the buffer probe (observation only) ----------
+// Buffer object (guest memory): word 3 = pointer to its memory pool object, word 4 = offset in
+// the pool, word 5 = size. Pool object: u64 at words 10-11 = the pool's GPU address.
+// nvnBufferGetAddress(buffer) -> u64 pool GPU address + offset.
+std::atomic<u64> s_native_get_address{0};
+bool NativeBufferGetAddress(u32* r, Memory::Memory& mem) {
+    s_native_get_address.fetch_add(1, std::memory_order_relaxed);
+    const u32 pool = mem.Read32(r[0] + 12);
+    const u64 base = mem.Read32(pool + 40) | (u64{mem.Read32(pool + 44)} << 32);
+    const u64 addr = base + mem.Read32(r[0] + 16);
+    r[0] = static_cast<u32>(addr);
+    r[1] = static_cast<u32>(addr >> 32);
+    return true;
+}
+
 // nvnCommandBufferBindVertexBuffer(cmd, index, u64 address, u64 size)
 void BindVertexBuffer(const u32* r, Memory::Memory&) {
     if (r[1] >= DrawState::kStreams) return;
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     s_cmds[r[0]].st.vb[r[1]] = r[2] | (u64{r[3]} << 32);
+    ProbeBind(r[2] | (u64{r[3]} << 32));
 }
 
 // nvnCommandBufferBindUniformBuffer(cmd, stage, slot, u64 address [sp], size [sp+8])
@@ -251,10 +374,11 @@ void BindUniformBuffer(const u32* r, Memory::Memory& mem) {
     const u32 sp = r[13];
     const u64 addr = mem.Read32(sp) | (u64{mem.Read32(sp + 4)} << 32);
     const u32 size = mem.Read32(sp + 8);
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     auto& st = s_cmds[r[0]].st;
     st.cb_addr[r[1]][r[2]] = addr;
     st.cb_size[r[1]][r[2]] = size;
+    ProbeBind(addr);
 }
 
 // nvnCommandBufferSetViewports(cmd, first, count, const float* {x, y, w, h} per viewport)
@@ -265,7 +389,7 @@ void SetViewports(const u32* r, Memory::Memory& mem) {
         const u32 w = mem.Read32(r[3] + 4 * k);
         std::memcpy(&v[k], &w, 4);
     }
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     auto& st = s_cmds[r[0]].st;
     st.viewport = v;
     st.viewport_set = true;
@@ -275,7 +399,7 @@ void SetViewports(const u32* r, Memory::Memory& mem) {
 void SetRenderTargets(const u32* r, Memory::Memory& mem) {
     const u32 rt0 = r[1] && r[2] ? mem.Read32(r[2]) : 0;
     const u32 depth = mem.Read32(r[13]);
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     auto& st = s_cmds[r[0]].st;
     st.rt_count = r[1];
     st.rt0_tex = rt0;
@@ -285,22 +409,22 @@ void SetRenderTargets(const u32* r, Memory::Memory& mem) {
 // Texture builders: (builder, value) setters, snapshotted by nvnTextureInitialize(texture, builder).
 template <u32 TexInfo::*Field>
 void BuilderSet(const u32* r, Memory::Memory&) {
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     s_builders[r[0]].*Field = r[1];
 }
 void BuilderDefaults(const u32* r, Memory::Memory&) {
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     s_builders[r[0]] = TexInfo{};
 }
 // nvnTextureBuilderSetStorage(builder, pool, offset)
 void BuilderStorage(const u32* r, Memory::Memory&) {
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     auto& b = s_builders[r[0]];
     b.pool = r[1];
     b.offset = r[2];
 }
 void TextureInitialize(const u32* r, Memory::Memory&) {
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     s_textures[r[0]] = s_builders[r[1]];
 }
 
@@ -315,7 +439,7 @@ void DrawElementsBaseVertex(const u32* r, Memory::Memory& mem) {
     d.index_addr = mem.Read32(sp) | (u64{mem.Read32(sp + 4)} << 32);
     d.base_vertex = static_cast<s32>(mem.Read32(sp + 8));
     d.instances = 1;
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     RecordNvnDraw(r[0], d);
 }
 
@@ -326,7 +450,7 @@ void DrawArrays(const u32* r, Memory::Memory&) {
     d.first = r[2];
     d.count = r[3];
     d.instances = 1;
-    std::scoped_lock lk{s_lock};
+    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
     RecordNvnDraw(r[0], d);
 }
 
@@ -400,6 +524,7 @@ std::pair<s64, size_t> BestDelta(const std::unordered_set<u64>& nvn, const std::
 } // namespace
 
 Observer Find(const std::string& name) {
+    if (name == "nvnBufferGetAddress") return ProbeGetAddress;
     if (name == "nvnProgramSetShaders") return SetShaders;
     if (name == "nvnCommandBufferBindProgram") return BindProgram;
     if (name == "nvnCommandBufferDrawElementsBaseVertex") return DrawElementsBaseVertex;
@@ -420,17 +545,425 @@ Observer Find(const std::string& name) {
     return nullptr;
 }
 
+
+namespace {
+
+std::atomic<u64> s_native_served[32];
+std::atomic<u64> s_native_declined[32];
+
+// A builder produces the Maxwell words the guest driver records for one call, or declines
+// (anything not yet observed). The same builder serves native_nvn (written straight into the
+// command buffer) and the verify census (compared word for word with what the guest wrote).
+bool BuildUniformBuffer(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 sp = r[13];
+    const u32 size = mem.Read32(sp + 8);
+    if (r[1] > 1 || r[2] > 8 || size == 0 || size > 0x200) return false;
+    w.n = 5;
+    w.v[0] = 0x200308e0;
+    w.v[1] = (size + 255) & ~255u;
+    w.v[2] = mem.Read32(sp + 4);
+    w.v[3] = mem.Read32(sp);
+    w.v[4] = 0x80000000u | (((r[2] + 3) << 4 | 1) << 16) | (0x904 + 0x20 * r[1]);
+    return true;
+}
+
+bool BuildTexture(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    if (r[1] > 1 || r[2] > 7) return false;
+    w.n = 5;
+    w.v[0] = 0x80000e0eu | (r[1] << 18);
+    w.v[1] = 0x8000068b;
+    w.v[2] = 0x200208e3;
+    w.v[3] = 0x20 + 8 * r[2];
+    w.v[4] = mem.Read32(r[13]);
+    return true;
+}
+
+bool BuildVertexBuffer(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 size = mem.Read32(r[13]);
+    if (r[1] != 0 || size == 0) return false;
+    const u64 limit = (r[2] | (u64{r[3]} << 32)) + size - 1;
+    w.n = 6;
+    w.v[0] = 0x20020701;
+    w.v[1] = r[3];
+    w.v[2] = r[2];
+    w.v[3] = 0x200207c0;
+    w.v[4] = static_cast<u32>(limit >> 32);
+    w.v[5] = static_cast<u32>(limit);
+    return true;
+}
+
+// nvnCommandBufferDrawElementsBaseVertex(cmd, mode, index type, count, u64 index address [sp],
+// base vertex [sp+8]): only mode 5, type 1, base vertex 0 observed.
+bool BuildDrawElements(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 sp = r[13];
+    if (r[1] != 5 || r[2] != 1 || mem.Read32(sp + 8) != 0) return false;
+    w.n = 12;
+    w.v[0] = 0x20010446;
+    w.v[1] = 0;
+    w.v[2] = 0x2001050d;
+    w.v[3] = 0;
+    w.v[4] = 0xa0050e36;
+    w.v[5] = 5;
+    w.v[6] = mem.Read32(sp + 4);
+    w.v[7] = mem.Read32(sp);
+    w.v[8] = 1;
+    w.v[9] = r[3];
+    w.v[10] = 0x8000050d;
+    w.v[11] = 0x80000446;
+    return true;
+}
+
+// nvnCommandBufferBindColorState(state object): hypothesis from samples, checked by verify.
+bool BuildColorState(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 o = mem.Read32(r[1]);
+    w.v[0] = 0x20010e10;
+    w.v[1] = o;
+    if ((o >> 24) == 0x08) {
+        w.n = 3;
+        w.v[2] = 0x800004bb;
+    } else if ((o >> 24) == 0x05) {
+        w.n = 4;
+        w.v[2] = 0x800104bb;
+        w.v[3] = 0x800504c5;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// nvnCommandBufferBindVertexStreamState(count, states): hypothesis from samples, checked by verify.
+bool BuildVertexStream(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    if (r[1] != 4 || r[2] == 0) return false;
+    const u32 stride = mem.Read32(r[2]);
+    w.n = 20;
+    static const u32 tail[20] = {0, 0x80000620, 0x90000704, 0x80000621, 0x90000708, 0x80000622,
+                                 0x9000070c, 0x80000623, 0x80000710, 0x80000714, 0x80000718,
+                                 0x8000071c, 0x80000720, 0x80000724, 0x80000728, 0x8000072c,
+                                 0x80000730, 0x80000734, 0x80000738, 0x8000073c};
+    for (u32 k = 0; k < 20; ++k) w.v[k] = tail[k];
+    w.v[0] = 0x90000700u | (stride << 16);
+    return true;
+}
+
+
+bool BuildDrawArrays(const u32* r, Memory::Memory&, NativeWords& w) {
+    if (r[1] != 5) return false;
+    w.n = 4;
+    w.v[0] = 0xa0030e30;
+    w.v[1] = 5;
+    w.v[2] = r[2];
+    w.v[3] = r[3];
+    return true;
+}
+
+bool BuildDepthClamp(const u32* r, Memory::Memory&, NativeWords& w) {
+    if (r[1] > 1) return false;
+    w.n = 2;
+    w.v[0] = 0x2001064f;
+    w.v[1] = r[1] ? 0x101a : 0x181d;
+    return true;
+}
+
+u32 FloatBits(f32 f) {
+    u32 u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+
+void ViewportWords(f32 x, f32 y, f32 w, f32 h, NativeWords& o) {
+    o.n = 9;
+    o.v[0] = 0x20020280;
+    o.v[1] = FloatBits(w * 0.5f);
+    o.v[2] = FloatBits(-h * 0.5f);
+    o.v[3] = 0x20020283;
+    o.v[4] = FloatBits(x + w * 0.5f);
+    o.v[5] = FloatBits(y + h * 0.5f);
+    o.v[6] = 0x20020300;
+    o.v[7] = static_cast<u32>(x) | (static_cast<u32>(w) << 16);
+    o.v[8] = static_cast<u32>(y) | (static_cast<u32>(h) << 16);
+}
+
+// nvnCommandBufferSetViewport(cmd, x, y, w, h): integers, as observed.
+bool BuildViewport(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    if (r[1] > 0xffff || r[2] > 0xffff || r[3] > 0xffff) return false;
+    const u32 h = mem.Read32(r[13]);
+    if (h > 0xffff) return false;
+    ViewportWords(static_cast<f32>(r[1]), static_cast<f32>(r[2]), static_cast<f32>(r[3]),
+                  static_cast<f32>(h), w);
+    return true;
+}
+
+// nvnCommandBufferSetViewports(cmd, first, count, const float* {x, y, w, h}).
+bool BuildViewports(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    if (r[1] != 0 || r[2] != 1 || r[3] == 0) return false;
+    f32 v[4];
+    for (u32 k = 0; k < 4; ++k) {
+        const u32 b = mem.Read32(r[3] + 4 * k);
+        std::memcpy(&v[k], &b, 4);
+    }
+    if (!(v[0] >= 0 && v[1] >= 0 && v[2] >= 0 && v[3] >= 0 && v[2] < 65536 && v[3] < 65536)) return false;
+    ViewportWords(v[0], v[1], v[2], v[3], w);
+    return true;
+}
+
+bool BuildScissor(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 h = mem.Read32(r[13]);
+    if (r[1] > 0xffff || r[2] > 0xffff || r[3] > 0xffff || h > 0xffff) return false;
+    w.n = 3;
+    w.v[0] = 0x20020381;
+    w.v[1] = r[1] | ((r[1] + r[3]) << 16);
+    w.v[2] = r[2] | ((r[2] + h) << 16);
+    return true;
+}
+
+bool BuildScissors(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    if (r[1] != 0 || r[2] != 1 || r[3] == 0) return false;
+    u32 v[4];
+    for (u32 k = 0; k < 4; ++k) v[k] = mem.Read32(r[3] + 4 * k);
+    if (v[0] > 0xffff || v[1] > 0xffff || v[2] > 0xffff || v[3] > 0xffff) return false;
+    w.n = 3;
+    w.v[0] = 0x20020381;
+    w.v[1] = v[0] | ((v[0] + v[2]) << 16);
+    w.v[2] = v[1] | ((v[1] + v[3]) << 16);
+    return true;
+}
+
+// nvnCommandBufferBindChannelMaskState(state): one word per byte of the object's mask, each bit a nibble.
+bool BuildChannelMask(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 o = mem.Read32(r[1]);
+    w.n = 5;
+    w.v[0] = 0xa0040e12;
+    for (u32 c = 0; c < 4; ++c) {
+        u32 word = 0;
+        for (u32 t = 0; t < 8; ++t) word |= ((o >> (c * 8 + t)) & 1u) << (t * 4);
+        w.v[1 + c] = word;
+    }
+    return true;
+}
+
+// nvnCommandBufferBindBlendState(state): state = {0x110c0000 | target, packed equation bytes}.
+bool BuildBlendState(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 head = mem.Read32(r[1]);
+    const u32 q = mem.Read32(r[1] + 4);
+    if ((head & 0xfffffff8u) != 0x110c0000u) return false;
+    w.n = 10;
+    w.v[0] = 0x80030d35;
+    w.v[1] = 0x80000374;
+    w.v[2] = 0x800104b9;
+    w.v[3] = 0x20060781 + 8 * (head & 7);
+    w.v[4] = 1;
+    w.v[5] = q & 0xff;
+    w.v[6] = (q >> 8) & 0xff;
+    w.v[7] = 1;
+    w.v[8] = (q >> 16) & 0xff;
+    w.v[9] = q >> 24;
+    return true;
+}
+
+// nvnCommandBufferBindDepthStencilState(state): flags word 0 (test, write, stencil, function in bits 4+).
+bool BuildDepthStencilState(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 f = mem.Read32(r[1]);
+    if (f & 0x4) return false;  // stencil: not decoded yet
+    if (!(f & 1)) {
+        if (f & 0x2) return false;
+        w.n = 2;
+        w.v[0] = 0x800004b3;
+        w.v[1] = 0x800004e0;
+        return true;
+    }
+    w.n = 4;
+    w.v[0] = 0x80000000u | (((f >> 1) & 1u) << 16) | 0x4ba;
+    w.v[1] = 0x800104b3;
+    w.v[2] = 0x80000000u | (((f >> 4) & 0xfu) << 16) | 0x4c3;
+    w.v[3] = 0x800004e0;
+    return true;
+}
+
+// nvnCommandBufferBindPolygonState(state): bit 1 cull, bit 2 counter-clockwise, bit 17 offset, bit 4 always.
+bool BuildPolygonState(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 f = mem.Read32(r[1]);
+    if ((f & ~0x2001eu) != 0 || !(f & 0x10)) return false;
+    const bool cull = (f & 0x2) != 0;
+    w.n = 0;
+    w.v[w.n++] = 0x80000000u | ((0x900u | ((f >> 2) & 1u)) << 16) | 0x647;
+    w.v[w.n++] = 0x80000000u | ((cull ? 1u : 0u) << 16) | 0x646;
+    if (cull) w.v[w.n++] = 0x84050648;
+    w.v[w.n++] = 0x9b02036b;
+    w.v[w.n++] = 0x9b02036c;
+    w.v[w.n++] = 0x80000000u | (((f >> 17) & 1u) << 16) | 0x372;
+    return true;
+}
+
+// nvnCommandBufferBindVertexAttribState(16, attribs): one word per slot, format enum translated by table.
+bool BuildVertexAttribState(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    if (r[1] != 16 || !mem.IsValidVirtualAddressRange(r[2], 64)) return false;
+    static const struct {
+        u32 in, out;
+    } kFormats[] = {{0x044, 0x384}, {0x04a, 0x114}, {0x02c, 0x388}, {0x056, 0x086}, {0x04c, 0x094},
+                    {0x04e, 0x214}, {0x052, 0x386}, {0x022, 0x39e}, {0x058, 0x19e}, {0x050, 0x194},
+                    {0x05c, 0x382}, {0x07a, 0x160}};
+    w.n = 17;
+    w.v[0] = 0x20100458;
+    for (u32 i = 0; i < 16; ++i) {
+        const u32 o = mem.Read32(r[2] + 4 * i);
+        if (o == 0) {
+            w.v[1 + i] = 0x3a400040;
+            continue;
+        }
+        bool found = false;
+        for (const auto& f : kFormats) {
+            if (f.in == (o >> 20)) {
+                w.v[1 + i] = (f.out << 20) | (o & 0xfffbf);
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+// nvnCommandBufferBindProgram(program, stages): the program object keeps its command words
+// ready-made (object word 2 -> block, word 4 = word count, word 5 = stage mask).
+bool BuildProgram(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    const u32 prog = r[1];
+    if (!mem.IsValidVirtualAddressRange(prog, 24)) return false;
+    const u32 block = mem.Read32(prog + 8);
+    const u32 count = mem.Read32(prog + 16);
+    if (r[2] != mem.Read32(prog + 20) || count == 0 || count > 32 ||
+        !mem.IsValidVirtualAddressRange(block, count * 4)) {
+        return false;
+    }
+    w.n = count;
+    for (u32 i = 0; i < count; ++i) w.v[i] = mem.Read32(block + 4 * i);
+    return true;
+}
+
+// nvnCommandBufferSetRenderTargets(1, colors**, views**, depth [sp]): one color target, no depth.
+// Texture object: word 3 = pool, 4 = offset, 7/8 = size, 11 = format, 20 = byte size; the pool
+// holds its texture mapping address at words 18-19.
+bool BuildRenderTargets(const u32* r, Memory::Memory& mem, NativeWords& w) {
+    if (r[1] != 1 || r[2] == 0 || mem.Read32(r[13]) != 0) return false;
+    if (r[3] != 0 && mem.Read32(r[3]) != 0) return false;  // a view: not decoded
+    const u32 tex = mem.Read32(r[2]);
+    if (!mem.IsValidVirtualAddressRange(tex, 96)) return false;
+    const u32 pool = mem.Read32(tex + 12);
+    if (!mem.IsValidVirtualAddressRange(pool, 80) || mem.Read32(tex + 44) != 0x25) return false;
+    const u64 va = (mem.Read32(pool + 72) | (u64{mem.Read32(pool + 76)} << 32)) + mem.Read32(tex + 16);
+    const u32 width = mem.Read32(tex + 28);
+    const u32 height = mem.Read32(tex + 32);
+    u32 gobs = 1;
+    while (gobs < 16 && gobs * 2 <= (height + 7) / 8) gobs *= 2;
+    u32 log2 = 0;
+    while ((1u << log2) < gobs) ++log2;
+    w.n = 24;
+    w.v[0] = 0x20010487;
+    w.v[1] = 0x0fac6881;
+    w.v[2] = 0x20080200;
+    w.v[3] = static_cast<u32>(va >> 32);
+    w.v[4] = static_cast<u32>(va);
+    w.v[5] = (width + 15) & ~15u;
+    w.v[6] = height;
+    w.v[7] = 0xd5;
+    w.v[8] = log2 << 4;
+    w.v[9] = 1;
+    w.v[10] = mem.Read32(tex + 80) >> 2;
+    for (u32 i = 0; i < 7; ++i) w.v[11 + i] = 0x80000214 + 0x10 * i;
+    w.v[18] = 0x8000054e;
+    w.v[19] = 0x80000d28;
+    w.v[20] = 0x200203fd;
+    w.v[21] = width << 16;
+    w.v[22] = height << 16;
+    w.v[23] = 0x80000574;
+    return true;
+}
+
+struct NativeCmd {
+    const char* name;
+    NativeBuilder build;
+    bool proven;  // verified word for word against the guest: only these are switched on
+};
+const NativeCmd kNativeCmds[] = {
+    {"nvnCommandBufferBindUniformBuffer", BuildUniformBuffer, true},
+    {"nvnCommandBufferBindTexture", BuildTexture, true},
+    {"nvnCommandBufferBindVertexBuffer", BuildVertexBuffer, true},
+    {"nvnCommandBufferDrawElementsBaseVertex", BuildDrawElements, true},
+    {"nvnCommandBufferBindColorState", BuildColorState, true},
+    {"nvnCommandBufferBindVertexStreamState", BuildVertexStream, true},
+    {"nvnCommandBufferDrawArrays", BuildDrawArrays, true},
+    {"nvnCommandBufferSetDepthClamp", BuildDepthClamp, true},
+    {"nvnCommandBufferSetViewport", BuildViewport, true},
+    {"nvnCommandBufferSetViewports", BuildViewports, true},
+    {"nvnCommandBufferSetScissor", BuildScissor, true},
+    {"nvnCommandBufferSetScissors", BuildScissors, true},
+    {"nvnCommandBufferBindChannelMaskState", BuildChannelMask, true},
+    {"nvnCommandBufferBindBlendState", BuildBlendState, true},
+    {"nvnCommandBufferBindDepthStencilState", BuildDepthStencilState, true},
+    {"nvnCommandBufferBindPolygonState", BuildPolygonState, true},
+    {"nvnCommandBufferBindVertexAttribState", BuildVertexAttribState, true},
+    {"nvnCommandBufferBindProgram", BuildProgram, true},
+    {"nvnCommandBufferSetRenderTargets", BuildRenderTargets, true},
+};
+constexpr size_t kNativeCount = sizeof(kNativeCmds) / sizeof(kNativeCmds[0]);
+
+template <size_t I>
+bool NativeCommand(u32* r, Memory::Memory& mem) {
+    if (GameSettings::NvnVulkanMode() != 0) NvnRec::OnCall(kNativeCmds[I].name, r, mem);
+    const u32 cmd = r[0];
+    const u32 wp = mem.Read32(cmd + 12);
+    const u32 end = mem.Read32(cmd + 16);
+    const u32 start = mem.Read32(cmd + 20);
+    NativeWords w;
+    // Near the end of a chunk the guest driver (which owns chunk switching) runs the call.
+    if ((wp & 3) != 0 || wp < start || end < wp || end - wp < 0x2000 ||
+        !kNativeCmds[I].build(r, mem, w)) {
+        s_native_declined[I].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    for (u32 k = 0; k < w.n; ++k) {
+        mem.Write32(wp + 4 * k, w.v[k]);
+    }
+    mem.Write32(cmd + 12, wp + 4 * w.n);
+    s_native_served[I].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+template <size_t... Is>
+void RegisterAll(std::index_sequence<Is...>) {
+    ((kNativeCmds[Is].proven ? NvnTrace::Get().Replace(kNativeCmds[Is].name, NativeCommand<Is>) : void()), ...);
+}
+
+} // namespace
+
+NativeBuilder FindBuilder(const std::string& name) {
+    for (const auto& c : kNativeCmds) {
+        if (name == c.name) return c.build;
+    }
+    return nullptr;
+}
+u64 NativeCalls() {
+    u64 n = s_native_get_address.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < kNativeCount; ++i) n += s_native_served[i].load(std::memory_order_relaxed);
+    return n;
+}
+
+void RegisterNative() {
+    NvnTrace::Get().Replace("nvnBufferGetAddress", NativeBufferGetAddress);
+    RegisterAll(std::make_index_sequence<kNativeCount>{});
+}
+
 void Start() {
     Common::GpuProbe::draw_sink.store(GpuDraw, std::memory_order_relaxed);
 }
 
 void Flush(const std::filesystem::path& file) {
+    WriteProbe(file.parent_path() / "nvn_bufprobe.txt");
     Side nvn, gpu;
     u64 unknown_program;
     size_t programs, textures, pending;
     Stats st;
     {
-        std::scoped_lock lk{s_lock};
+        Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockShadow};
         nvn = s_nvn;
         gpu = s_gpu;
         unknown_program = s_unknown_program_draws;
@@ -449,6 +982,12 @@ void Flush(const std::filesystem::path& file) {
                        nvn.dropped ? fmt::format(", {} past cap", nvn.dropped) : "", gpu.total,
                        gpu.draws.size(), gpu.dropped ? fmt::format(", {} past cap", gpu.dropped) : "");
     out << fmt::format("programs seen: {}; NVN draws with no known program: {}\n", programs, unknown_program);
+    out << fmt::format("native entry points: native_nvn {}, nvnBufferGetAddress served natively {} times\n",
+                       GameSettings::NativeNvn() ? "on" : "off", s_native_get_address.load());
+    for (size_t i = 0; i < kNativeCount; ++i) {
+        out << fmt::format("  {} served natively {} times, declined (guest ran) {}{}", kNativeCmds[i].name,
+                           s_native_served[i].load(), s_native_declined[i].load(), char(10));
+    }
     if (nvn.total == 0 || gpu.total == 0) {
         return;
     }

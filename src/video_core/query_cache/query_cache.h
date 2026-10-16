@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "core/hle/kernel/stall_ring.h"
 #include <array>
 #include <deque>
 #include <memory>
@@ -262,7 +263,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate() && !Settings::IsGPUFenceBehaviorStrict()) && is_fence;
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
-                                     pointer, pointer_timestamp] {
+                                     pointer, pointer_timestamp, streamer_id, is_fence] {
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
@@ -283,9 +284,18 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             u64 timestamp = impl->gpu.GetTicks();
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
+            const double t = Kernel::StallRing::NowMs();
+            Kernel::StallRing::Add(Kernel::StallRing::Report, Kernel::StallRing::t_gtid,
+                                   static_cast<u8>((is_fence ? 1 : 0) | 2), 0,
+                                   static_cast<u32>(streamer_id),
+                                   static_cast<u32>(query_base->value), t, t);
         } else {
             u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
+            const double t = Kernel::StallRing::NowMs();
+            Kernel::StallRing::Add(Kernel::StallRing::Report, Kernel::StallRing::t_gtid,
+                                   static_cast<u8>(is_fence ? 1 : 0), 0,
+                                   static_cast<u32>(streamer_id), value, t, t);
         }
         if (!is_synced) [[likely]] {
             impl->pending_unregister.push_back(query_location);
@@ -302,6 +312,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 std::memcpy(pointer, &value, sizeof(value));
             } else {
                 std::memcpy(pointer, &payload, sizeof(payload));
+            }
+            {
+                const double t = Kernel::StallRing::NowMs();
+                Kernel::StallRing::Add(Kernel::StallRing::Report, Kernel::StallRing::t_gtid,
+                                       static_cast<u8>(has_timestamp ? 2 : 0), 0,
+                                       static_cast<u32>(streamer_id), payload, t, t);
             }
             streamer->Free(new_query_id);
             return;

@@ -40,15 +40,18 @@ public:
     static NvnTrace& Get();
 
     /// Called once with the process's modules (base -> name) before guest code runs.
-    void Attach(System& system, const std::map<u64, std::string>& modules);
+    /// `lean`: only the entry points that have a replacement are hooked, and they run with no
+    /// census, observers or locks (diagnostics off, native_nvn on).
+    void Attach(System& system, const std::map<u64, std::string>& modules, bool lean = false);
 
     /// Native stand-in for an NVN entry point (G3): gets r0-r3/sp as the call starts and
     /// leaves the return value in r0 (r0:r1 for 64-bit results). The guest function is
-    /// skipped; the dispatcher continues at the caller's return address.
-    using Replacement = void (*)(u32* regs, Memory::Memory& mem);
+    /// skipped (return false to decline: the guest function then runs); the dispatcher continues at the caller's return address.
+    using Replacement = bool (*)(u32* regs, Memory::Memory& mem);
 
     /// Registers a replacement for an entry point by name, before guest code runs.
     void Replace(const std::string& name, Replacement fn);
+    bool HasReplacement(const std::string& name);
 
     /// Hot path: called for every block the dispatcher is about to run. Returns true when a
     /// replacement ran instead: regs[15] then holds the address to continue at.
@@ -61,6 +64,13 @@ public:
         }
         const u32 off = pc - watch_lo;
         if (off < watch_span && (bits[off >> 5].load(std::memory_order_relaxed) >> ((off >> 2) & 7) & 1)) {
+            if (lean) {
+                for (u32 i = 0, n = fast_count.load(std::memory_order_acquire); i < n; ++i) {
+                    if (fast[i].pc == pc) {
+                        return RunFast(fast[i].fn, regs);
+                    }
+                }
+            }
             return OnHookedEntry(pc, regs);
         }
         return false;
@@ -73,10 +83,19 @@ private:
     NvnTrace() = default;
     void OnMaybeReturn(u32 pc, const u32* regs);
     bool OnHookedEntry(u32 pc, u32* regs);
+    bool RunFast(Replacement fn, u32* regs);
     void Watch(u32 addr);
 
     std::atomic<bool> enabled{false};
     bool attach_tried{false};
+    bool lean{false};
+    struct FastEntry {
+        u32 pc;
+        Replacement fn;
+    };
+    static constexpr u32 kMaxFast = 192;
+    FastEntry fast[kMaxFast]{};
+    std::atomic<u32> fast_count{0};
     u32 watch_lo{};
     u32 watch_span{};
     std::atomic<u8>* bits{}; // one bit per word of the watched range

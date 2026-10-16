@@ -60,6 +60,16 @@ public:
     /// True when owner was the listener (and is now removed).
     bool ClearNetworkListener(const void* owner);
 
+    /// Extra lobby watchers (the room bridge): called like the network listener, on top of it.
+    using ObserverHandle = std::shared_ptr<NetworkListener>;
+    ObserverHandle AddNetworkObserver(NetworkListener observer);
+    void RemoveNetworkObserver(const ObserverHandle& handle);
+
+    /// This node created the lobby it is in (CreateNetwork succeeded and it is still open).
+    bool IsHosting() const;
+    /// The lobby's NetworkInfo as the server last pushed it (zeros outside a lobby).
+    NetworkInfoBlob LobbyInfo() const;
+
     bool IsConnected() const override;
     IPv4Address GetFakeIpAddress() const override;
     std::optional<IPv4Address> GetFakeSubnetMask() const override;
@@ -111,15 +121,24 @@ private:
     std::mutex listener_lock;
     NetworkListener network_listener;
     const void* listener_owner = nullptr;
+    std::vector<ObserverHandle> observers;
+
+    mutable std::mutex lobby_lock;
+    NetworkInfoBlob lobby_info{};
+    std::atomic<bool> hosting{false};
 
     std::mutex callbacks_lock;
     std::vector<CallbackHandle<ProxyPacket>> proxy_callbacks;
 };
 
-/// The RyuLdn backend of this run, null when LDN goes through a suyu room.
+/// The RyuLdn backend of this run, null when none was set up.
 std::shared_ptr<Backend> GetActiveBackend();
 
 /// Makes backend the run's LDN backend (also for GetLdnBackend()). Call once at start.
 void Activate(std::shared_ptr<Backend> backend);
+
+/// Makes backend the run's RyuLdn backend without making it the LDN backend: the hybrid backend
+/// (Network::SetHybridLdnBackend) carries it next to the room.
+void Register(std::shared_ptr<Backend> backend);
 
 } // namespace Network::RyuLdn

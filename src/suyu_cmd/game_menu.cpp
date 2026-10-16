@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +24,8 @@
 
 #include "common/fs/path_util.h"
 #include "common/logging/log.h"
+#include "common/settings.h"
+#include "common/settings_enums.h"
 #include "common/settings_input.h"
 #include "core/arm/recomp/game_settings.h"
 #include "core/core.h"
@@ -451,7 +454,7 @@ void DoJoin() {
     }
 }
 
-/// [Multiplayer] backend = ryuldn: the lobby server replaces the room for this run.
+/// The Ryujinx LDN side: where the RyuLdn lobbies live (Ryujinx LDN or Both).
 void DrawRyuLdn() {
     static bool show_server = false;
     const std::string status = Multiplayer::RyuLdnStatusText();
@@ -590,7 +593,7 @@ void DrawPublicRooms() {
     }
 
     if (!Multiplayer::UsingRyuLdn()) {
-        ImGui::TextColored(kYellow, "To join these, switch to Ryujinx LDN above and restart.");
+        ImGui::TextColored(kYellow, "Local play is set to suyu rooms only (ini backend = room).");
     }
     if (ImGui::Button("Refresh")) {
         Multiplayer::RefreshPublicRooms();
@@ -648,17 +651,12 @@ void DrawPublicRooms() {
     }
 
     SectionTitle("Servers");
-    const std::string main_server = Multiplayer::MainRyuLdnServer();
-    if (main_server == Multiplayer::DefaultRyuLdnHost) {
-        ImGui::BulletText("Ryujinx (%s) - main", main_server.c_str());
-    } else if (Multiplayer::CurrentRyuLdnServerChoice().mode ==
-               Multiplayer::RyuLdnServerChoice::Mode::Host) {
-        ImGui::BulletText("Your server - main");
-    } else {
-        ImGui::BulletText("Server 1: %s - main", show_servers ? main_server.c_str() : "(hidden)");
-    }
-    HelpMarker("Lobbies you host go to the main server (game_settings.ini ryuldn_host; empty = "
-               "Ryujinx's public server, ldn.ryujinx.app).");
+    ImGui::BulletText("This PC - your lobbies are hosted here while you host");
+    ImGui::BulletText("Ryujinx (%s) - public lobbies", Multiplayer::DefaultRyuLdnHost);
+    HelpMarker("Hosting opens a room for suyu players and a server for Ryujinx players on this "
+               "PC; the game's local-play search also lists Ryujinx's public lobbies and those "
+               "of the friend whose room you joined. game_settings.ini ryuldn_public = off "
+               "leaves the public server out.");
     const auto extra = Multiplayer::ExtraRyuLdnServers();
     for (std::size_t i = 0; i < extra.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
@@ -703,25 +701,26 @@ void DrawPublicRooms() {
 void DrawRoom();
 
 void DrawMultiplayer() {
-    // The switch: which network carries local play (read at start).
-    const bool running_ryu = Multiplayer::UsingRyuLdn();
-    const bool chosen_ryu = Multiplayer::RyuLdnChosenInSettings();
+    // The switch: which network carries local play (applies at once). Both = automatic.
+    static std::string mode_message;
+    using LdnMode = Multiplayer::LdnMode;
+    const LdnMode mode = Multiplayer::CurrentLdnMode();
     ImGui::TextUnformatted("Play over:");
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Suyu room", !chosen_ryu) && chosen_ryu) {
-        Multiplayer::ChooseBackend(false);
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Ryujinx LDN", chosen_ryu) && !chosen_ryu) {
-        Multiplayer::ChooseBackend(true);
-    }
-    HelpMarker("Suyu room: you and your friends join one room (host/invite below), e.g. over "
-               "Radmin VPN. Ryujinx LDN: lobbies on Ryujinx's public server, shared with Ryujinx "
-               "players; find them in the game's local play or in Public rooms. One at a time; "
-               "switching needs a restart.");
-    if (chosen_ryu != running_ryu) {
-        ImGui::TextColored(kYellow, "Restart the game to switch to %s.",
-                           chosen_ryu ? "Ryujinx LDN" : "suyu rooms");
+    const auto pick = [&](const char* label, LdnMode value) {
+        ImGui::SameLine();
+        if (ImGui::RadioButton(label, mode == value) && mode != value) {
+            std::string error;
+            mode_message = Multiplayer::SetLdnMode(value, &error) ? std::string{} : error;
+        }
+    };
+    pick("Suyu room", LdnMode::Room);
+    pick("Ryujinx LDN", LdnMode::RyuLdn);
+    pick("Both (automatic)", LdnMode::Auto);
+    HelpMarker("Both (the default): hosting opens a room and a server by itself, joining picks "
+               "whatever the lobby needs. Suyu room / Ryujinx LDN force one side only. Applies at "
+               "once (leave a lobby first).");
+    if (!mode_message.empty()) {
+        ImGui::TextColored(kRed, "Couldn't switch: %s", mode_message.c_str());
     }
 
     // One name for both networks: suyu rooms and Ryujinx lobbies (Public rooms lists).
@@ -734,13 +733,18 @@ void DrawMultiplayer() {
                "4-20 characters: letters, digits, space, . _ -. Applies to the next room or "
                "lobby you host or join.");
 
+    const std::string bridge = Multiplayer::BridgeStatusText();
+    if (!bridge.empty()) {
+        ImGui::TextColored(kGrey, "%s", bridge.c_str());
+    }
+
     if (ImGui::BeginTabBar("mptabs")) {
-        if (ImGui::BeginTabItem(running_ryu ? "Ryujinx LDN" : "Suyu room")) {
-            if (running_ryu) {
-                DrawRyuLdn();
-            } else {
-                DrawRoom();
-            }
+        if (mode != LdnMode::RyuLdn && ImGui::BeginTabItem("Join Room")) {
+            DrawRoom();
+            ImGui::EndTabItem();
+        }
+        if (mode != LdnMode::Room && ImGui::BeginTabItem("Ryujinx LDN")) {
+            DrawRyuLdn();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Public rooms")) {
@@ -779,8 +783,17 @@ void DrawRoom() {
             MpMessage("Left the room.", false);
         }
     }
-    for (const auto& m : st.members) {
-        ImGui::BulletText("%s", m.c_str());
+    for (std::size_t i = 0; i < st.members.size(); ++i) {
+        ImGui::BulletText("%s", st.members[i].c_str());
+        if (st.phase == Phase::Hosting && i < st.names.size() && st.names[i] != st.nickname) {
+            ImGui::SameLine();
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::SmallButton("Kick")) {
+                Multiplayer::Kick(st.names[i]);
+                MpMessage(fmt::format("Kicked {}.", st.names[i]), false);
+            }
+            ImGui::PopID();
+        }
     }
     if (!st.last_error.empty()) {
         ImGui::TextColored(kRed, "Last problem: %s", st.last_error.c_str());
@@ -811,7 +824,9 @@ void DrawRoom() {
         DoJoin();
     }
     HelpMarker("Paste the invite your friend copied in their menu (address:port, plus #password "
-               "if the room has one), or type their Radmin VPN address.");
+               "if the room has one), or type their Radmin VPN address. One address covers both "
+               "worlds: you join their room and see the lobbies on their server too. Then open "
+               "the game's local play and join their lobby.");
     const auto recent = Multiplayer::RecentHosts();
     if (!recent.empty()) {
         ImGui::TextColored(kGrey, "Joined before:");
@@ -834,7 +849,11 @@ void DrawRoom() {
         }
     }
 
-    SectionTitle("Host a room");
+    SectionTitle("Hosting");
+    ImGui::TextWrapped(
+        "Nothing to press: when you host in the game's local play, this PC opens the room and the "
+        "server by itself, and suyu and Ryujinx friends join the same lobby. These are the "
+        "room's options:");
     const float field = ImGui::GetFontSize() * 9.0f;
     ImGui::SetNextItemWidth(field);
     ImGui::InputText("Room name", g_room, sizeof(g_room));
@@ -846,18 +865,19 @@ void DrawRoom() {
     ImGui::SameLine();
     ImGui::SetNextItemWidth(field);
     ImGui::InputInt("Port", &g_port, 0, 0);
-    if (ImGui::Button("Host")) {
-        const Multiplayer::Config c = FieldsToConfig();
-        std::string error;
-        if (g_system != nullptr && Multiplayer::Host(*g_system, c, &error)) {
-            Multiplayer::Save(c);
-            MpMessage("Room open. Send a friend one of the invites below.", false);
-        } else {
-            MpMessage("Couldn't host: " + error, true);
-        }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        Multiplayer::Save(FieldsToConfig());
+    }
+    const auto own = Multiplayer::GetOwnServerStatus();
+    if (own.running) {
+        ImGui::TextColored(kGreen, "Hosting: %zu connected to your server, %zu lobbies (port %u)",
+                           own.connections, own.lobbies, own.port);
+    } else if (!own.error.empty()) {
+        ImGui::TextColored(kRed, "Your server couldn't start: %s", own.error.c_str());
     }
     ImGui::TextColored(kGrey, "Friends join with one of your addresses (Copy puts an invite on "
-                              "the clipboard; click an address to show it):");
+                              "the clipboard; click an address to show it). Ryujinx friends set "
+                              "this address as their LDN server:");
     const auto addresses = Multiplayer::LocalAddresses();
     bool any_vpn = false;
     for (std::size_t i = 0; i < addresses.size(); ++i) {
@@ -935,8 +955,10 @@ constexpr SettingHint kSettingHints[] = {
     {"Graphics", "native_render", "Render at the set resolution", ""},
     {"Graphics", "draw_distance", "Draw distance", "1.0|1.5|2.0|3.0|4.0|8.0"},
     {"Debug", "diagnostics", "Run reports", ""},
+    {"Debug", "gpu_diagnostics", "Run reports (replacement renderer)", ""},
     {"Debug", "rtss_overlay", "Allow RivaTuner overlay", ""},
     {"Menu", "key", "Menu key", "F10|F9|F8|Home|none"},
+    {"Menu", "show_advanced", "Show advanced settings", ""},
     {"Menu", "pad_combo", "Menu controller combo",
      "back+start|back+guide|leftstick+rightstick|none"},
 #ifdef _WIN32
@@ -1030,6 +1052,8 @@ void CommitSetting(const GS::OptionInfo& o, const std::string& label, const std:
     g_settings_message_bad = false;
 }
 
+void DrawAdvancedRow(Settings::BasicSetting& setting);
+
 void DrawSettings() {
     ImGui::TextWrapped("The options in game_settings.ini beside the game. Changes are saved right "
                        "away. Frame rate, the FPS display and the menu buttons apply at once; the "
@@ -1048,6 +1072,18 @@ void DrawSettings() {
         ImGui::TextColored(g_settings_message_bad ? kRed : kGrey, "%s",
                            g_settings_message.c_str());
     }
+
+    SectionTitle("Resolution scale");
+    if (ImGui::BeginTable("resscale", 2)) {
+        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::GetFontSize() * 14.0f);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+        DrawAdvancedRow(Settings::values.resolution_setup);
+        ImGui::EndTable();
+    }
+    ImGui::TextColored(kGrey, "How much sharper than the game's own resolution suyu renders "
+                              "(1X = native). Not the window size: that is Display > Resolution. "
+                              "With the replacement renderer it applies after a restart.");
 
     std::string section;
     bool table_open = false;
@@ -1120,6 +1156,262 @@ void DrawSettings() {
     }
     if (table_open) {
         ImGui::EndTable();
+    }
+}
+
+// ── Advanced: every suyu setting ───────────────────────────────────────────
+
+/// "Res3_4X" -> "3/4X (0.75X)", "Res2X" -> "2X".
+std::string PrettyResolution(const std::string& name) {
+    std::string body = name.substr(3);
+    const auto us = body.find('_');
+    if (us == std::string::npos) {
+        return body;
+    }
+    const int num = std::atoi(body.c_str());
+    const int den = std::atoi(body.c_str() + us + 1);
+    const std::string frac = fmt::format("{}/{}X", num, den);
+    return den == 0 ? frac : fmt::format("{} ({:g}X)", frac, static_cast<double>(num) / den);
+}
+
+/// The names an enum setting accepts (empty when the setting isn't one of the known enums).
+template <typename... Es>
+std::vector<std::pair<std::string, u32>> EnumNamesFor(u32 index) {
+    std::vector<std::pair<std::string, u32>> out;
+    (
+        [&] {
+            if (out.empty() && Settings::EnumMetadata<Es>::Index() == index) {
+                for (const auto& entry : Settings::EnumMetadata<Es>::Canonicalizations()) {
+                    out.emplace_back(std::string{entry.first}, static_cast<u32>(entry.second));
+                }
+            }
+        }(),
+        ...);
+    return out;
+}
+
+std::vector<std::pair<std::string, u32>> EnumNames(const Settings::BasicSetting& setting) {
+    using namespace Settings;
+    return EnumNamesFor<AudioEngine, AudioMode, Language, Region, TimeZone, AnisotropyMode,
+                        AstcDecodeMode, AstcRecompression, FramePacingMode, VSyncMode,
+                        VramUsageMode, RendererBackend, GpuAccuracy, DmaAccuracy, GpuFenceBehavior,
+                        CpuBackend, CpuAccuracy, CpuClock, MemoryLayout, ConfirmStop,
+                        FullscreenMode, NvdecEmulation, ResolutionSetup, ScalingFilter,
+                        AntiAliasing, AspectRatio, ConsoleMode, AppletMode, SpirvOptimizeMode,
+                        GpuOverclock, GpuUnswizzleSize, GpuUnswizzle, GpuUnswizzleChunk,
+                        TemperatureUnits, ExtendedDynamicState, GpuLogLevel, GameListMode,
+                        SpeedMode, DarkModeState>(setting.EnumIndex());
+}
+
+const char* CategoryTitle(Settings::Category c) {
+    using Settings::Category;
+    switch (c) {
+    case Category::Audio:
+    case Category::SystemAudio:
+        return "Audio";
+    case Category::Core:
+        return "Core";
+    case Category::Cpu:
+    case Category::CpuDebug:
+    case Category::CpuUnsafe:
+        return "CPU";
+    case Category::Overlay:
+    case Category::Renderer:
+    case Category::RendererAdvanced:
+    case Category::RendererHacks:
+    case Category::RendererExtensions:
+    case Category::RendererDebug:
+    case Category::GpuDriver:
+        return "Graphics";
+    case Category::System:
+    case Category::Services:
+    case Category::LibraryApplet:
+        return "System";
+    case Category::DataStorage:
+        return "Storage";
+    case Category::Debugging:
+    case Category::DebuggingGraphics:
+        return "Debug";
+    case Category::Linux:
+    case Category::Miscellaneous:
+    case Category::AddOns:
+        return "Miscellaneous";
+    case Category::Network:
+        return "Network";
+    default:
+        return nullptr; // controls, shortcuts, paths, UI...: not shown here
+    }
+}
+
+std::map<std::string, std::array<char, 160>> g_adv_text; // setting label -> field text
+std::string g_adv_message;
+bool g_adv_message_bad{};
+char g_adv_filter[64]{};
+
+void RefreshAdvText(const Settings::BasicSetting& setting) {
+    CopyTo(g_adv_text[setting.GetLabel()], setting.ToString());
+}
+
+void CommitAdvanced(Settings::BasicSetting& setting, const std::string& value) {
+    const std::string before = setting.ToString();
+    setting.LoadString(value);
+    const std::string after = setting.ToString();
+    CopyTo(g_adv_text[setting.GetLabel()], after);
+    if (after == before) {
+        if (value != before) {
+            g_adv_message = fmt::format("{}: '{}' wasn't accepted (kept {})", setting.GetLabel(),
+                                        value, after);
+            g_adv_message_bad = true;
+        }
+        return;
+    }
+    LOG_INFO(Frontend, "game menu: advanced {} = {}", setting.GetLabel(), after);
+    Controls::SaveConfig();
+    if (g_system != nullptr && setting.RuntimeModifiable()) {
+        g_system->ApplySettings();
+        g_adv_message = fmt::format("{}: {} (applied now)", setting.GetLabel(), after);
+    } else {
+        g_adv_message =
+            fmt::format("{}: {} (saved; restart the game to apply)", setting.GetLabel(), after);
+    }
+    g_adv_message_bad = false;
+}
+
+/// The editor for one setting: a checkbox, a drop-down for enums, or a text field.
+void DrawAdvancedValue(Settings::BasicSetting& setting) {
+    auto& text = g_adv_text[setting.GetLabel()];
+    if (text[0] == '\0') {
+        RefreshAdvText(setting);
+    }
+    if (setting.TypeId() == "bool") {
+        bool on = setting.ToString() == "true";
+        if (ImGui::Checkbox("##value", &on)) {
+            CommitAdvanced(setting, on ? "true" : "false");
+        }
+        return;
+    }
+    if (setting.IsEnum()) {
+        // ToString/LoadString speak the enum's number; the drop-down shows the names.
+        const auto names = EnumNames(setting);
+        if (!names.empty()) {
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+            const std::string current = setting.ToString();
+            std::string shown = setting.Canonicalize();
+            if (shown.rfind("Res", 0) == 0 && shown.size() > 3 && std::isdigit(shown[3])) {
+                shown = PrettyResolution(shown);
+            }
+            if (ImGui::BeginCombo("##value", shown.c_str())) {
+                for (const auto& [name, value] : names) {
+                    const std::string label =
+                        name.rfind("Res", 0) == 0 && name.size() > 3 && std::isdigit(name[3])
+                            ? PrettyResolution(name)
+                            : name;
+                    if (ImGui::Selectable(label.c_str(), std::to_string(value) == current)) {
+                        CommitAdvanced(setting, std::to_string(value));
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            return;
+        }
+    }
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+    ImGui::InputText("##value", text.data(), text.size());
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        CommitAdvanced(setting, text.data());
+    }
+}
+
+void DrawAdvancedRow(Settings::BasicSetting& setting) {
+    ImGui::PushID(setting.GetLabel().c_str());
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(setting.GetLabel().c_str());
+    std::string help = fmt::format("{} (default {})", setting.GetLabel(), setting.DefaultToString());
+    if (setting.Ranged()) {
+        help += fmt::format("\nrange {} to {}", setting.MinVal(), setting.MaxVal());
+    }
+    if (!setting.RuntimeModifiable()) {
+        help += "\nApplies at the next start of the game.";
+    }
+    HelpMarker(help.c_str());
+    ImGui::TableNextColumn();
+    DrawAdvancedValue(setting);
+    ImGui::SameLine();
+    if (setting.ToString() != setting.DefaultToString() && ImGui::SmallButton("Reset")) {
+        CommitAdvanced(setting, setting.DefaultToString());
+    }
+    ImGui::PopID();
+}
+
+/// game_settings.ini [Menu] show_advanced, re-read about once a second (the Settings tab edits it).
+bool ShowAdvancedTab() {
+    static bool shown{};
+    static Clock::time_point next{};
+    if (Clock::now() >= next) {
+        const std::string v = GS::Value("Menu", "show_advanced");
+        shown = v == "true" || v == "1" || v == "yes" || v == "on";
+        next = Clock::now() + std::chrono::seconds(1);
+    }
+    return shown;
+}
+
+void DrawAdvanced() {
+    ImGui::TextWrapped("Every setting of suyu's own configuration, grouped like its config tab. "
+                       "Changes are saved with the game's config when it closes; settings that "
+                       "can change while a game runs apply at once, the rest at the next start. "
+                       "Controls and Multiplayer have their own tabs.");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+    ImGui::InputText("Search", g_adv_filter, sizeof(g_adv_filter));
+    if (!g_adv_message.empty()) {
+        ImGui::TextColored(g_adv_message_bad ? kRed : kGrey, "%s", g_adv_message.c_str());
+    }
+    std::string needle = g_adv_filter;
+    std::transform(needle.begin(), needle.end(), needle.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    // Group the categories under their headings, in a fixed order.
+    constexpr const char* kGroups[] = {"Graphics", "CPU",     "Audio",   "System",
+                                       "Storage",  "Network", "Debug",   "Miscellaneous"};
+    for (const char* group : kGroups) {
+        std::vector<Settings::BasicSetting*> rows;
+        for (const auto& [category, list] : Settings::values.linkage.by_category) {
+            const char* title = CategoryTitle(category);
+            if (title == nullptr || std::string_view{title} != group) {
+                continue;
+            }
+            for (Settings::BasicSetting* setting : list) {
+                if (!setting->Save()) {
+                    continue;
+                }
+                std::string label = setting->GetLabel();
+                std::transform(label.begin(), label.end(), label.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (needle.empty() || label.find(needle) != std::string::npos) {
+                    rows.push_back(setting);
+                }
+            }
+        }
+        if (rows.empty()) {
+            continue;
+        }
+        const bool open = !needle.empty() || ImGui::CollapsingHeader(group);
+        if (!open) {
+            continue;
+        }
+        if (!needle.empty()) {
+            SectionTitle(group);
+        }
+        if (ImGui::BeginTable(group, 2)) {
+            ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
+                                    ImGui::GetFontSize() * 18.0f);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            for (Settings::BasicSetting* setting : rows) {
+                DrawAdvancedRow(*setting);
+            }
+            ImGui::EndTable();
+        }
     }
 }
 
@@ -1225,6 +1517,12 @@ void Draw() {
         if (ImGui::BeginTabItem("Settings")) {
             ImGui::BeginChild("settings");
             DrawSettings();
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ShowAdvancedTab() && ImGui::BeginTabItem("Advanced")) {
+            ImGui::BeginChild("advanced");
+            DrawAdvanced();
             ImGui::EndChild();
             ImGui::EndTabItem();
         }

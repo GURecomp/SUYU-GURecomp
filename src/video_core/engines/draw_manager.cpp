@@ -8,6 +8,7 @@
 
 #include "common/gpu_probe.h"
 #include "common/settings.h"
+#include "core/arm/recomp/game_settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
@@ -126,6 +127,12 @@ void Maxwell3D::DrawManager::DrawIndexedIndirect(Maxwell3D& maxwell3d, Maxwell3D
 }
 
 void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 index) {
+    if (!Core::GameSettings::SuyuRender()) {
+        // the replacement renderer draws; only the index count matters here
+        draw_state.inline_index_skipped += 4;
+        draw_state.draw_mode = DrawMode::InlineIndex;
+        return;
+    }
     draw_state.inline_index_draw_indexes.push_back(u8(index & 0x000000ff));
     draw_state.inline_index_draw_indexes.push_back(u8((index & 0x0000ff00) >> 8));
     draw_state.inline_index_draw_indexes.push_back(u8((index & 0x00ff0000) >> 16));
@@ -135,6 +142,13 @@ void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 inde
 
 void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 method,
                                                   const u32* base_start, u32 amount) {
+    if (!Core::GameSettings::SuyuRender()) {
+        const size_t per_word = method == MAXWELL3D_REG_INDEX(draw_inline_index) ? 4
+                                : method == MAXWELL3D_REG_INDEX(inline_index_2x16.even) ? 8 : 16;
+        draw_state.inline_index_skipped += size_t(amount) * per_word;
+        draw_state.draw_mode = DrawMode::InlineIndex;
+        return;
+    }
     auto& index_buffer = draw_state.inline_index_draw_indexes;
     switch (method) {
     case MAXWELL3D_REG_INDEX(draw_inline_index): {
@@ -208,11 +222,12 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
         draw_state.base_instance = maxwell3d.regs.global_base_instance_index;
         draw_state.base_index = maxwell3d.regs.global_base_vertex_index;
         draw_state.index_buffer = maxwell3d.regs.index_buffer;
-        draw_state.index_buffer.count = u32(draw_state.inline_index_draw_indexes.size() / 4);
+        draw_state.index_buffer.count = u32((draw_state.inline_index_draw_indexes.size() + draw_state.inline_index_skipped) / 4);
         draw_state.index_buffer.format = Maxwell3D::Regs::IndexFormat::UnsignedInt;
         maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
         ProcessDraw(maxwell3d, true, instance_count);
         draw_state.inline_index_draw_indexes.clear();
+        draw_state.inline_index_skipped = 0;
         break;
     }
 }

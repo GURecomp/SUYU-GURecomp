@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <chrono>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "core/arm/recomp/nvn_census.h"
+#include "core/arm/recomp/nvn_shadow.h"
 #include "core/memory.h"
 
 namespace Core::NvnCensus {
@@ -33,6 +35,9 @@ struct Sample {
     std::string name;
     std::array<u32, kArgs> args;
     std::array<u32, kObjectWords> before;
+    bool has_pred{};
+    bool declined{};
+    NvnShadow::NativeWords pred;
 };
 
 /// One method write: subchannel << 16 | method (in words, as dma_pusher numbers them).
@@ -55,6 +60,8 @@ struct Fn {
     u32 max_words{};
     std::map<MethodSeq, Shape> shapes;
     u64 shapes_dropped{};
+    u64 v_match{}, v_mismatch{}, v_declined{};
+    std::vector<std::string> v_examples;
 };
 
 std::vector<Sample> g_pending;
@@ -65,6 +72,15 @@ u64 g_expired{};
 constexpr auto kSampleTimeout = std::chrono::milliseconds(200);
 std::map<std::string, Fn> g_fns;
 std::array<u64, kObjectWords> g_votes{};
+struct UbRec {
+    std::string name;
+    std::array<u32, 7> args;
+    std::vector<u32> words;
+    std::string extra;
+    std::array<u32, kObjectWords> before, after;
+};
+std::map<std::string, u32> g_ub_count;
+std::map<std::string, UbRec> g_ub;  // keyed by words, a few per size class
 int g_ptr_word = -1;
 
 int Winner() {
@@ -163,7 +179,8 @@ bool Wants(const std::string& name) {
 }
 
 bool Begin(const std::string& name, u64 call, const u32* regs, Memory::Memory& mem) {
-    if (call >= kFirstCalls && call % kRate != 0) {
+    const auto builder = NvnShadow::FindBuilder(name);
+    if (call >= kFirstCalls && call % (builder ? 8 : kRate) != 0) {
         return false;
     }
     const u32 cmd = regs[0];
@@ -177,6 +194,10 @@ bool Begin(const std::string& name, u64 call, const u32* regs, Memory::Memory& m
     }
     for (u32 a = 4; a < kArgs; ++a) {
         s.args[a] = mem.Read32(regs[13] + 4 * (a - 4));
+    }
+    if (builder) {
+        s.has_pred = true;
+        s.declined = !builder(regs, mem, s.pred);
     }
     mem.ReadBlock(cmd, s.before.data(), kObjectWords * 4);
     g_pending.push_back(std::move(s));
@@ -217,6 +238,39 @@ bool End(u32 pc, const u32* regs, Memory::Memory& mem) {
     }
     const u32 from = s.before[ptr];
     const u32 bytes = after[ptr] - from;
+    if (s.has_pred) {
+        if (s.declined) {
+            ++fn.v_declined;
+        } else {
+            std::vector<u32> got;
+            if (bytes != 0 && bytes <= kMaxCallBytes && (bytes & 3) == 0 &&
+                mem.IsValidVirtualAddressRange(from, bytes)) {
+                got.resize(bytes / 4);
+                mem.ReadBlock(from, got.data(), bytes);
+            }
+            const bool ok = got.size() == s.pred.n && std::equal(got.begin(), got.end(), s.pred.v);
+            if (ok) {
+                ++fn.v_match;
+            } else {
+                ++fn.v_mismatch;
+                if (fn.v_examples.size() < 6) {
+                    std::string line = "  VERIFY MISMATCH args";
+                    for (u32 a = 1; a < 7; ++a) line += fmt::format(" {:x}", s.args[a]);
+                    line += " | predicted";
+                    for (u32 k = 0; k < s.pred.n; ++k) line += fmt::format(" {:x}", s.pred.v[k]);
+                    line += " | guest wrote";
+                    for (u32 wd : got) line += fmt::format(" {:x}", wd);
+                    for (u32 a = 1; a < 3; ++a) {
+                        if (s.args[a] >= 0x04000000 && mem.IsValidVirtualAddressRange(s.args[a], 96)) {
+                            line += fmt::format(" | obj r{}:", a);
+                            for (u32 k = 0; k < 16; ++k) line += fmt::format(" {:x}", mem.Read32(s.args[a] + 4 * k));
+                        }
+                    }
+                    fn.v_examples.push_back(std::move(line));
+                }
+            }
+        }
+    }
     if (bytes == 0 || bytes > kMaxCallBytes || (bytes & 3) != 0) {
         ++fn.no_advance;
         return true;
@@ -231,6 +285,41 @@ bool End(u32 pc, const u32* regs, Memory::Memory& mem) {
     std::vector<u32> values;
     Decode(words, seq, values);
     ++fn.decoded;
+    static const char* const kProbe[] = {"SetRenderTargets", "BindDepthStencilState", "BindBlendState",
+                                         "BindVertexAttribState"};
+    bool probe_it = false;
+    for (const char* n : kProbe) {
+        probe_it = probe_it || s.name == std::string("nvnCommandBuffer") + n;
+    }
+    if (probe_it && s.has_pred && s.declined && g_ub_count[s.name] < 60) {
+        std::string extra;
+        std::vector<u32> seen;
+        // dump an object and, one or two levels down, the heap objects it points at
+        std::function<void(u32, int, const char*)> dump = [&](u32 addr, int depth, const char* tag) {
+            if (addr < 0x04000000 || addr >= 0x80000000 || seen.size() >= 10 ||
+                std::find(seen.begin(), seen.end(), addr) != seen.end() ||
+                !mem.IsValidVirtualAddressRange(addr, 96)) {
+                return;
+            }
+            seen.push_back(addr);
+            extra += fmt::format("{}  {} {:x}:", char(10), tag, addr);
+            u32 w[24];
+            for (u32 k = 0; k < 24; ++k) {
+                w[k] = mem.Read32(addr + 4 * k);
+                extra += fmt::format(" {:x}", w[k]);
+            }
+            if (depth > 0) {
+                for (u32 k = 0; k < 12; ++k) dump(w[k], depth - 1, "ptr");
+            }
+        };
+        for (u32 a = 1; a < 5; ++a) dump(s.args[a], 2, "obj");
+        std::string key = s.name + extra;
+        for (u32 w : words) key += fmt::format(" {:x}", w);
+        if (!g_ub.count(key)) {
+            ++g_ub_count[s.name];
+            g_ub[key] = UbRec{s.name, s.args, words, extra, s.before, after};
+        }
+    }
     fn.min_words = std::min(fn.min_words, bytes / 4);
     fn.max_words = std::max(fn.max_words, bytes / 4);
     Record(fn, s, seq, values);
@@ -246,6 +335,24 @@ void Flush(const std::filesystem::path& file) {
     if (!out) {
         return;
     }
+    {
+        std::ofstream ub(file.parent_path() / "nvn_ubprobe.txt", std::ios::trunc);
+        int shown = 0;
+        for (const auto& [k, r] : g_ub) {
+            ub << r.name.substr(16) << std::hex << " args:";
+            for (u32 a = 1; a < 7; ++a) ub << ' ' << r.args[a];
+            ub << " words:";
+            for (u32 w : r.words) ub << ' ' << w;
+            ub << r.extra;
+            if (shown++ < 0) {
+                ub << "\n  before:";
+                for (u32 w : r.before) ub << ' ' << w;
+                ub << "\n  after: ";
+                for (u32 w : r.after) ub << ' ' << w;
+            }
+            ub << '\n';
+        }
+    }
     out << "# NVN method census: GPU methods the guest driver records per command buffer call\n";
     out << "# method writes are sc.method(hex, in words)=value; aN = always argument N "
            "(1-3 = r1-r3, 4-6 = stack words), * = varies, otherwise the constant seen\n";
@@ -260,7 +367,8 @@ void Flush(const std::filesystem::path& file) {
     for (size_t i = 0; i < std::min<size_t>(votes.size(), 6); ++i) {
         out << fmt::format(" w{}={}", votes[i].second, votes[i].first);
     }
-    out << fmt::format("); samples given up (no return seen): {}\n\n", g_expired);
+    out << fmt::format("); samples given up (no return seen): {}\n",
+                           g_expired);
     for (const auto& [name, fn] : g_fns) {
         out << fmt::format("## {}: {} sampled, {} decoded, {} without commands, {} unreadable, "
                            "words/call {}-{}, {} shapes{}\n",
@@ -269,6 +377,11 @@ void Flush(const std::filesystem::path& file) {
                            fn.shapes_dropped ? fmt::format(" (+{} calls in dropped shapes)",
                                                            fn.shapes_dropped)
                                              : "");
+        if (fn.v_match + fn.v_mismatch + fn.v_declined != 0) {
+            out << fmt::format("  verify (native words vs guest): {} match, {} MISMATCH, {} declined{}",
+                               fn.v_match, fn.v_mismatch, fn.v_declined, char(10));
+            for (const auto& ex : fn.v_examples) out << ex << char(10);
+        }
         std::vector<std::pair<u64, const MethodSeq*>> order;
         for (const auto& [seq, sh] : fn.shapes) {
             order.emplace_back(sh.count, &seq);

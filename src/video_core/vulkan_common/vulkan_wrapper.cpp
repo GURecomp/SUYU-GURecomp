@@ -668,9 +668,9 @@ Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreate
     return Device(device, dispatch);
 }
 
-Queue Device::GetQueue(u32 family_index) const noexcept {
+Queue Device::GetQueue(u32 family_index, u32 queue_index) const noexcept {
     VkQueue queue;
-    dld->vkGetDeviceQueue(handle, family_index, 0, &queue);
+    dld->vkGetDeviceQueue(handle, family_index, queue_index, &queue);
     return Queue(queue, *dld);
 }
 

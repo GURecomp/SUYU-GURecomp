@@ -62,16 +62,26 @@ struct OwnServerStatus {
 };
 OwnServerStatus GetOwnServerStatus();
 
-/// game_settings.ini [Multiplayer] backend: room (default) or ryuldn. With ryuldn, local wireless
-/// play goes through RyuLdn master servers (Ryujinx's lobby servers: ryuldn_host, default
-/// ldn.ryujinx.app, plus ryuldn_servers) for the whole run; room hosting/joining is then off.
-/// Call once, before the game is loaded. False (with a log line) when the setting is unknown.
+/// Where local wireless play goes: a suyu room, RyuLdn master servers (Ryujinx's lobby servers:
+/// ryuldn_host, default ldn.ryujinx.app, plus ryuldn_servers), or both at once.
+///  - Room: only suyu rooms (the default).
+///  - RyuLdn: only RyuLdn servers; room hosting/joining is off.
+///  - Auto: lobbies of both are listed and joined through whichever they came from, and a lobby
+///    this game hosts is open to both: Ryujinx players join on the server, suyu players in the
+///    room, all in one lobby (Network::RyuLdn::RoomBridge).
+/// [Multiplayer] backend = room | ryuldn | auto. The mode can change while the game runs.
+enum class LdnMode { Room, RyuLdn, Auto };
+/// Sets both transports up and picks the mode game_settings.ini names. Call once, before the game
+/// is loaded. False (with a log line) when the setting is unknown (room is used then).
 bool SetupLdnBackend();
-/// ryuldn was chosen at start.
+LdnMode CurrentLdnMode();
+/// RyuLdn servers are in use (mode RyuLdn or Auto).
 bool UsingRyuLdn();
-/// What game_settings.ini says now (the menu's switch; takes effect at the next start).
-bool RyuLdnChosenInSettings();
-void ChooseBackend(bool ryuldn);
+/// Saves the mode and applies it at once (sockets, next local-play session, bridge). false + *error
+/// while a lobby is open.
+bool SetLdnMode(LdnMode mode, std::string* error);
+/// The bridge's state for the menu ("" unless the mode is Auto).
+std::string BridgeStatusText();
 /// One line about the RyuLdn connection for the menu ("" when the backend is room); the
 /// server's address isn't in it (RyuLdnServer, shown on request).
 std::string RyuLdnStatusText();
@@ -118,6 +128,9 @@ bool Join(const Config& config, std::string* error);
 /// Leaves the room and closes it if this process hosts it.
 void Leave();
 
+/// At exit: stops the room bridge (its threads use the network objects).
+void Shutdown();
+
 /// One-line state ("Joined MHGU (2/4) as Hunter") plus the member list, for the panel.
 std::string StatusText();
 
@@ -131,11 +144,15 @@ struct Status {
     std::string room;
     std::string nickname;
     std::vector<std::string> members; // "Name (Game)"
+    std::vector<std::string> names;   // the bare nicknames, same order (for Kick)
     u32 slots{};
     std::string last_error;
     int reconnect_attempt{}; // while Reconnecting
 };
 Status GetStatus();
+
+/// Hosting only: removes that player from the room. They can rejoin; the room has no ban list here.
+bool Kick(const std::string& nickname);
 
 /// Short form for the window title: "" offline, "Online 2/4", "Reconnecting...", or a recent
 /// event ("Mira joined") for a few seconds.

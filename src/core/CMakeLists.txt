@@ -20,6 +20,8 @@ add_library(core STATIC
     arm/recomp/mod_host_api.h
     arm/recomp/nvn_census.cpp
     arm/recomp/nvn_census.h
+    arm/recomp/nvn_rec.cpp
+    arm/recomp/nvn_rec.h
     arm/recomp/nvn_shadow.cpp
     arm/recomp/nvn_shadow.h
     arm/recomp/nvn_trace.cpp
@@ -748,6 +750,8 @@ add_library(core STATIC
     hle/service/lbl/lbl.h
     hle/service/ldn/client_process_monitor.cpp
     hle/service/ldn/client_process_monitor.h
+    hle/service/ldn/hybrid_network.cpp
+    hle/service/ldn/hybrid_network.h
     hle/service/ldn/lan_discovery.cpp
     hle/service/ldn/lan_discovery.h
     hle/service/ldn/ldn_network.h
