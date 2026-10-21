@@ -8,11 +8,14 @@
 
 #include <limits>
 
+#include <boost/container/small_vector.hpp>
+
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -167,6 +170,40 @@ public:
         return limit_dynamic_storage_buffers;
     }
 
+    /// Multi-range storage buffers ([Debug] multi_range_buffers, read once at construction).
+    [[nodiscard]] bool MultiRangeEnabled() const noexcept {
+        return multi_range_enabled;
+    }
+
+    void ResetMultiRange() noexcept {
+        multi_range_sources.clear();
+        multi_range_total = 0;
+    }
+
+    void PushMultiRangeSource(const Buffer& buffer, u32 offset, u32 size) {
+        multi_range_sources.push_back(MultiRangeSource{
+            .handle = buffer.Handle(),
+            .offset = offset,
+            .size = size,
+            .write_tick = buffer.getWriteTick(),
+        });
+        multi_range_total += size;
+    }
+
+    /// Binds the gathered buffer for `key` as the next storage descriptor. False: nothing was
+    /// bound, the caller binds the ordinary way.
+    bool BindMultiRangeStorageBuffer(u64 key, bool is_written);
+
+    void InvalidateMultiRange(u64 key) {
+        multi_range_buffers.Invalidate(key);
+    }
+
+    void OnBufferDeleted(const Buffer& buffer) {
+        if (multi_range_enabled) {
+            multi_range_buffers.DropOwner(scheduler, buffer.Handle());
+        }
+    }
+
     u32 GetMaxDynamicStorageBuffers() const {
         return max_dynamic_storage_buffers;
     }
@@ -196,6 +233,15 @@ private:
 
     std::unique_ptr<Uint8Pass> uint8_pass;
     QuadIndexedPass quad_index_pass;
+
+    MultiRangeBufferCache multi_range_buffers;
+    boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
+    VkDeviceSize multi_range_total{};
+    bool multi_range_enabled{};
+    u64 multi_range_binds{};
+    u64 multi_range_gathers{};
+    u64 multi_range_gather_bytes{};
+    u64 multi_range_fallbacks{};
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();

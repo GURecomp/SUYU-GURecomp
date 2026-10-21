@@ -95,6 +95,12 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdBeginTransformFeedbackEXT);
     X(vkCmdBeginDebugUtilsLabelEXT);
     X(vkCmdBindDescriptorSets);
+    X(vkCmdBindDescriptorBuffersEXT);
+    X(vkCmdSetDescriptorBufferOffsetsEXT);
+    X(vkGetBufferDeviceAddress);
+    X(vkGetDescriptorEXT);
+    X(vkGetDescriptorSetLayoutSizeEXT);
+    X(vkGetDescriptorSetLayoutBindingOffsetEXT);
     X(vkCmdBindIndexBuffer);
     X(vkCmdBindPipeline);
     X(vkCmdBindTransformFeedbackBuffersEXT);

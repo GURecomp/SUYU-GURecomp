@@ -315,6 +315,7 @@ public:
 
     Id local_memory{};
 
+    bool uses_explicit_workgroup_layout{};
     Id shared_memory_u8{};
     Id shared_memory_u16{};
     Id shared_memory_u32{};
@@ -364,6 +365,7 @@ public:
     Id frag_depth{};
 
     std::vector<Id> interfaces;
+    std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -374,6 +376,11 @@ public:
 
     // Sirit::Id doesn't play nice with *::set<>
     ankerl::unordered_dense::set<u32> non_uniform_ids;
+
+    bool uses_nonuniform_sampled_image{};
+    bool uses_nonuniform_storage_image{};
+    bool uses_nonuniform_uniform_texel_buffer{};
+    bool uses_nonuniform_storage_texel_buffer{};
 
 private:
     void DefineCommonTypes(const Info& info);

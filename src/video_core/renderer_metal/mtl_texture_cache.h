@@ -41,6 +41,8 @@ public:
     // TODO: implement
     void Finish() {}
 
+    void FlushDeferredClear() {}
+
     void TickFrame();
 
     StagingBufferRef UploadStagingBuffer(size_t size);

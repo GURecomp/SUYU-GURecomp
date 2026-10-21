@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -35,6 +36,21 @@
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
+
+namespace {
+/// SetThreadSkipsRasterizerDownload(true) on this thread.
+thread_local bool t_skip_rasterizer_download = false;
+/// Rasterizer downloads requested from a thread that is not a CPU core thread (see HandleRasterizerDownload).
+std::atomic<u64> g_noncore_downloads{0};
+} // namespace
+
+void SetThreadSkipsRasterizerDownload(bool skip) {
+    t_skip_rasterizer_download = skip;
+}
+
+u64 NonCoreRasterizerDownloads() {
+    return g_noncore_downloads.load(std::memory_order_relaxed);
+}
 
 static inline bool AddressSpaceContains(const Common::PageTable& table, const Common::ProcessAddress addr, const std::size_t size) {
     const Common::ProcessAddress max_addr = 1ULL << table.GetAddressSpaceBits();
@@ -613,6 +629,14 @@ struct Memory::Impl {
             GetInteger(vaddr), []() {}, []() {});
     }
 
+    /// Host pointer of vaddr when its page is plain memory (the page entry holds a pointer: the case where Read/ReadBlock
+    /// copy straight from it), else nullptr (unmapped, debug or rasterizer-cached: use ReadBlock). Never calls the GPU.
+    [[nodiscard]] const u8* GetPlainPointer(u64 vaddr) const {
+        if (!AddressSpaceContains(*current_page_table, vaddr, 1)) return nullptr;
+        const uintptr_t pointer = Common::PageTable::PageInfo::ExtractPointer(current_page_table->entries[vaddr >> YUZU_PAGEBITS].ptr.Raw());
+        return pointer ? reinterpret_cast<const u8*>(pointer + vaddr) : nullptr;
+    }
+
     /// @brief Reads a particular data type out of memory at the given virtual address.
     /// @param vaddr The virtual address to read the data type from.
     /// @tparam T The data type to read out of memory.
@@ -677,12 +701,36 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+        const size_t core = system.GetCurrentHostThreadID();
+        if (core >= Core::Hardware::NUM_CPU_CORES) [[unlikely]] {
+            // Not a CPU core thread (host thread id UINT8_MAX: renderer, workers, GPU or service threads). The per-core
+            // read area and scratch buffer have NUM_CPU_CORES slots, so indexing them with this id wrote past both
+            // arrays. Same download, with a local area (no cache across calls) and a local scratch buffer.
+            g_noncore_downloads.fetch_add(1, std::memory_order_relaxed);
+            if (t_skip_rasterizer_download) {
+                return; // SetThreadSkipsRasterizerDownload: this thread reads guest memory as it is (like ReadBlockUnsafe)
+            }
+            const auto* p = GetPointerImpl(
+                v_address, []() {}, []() {});
+            if (!gpu_device_memory) [[unlikely]] {
+                gpu_device_memory = &system.Host1x().MemoryManager();
+            }
+            VideoCore::RasterizerDownloadArea area{};
+            Common::ScratchBuffer<u32> scratch;
+            gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
+                const DAddr end_address = address + size;
+                if (area.start_address <= address && end_address <= area.end_address) {
+                    return;
+                }
+                area = system.GPU().OnCPURead(address, size);
+            });
+            return;
+        }
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
-        const size_t core = system.GetCurrentHostThreadID();
         auto& current_area = rasterizer_read_areas[core];
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
@@ -852,6 +900,10 @@ u8* Memory::GetPointer(Common::ProcessAddress vaddr) {
 
 u8* Memory::GetPointerSilent(Common::ProcessAddress vaddr) {
     return impl->GetPointerSilent(vaddr);
+}
+
+const u8* Memory::GetPlainPointer(Common::ProcessAddress vaddr) const {
+    return impl->GetPlainPointer(GetInteger(vaddr));
 }
 
 const u8* Memory::GetPointer(Common::ProcessAddress vaddr) const {

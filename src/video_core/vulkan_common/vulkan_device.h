@@ -36,6 +36,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
     FEATURE(EXT, DescriptorIndexing, DESCRIPTOR_INDEXING, descriptor_indexing)                     \
     FEATURE(EXT, HostQueryReset, HOST_QUERY_RESET, host_query_reset)                               \
     FEATURE(KHR, 8BitStorage, 8BIT_STORAGE, bit8_storage)                                          \
+    FEATURE(KHR, BufferDeviceAddress, BUFFER_DEVICE_ADDRESS, buffer_device_address)                \
     FEATURE(KHR, TimelineSemaphore, TIMELINE_SEMAPHORE, timeline_semaphore)
 
 #define FOR_EACH_VK_FEATURE_1_3(FEATURE)                                                           \
@@ -55,6 +56,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
     FEATURE(EXT, CustomBorderColor, CUSTOM_BORDER_COLOR, custom_border_color)                      \
     FEATURE(EXT, DepthBiasControl, DEPTH_BIAS_CONTROL, depth_bias_control)                         \
     FEATURE(EXT, DepthClipControl, DEPTH_CLIP_CONTROL, depth_clip_control)                         \
+    FEATURE(EXT, DescriptorBuffer, DESCRIPTOR_BUFFER, descriptor_buffer)                           \
     FEATURE(EXT, ExtendedDynamicState, EXTENDED_DYNAMIC_STATE, extended_dynamic_state)             \
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
@@ -73,6 +75,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, WorkgroupMemoryExplicitLayout, WORKGROUP_MEMORY_EXPLICIT_LAYOUT,                  \
             workgroup_memory_explicit_layout)                                                      \
+    FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
     FEATURE(EXT, TextureCompressionASTCHDR, TEXTURE_COMPRESSION_ASTC_HDR,                          \
             texture_compression_astc_hdr)
 
@@ -278,6 +281,12 @@ public:
         return nvn_queue_separate;
     }
 
+    /// VK_KHR_external_memory_win32 + VK_KHR_external_semaphore_win32 were enabled for the FSR 4 bridge
+    /// ([Debug] nvn_fsr_backend = 4 only).
+    bool HasFsr4Interop() const {
+        return fsr4_interop;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
@@ -379,6 +388,18 @@ FN_MAX_LIMIT_LIST
 
     bool IsSampledImageArrayNonUniformIndexingSupported() const {
         return features.descriptor_indexing.shaderSampledImageArrayNonUniformIndexing;
+    }
+
+    bool IsStorageImageArrayNonUniformIndexingSupported() const {
+        return features.descriptor_indexing.shaderStorageImageArrayNonUniformIndexing;
+    }
+
+    bool IsUniformTexelBufferArrayNonUniformIndexingSupported() const {
+        return features.descriptor_indexing.shaderUniformTexelBufferArrayNonUniformIndexing;
+    }
+
+    bool IsStorageTexelBufferArrayNonUniformIndexingSupported() const {
+        return features.descriptor_indexing.shaderStorageTexelBufferArrayNonUniformIndexing;
     }
 
     /// Returns true if the device supports float64 natively.
@@ -518,6 +539,29 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_KHR_workgroup_memory_explicit_layout.
     bool IsKhrWorkgroupMemoryExplicitLayoutSupported() const {
         return extensions.workgroup_memory_explicit_layout;
+    }
+
+    bool IsWorkgroupMemoryExplicitLayout8BitAccessSupported() const {
+        return extensions.workgroup_memory_explicit_layout &&
+               features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout8BitAccess &&
+               features.shader_float16_int8.shaderInt8;
+    }
+
+    bool IsWorkgroupMemoryExplicitLayout16BitAccessSupported() const {
+        return extensions.workgroup_memory_explicit_layout &&
+               features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout16BitAccess &&
+               features.features.shaderInt16;
+    }
+
+    /// Returns true if the device supports VK_KHR_shader_quad_control.
+    bool IsKhrShaderQuadControlSupported() const {
+        return extensions.shader_quad_control && features.shader_quad_control.shaderQuadControl;
+    }
+
+    /// Largest subgroup size the device can run a shader with.
+    u32 GetMaxSubgroupSize() const {
+        return (std::max)(properties.subgroup_properties.subgroupSize,
+                          properties.subgroup_size_control.maxSubgroupSize);
     }
 
     /// Returns true if the device supports VK_KHR_image_format_list.
@@ -772,6 +816,11 @@ FN_MAX_LIMIT_LIST
         return extensions.shader_atomic_int64;
     }
 
+    bool IsSharedInt64AtomicsSupported() const {
+        return extensions.shader_atomic_int64 &&
+               features.shader_atomic_int64.shaderSharedInt64Atomics;
+    }
+
     bool IsExtConditionalRendering() const {
         return extensions.conditional_rendering;
     }
@@ -854,6 +903,26 @@ FN_MAX_LIMIT_LIST
 
     bool HasNullDescriptor() const {
         return features.robustness2.nullDescriptor;
+    }
+
+    /// True when guest graphics pipelines may use VK_EXT_descriptor_buffer: the device supports it
+    /// (with buffer device address, bufferless push descriptors and null descriptors) and
+    /// game_settings.ini [Debug] descriptor_buffer is on. Buffer device address is enabled only then.
+    bool IsDescriptorBufferEnabled() const {
+        return descriptor_buffer_enabled;
+    }
+
+    /// Why descriptor buffers are off ("" when enabled).
+    const std::string& DescriptorBufferDisabledReason() const {
+        return descriptor_buffer_reason;
+    }
+
+    const VkPhysicalDeviceDescriptorBufferPropertiesEXT& DescriptorBufferProperties() const {
+        return properties.descriptor_buffer;
+    }
+
+    bool IsRobustBufferAccessEnabled() const {
+        return features.features.robustBufferAccess == VK_TRUE;
     }
 
     bool MustEmulateBGR565() const;
@@ -1027,6 +1096,7 @@ private:
     vk::Queue present_queue;     ///< Main present queue.
     vk::Queue nvn_queue;         ///< Second graphics queue for the NVN renderer (same as graphics_queue if the family has one).
     bool nvn_queue_separate{};
+    std::mutex queue_mutex;      ///< Guards graphics_queue (also present_queue / nvn_queue when they alias it).
     mutable u32 nvn_queue_count_requested{1};
     u32 instance_version{};      ///< Vulkan instance version.
     u32 graphics_family{};       ///< Main graphics queue family index.
@@ -1073,6 +1143,7 @@ private:
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
+        VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
 
         VkPhysicalDeviceProperties properties{};
     };
@@ -1090,6 +1161,8 @@ private:
     bool is_blit_depth32_stencil8_supported{}; ///< Support for blitting from and to D32S8.
     bool is_warp_potentially_bigger{};         ///< Host warp size can be bigger than guest.
     bool is_integrated{};                      ///< Is GPU an iGPU.
+    bool descriptor_buffer_enabled{};          ///< VK_EXT_descriptor_buffer in use (see getter).
+    std::string descriptor_buffer_reason;      ///< Why descriptor buffers are off.
     bool is_virtual{};                         ///< Is GPU a virtual GPU.
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
@@ -1100,6 +1173,7 @@ private:
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.
     bool supports_d24_depth{};                 ///< Supports D24 depth buffers.
     bool cant_blit_msaa{};                     ///< Does not support MSAA<->MSAA blitting.
+    bool fsr4_interop{};                       ///< D3D12 sharing extensions enabled (nvn_fsr_backend = 4).
     bool must_emulate_scaled_formats{};        ///< Requires scaled vertex format emulation
     bool dynamic_state3_blending{};            ///< Has blending features of dynamic_state3.
     bool dynamic_state3_enables{};             ///< Has at least one enable feature of dynamic_state3.

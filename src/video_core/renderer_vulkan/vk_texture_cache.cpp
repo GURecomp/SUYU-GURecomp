@@ -940,6 +940,10 @@ void TextureCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
+void TextureCacheRuntime::FlushDeferredClear() {
+    scheduler.FlushDeferredClear();
+}
+
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
     return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
 }
@@ -2517,6 +2521,8 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     renderpass_key.samples = samples;
 
     renderpass = runtime.render_pass_cache.Get(renderpass_key);
+    render_pass_cache = &runtime.render_pass_cache;
+    render_pass_key = renderpass_key;
     render_area.width = (std::min)(render_area.width, width);
     render_area.height = (std::min)(render_area.height, height);
 
@@ -2532,6 +2538,17 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         .height = render_area.height,
         .layers = static_cast<u32>((std::max)(num_layers, 1)),
     });
+}
+
+VkRenderPass Framebuffer::RenderPassVariant(u32 color_clear_mask,
+                                            bool depth_stencil_clear) const {
+    if (color_clear_mask == 0 && !depth_stencil_clear) {
+        return renderpass;
+    }
+    RenderPassKey key = render_pass_key;
+    key.color_clear_mask = color_clear_mask;
+    key.depth_stencil_clear = depth_stencil_clear;
+    return render_pass_cache->Get(key);
 }
 
 void TextureCacheRuntime::AccelerateImageUpload(

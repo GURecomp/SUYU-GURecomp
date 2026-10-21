@@ -67,6 +67,8 @@ add_library(
     fs/path_util.cpp
     fs/path_util.h
     hash.h
+    host_key.cpp
+    host_key.h
     heap_tracker.cpp
     heap_tracker.h
     hex_util.cpp
@@ -76,6 +78,8 @@ add_library(
     input.h
     intrusive_red_black_tree.h
     literals.h
+    log_redact.cpp
+    log_redact.h
     logging.cpp
     logging.h
     gpu_probe.h

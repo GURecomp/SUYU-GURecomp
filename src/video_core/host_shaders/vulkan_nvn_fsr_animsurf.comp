@@ -1,0 +1,157 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_fsr_animsurf: surfaces that change while they do not move (baked texture / UV
+// flipbook animations: banners are flat sheets whose pattern steps at ~24-30 fps, so neither geometry nor motion
+// vectors see the change and FSR blends the old pattern into the new one).
+// One workgroup = one 8x8 tile. Per texel, except where a geometry object vector says the surface really moves
+// (|object - camera| >= 0.25 px; flags bit 2 = object vectors present this frame; static draws excluded from the
+// capture have none and use the camera vector):
+//  - d = MIN over a 3x3 search (+-1 px) around the reprojected position (object / camera vector + the change of the
+//    jitter picture shift) of the max channel difference between the 4x4 box mean of the current input and that of the
+//    previous input. A thin line or edge that shifted by a sub-pixel amount finds a match within the search; the
+//    interior of a flipbook step does not.
+// Tile decision: score = mean d over the evaluated texels (>= 16); raw flag = score > thr AND >= 40% of the evaluated
+// texels have d > thr (area-coherent change, not a few edge texels). Edge gate (flags bit 3, [Debug]
+// nvn_fsr_animsurf_edge_gate): the tile's linear depth range must be < 5% of its nearest depth (flat sheet interior,
+// no depth discontinuity: ropes, rigging, silhouettes fail).
+// Output tile texel (RGBA8): r = bypass / reactive weight now (1 = passed and the tile was also flagged within the last
+// 12 frames: the cadence repeats; 0.35 = passed for the first time; 0 = not flagged), g = frames since the last pass /
+// 255, b = r of the previous frame, a = 1, or 0.5 when the raw flag was rejected by the edge gate (debug PNG).
+// Counters (flags bit 0): [0] passed tiles, [1] evaluated tiles, [2] sum of the frames between passes of a tile
+// (periods <= 60), [3] number of such periods, [4] raw flags rejected by the edge gate, [5] passed with full weight.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D col_cur;  // linear
+layout(set = 0, binding = 1) uniform sampler2D col_prev; // linear
+layout(set = 0, binding = 2) uniform sampler2D vel_tex;  // nearest
+layout(set = 0, binding = 3) uniform sampler2D cam_mv;   // nearest
+layout(set = 0, binding = 4) uniform sampler2D tile_prev;
+layout(set = 0, binding = 5) uniform writeonly image2D tile_out;
+layout(set = 0, binding = 6, r32ui) uniform uimage2D stats;
+layout(set = 0, binding = 7) uniform sampler2D scene_depth; // nearest
+
+layout(push_constant) uniform PushConstants {
+    uint flags; // bit 0 counters, bit 1 previous frame valid, bit 2 object vectors valid, bit 3 edge gate, bit 4 linear depth
+    float jd_x;
+    float jd_y;
+    float thr;
+    float p22; // linear depth = p32 / (z + p22)
+    float p32;
+    float pad0;
+    float pad1;
+} pc;
+
+shared uint s_sum;
+shared uint s_n;
+shared uint s_hot;
+shared uint s_zmin;
+shared uint s_zmax;
+
+vec3 Box(sampler2D t, vec2 c, vec2 texel) {
+    // 4 bilinear taps on texel corners = the 4x4 texel mean around c
+    return 0.25 * (textureLod(t, (c + vec2(-1.0, -1.0)) * texel, 0.0).rgb + textureLod(t, (c + vec2(1.0, -1.0)) * texel, 0.0).rgb +
+                   textureLod(t, (c + vec2(-1.0, 1.0)) * texel, 0.0).rgb + textureLod(t, (c + vec2(1.0, 1.0)) * texel, 0.0).rgb);
+}
+
+float LinearDepth(float z) {
+    return (pc.flags & 16u) != 0u ? pc.p32 / (z + pc.p22) : z;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        s_sum = 0u;
+        s_n = 0u;
+        s_hot = 0u;
+        s_zmin = 0x7f7fffffu;
+        s_zmax = 0u;
+    }
+    barrier();
+    const ivec2 size = textureSize(col_cur, 0);
+    const vec2 texel = 1.0 / vec2(size);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < size.x && p.y < size.y) {
+        // depth range of the tile and its 1-texel border (the border texel of the edge threads)
+        const ivec2 dsize = textureSize(scene_depth, 0);
+        const ivec2 lp = ivec2(gl_LocalInvocationID.xy);
+        const ivec2 ext = ivec2(lp.x == 0 ? -1 : lp.x == 7 ? 1 : 0, lp.y == 0 ? -1 : lp.y == 7 ? 1 : 0);
+        const float z0 = LinearDepth(texelFetch(scene_depth, clamp(p, ivec2(0), dsize - 1), 0).r);
+        const float z1 = LinearDepth(texelFetch(scene_depth, clamp(p + ext, ivec2(0), dsize - 1), 0).r);
+        if (z0 > 0.0 && z1 > 0.0) {
+            atomicMin(s_zmin, floatBitsToUint(min(z0, z1)));
+            atomicMax(s_zmax, floatBitsToUint(max(z0, z1)));
+        }
+    }
+    if ((pc.flags & 2u) != 0u && p.x < size.x && p.y < size.y) {
+        const vec4 v = texelFetch(vel_tex, p, 0);
+        const vec2 cam = texelFetch(cam_mv, p, 0).rg;
+        const bool has_obj = (pc.flags & 4u) != 0u && v.b > 0.5;
+        if (!has_obj || length(v.rg - cam) < 0.25) {
+            const vec2 c = vec2(p) + 0.5;
+            const vec2 q = c + (has_obj ? v.rg : cam) + vec2(pc.jd_x, pc.jd_y);
+            if (q.x >= 3.0 && q.y >= 3.0 && q.x <= float(size.x) - 3.0 && q.y <= float(size.y) - 3.0) {
+                const vec3 cur = Box(col_cur, c, texel);
+                float d = 1e9;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const vec3 d3 = abs(cur - Box(col_prev, q + vec2(dx, dy), texel));
+                        d = min(d, max(d3.r, max(d3.g, d3.b)));
+                    }
+                }
+                atomicAdd(s_sum, uint(min(d, 1.0) * 4096.0));
+                atomicAdd(s_n, 1u);
+                if (d > pc.thr) {
+                    atomicAdd(s_hot, 1u);
+                }
+            }
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex != 0u) {
+        return;
+    }
+    const ivec2 tile = ivec2(gl_WorkGroupID.xy);
+    if (any(greaterThanEqual(tile, imageSize(tile_out)))) {
+        return;
+    }
+    const bool prev_ok = (pc.flags & 2u) != 0u;
+    const vec4 tp = prev_ok ? texelFetch(tile_prev, tile, 0) : vec4(0.0, 1.0, 0.0, 1.0);
+    const bool evaluated = s_n >= 16u;
+    const bool raw = evaluated && float(s_sum) / 4096.0 / float(s_n) > pc.thr && float(s_hot) >= 0.4 * float(s_n);
+    bool flat_ok = true;
+    if ((pc.flags & 8u) != 0u) {
+        const float zmin = uintBitsToFloat(s_zmin), zmax = uintBitsToFloat(s_zmax);
+        flat_ok = s_zmax != 0u && zmax >= zmin && (zmax - zmin) < 0.05 * max(zmin, 1e-6);
+    }
+    const bool pass = raw && flat_ok;
+    const float since = floor(tp.g * 255.0 + 0.5);
+    float next = min(since + 1.0, 255.0);
+    float w = 0.0;
+    if (pass) {
+        const bool repeat = prev_ok && since < 12.0;
+        w = repeat ? 1.0 : 0.35;
+        if ((pc.flags & 1u) != 0u && prev_ok && since < 60.0) {
+            imageAtomicAdd(stats, ivec2(2, 0), uint(since + 1.0));
+            imageAtomicAdd(stats, ivec2(3, 0), 1u);
+        }
+        next = 0.0;
+    }
+    if ((pc.flags & 1u) != 0u) {
+        if (pass) {
+            imageAtomicAdd(stats, ivec2(0, 0), 1u);
+        }
+        if (pass && w > 0.5) {
+            imageAtomicAdd(stats, ivec2(5, 0), 1u);
+        }
+        if (evaluated) {
+            imageAtomicAdd(stats, ivec2(1, 0), 1u);
+        }
+        if (raw && !flat_ok) {
+            imageAtomicAdd(stats, ivec2(4, 0), 1u);
+        }
+    }
+    imageStore(tile_out, tile, vec4(w, next / 255.0, tp.r, raw && !flat_ok ? 0.5 : 1.0));
+}

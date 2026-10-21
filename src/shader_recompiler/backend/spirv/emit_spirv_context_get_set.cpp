@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
@@ -624,12 +624,14 @@ Id EmitRenderArea(EmitContext& ctx) {
 }
 
 Id EmitLoadLocal(EmitContext& ctx, Id word_offset) {
-    const Id pointer{ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset)};
+    const Id pointer{
+        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
     return ctx.OpLoad(ctx.U32[1], pointer);
 }
 
 void EmitWriteLocal(EmitContext& ctx, Id word_offset, Id value) {
-    const Id pointer{ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset)};
+    const Id pointer{
+        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
     ctx.OpStore(pointer, value);
 }
 

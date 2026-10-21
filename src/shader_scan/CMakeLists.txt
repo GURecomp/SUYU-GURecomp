@@ -8,4 +8,11 @@ target_link_libraries(shader-scan PRIVATE common shader_recompiler)
 # Headless Vulkan check: build a real graphics pipeline for every program of a package on
 # this machine's GPU, through the same device/profile/layout code the Vulkan backend uses.
 add_executable(pipeline-test pipeline_test.cpp)
-target_link_libraries(pipeline-test PRIVATE common shader_recompiler video_core)
+# core (query_service.cpp) references PlayTime symbols provided by frontend_common, and
+# frontend_common depends on core, so the static libraries must be resolved as a group.
+if (UNIX AND NOT APPLE)
+    target_link_libraries(pipeline-test PRIVATE common shader_recompiler
+        "-Wl,--start-group" video_core frontend_common core "-Wl,--end-group")
+else()
+    target_link_libraries(pipeline-test PRIVATE common shader_recompiler video_core frontend_common)
+endif()

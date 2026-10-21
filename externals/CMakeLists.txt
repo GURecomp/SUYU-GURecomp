@@ -89,6 +89,11 @@ endif()
 # Vulkan stuff
 AddDependentPackages(vulkan-headers vulkan-utility-libraries)
 
+# FSR 3.1 Vulkan upscaler (vendored subset of FireBurn/FSR-Vulkan, see fsr-vulkan/README.md)
+if (SUYU_FSR_VULKAN)
+    add_subdirectory(fsr-vulkan)
+endif()
+
 # frozen
 AddJsonPackage(frozen)
 

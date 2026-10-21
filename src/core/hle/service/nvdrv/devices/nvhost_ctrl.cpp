@@ -126,14 +126,14 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
 
     if (syncpoint_manager.IsFenceSignalled(params.fence)) {
         params.value.raw = syncpoint_manager.ReadSyncpointMinValue(fence_id);
-        note_wait(0, Kernel::StallRing::NowMs(), Kernel::StallRing::NowMs());
+        note_wait(0, Kernel::StallRing::NowIfOn(), Kernel::StallRing::NowIfOn());
         return NvResult::Success;
     }
 
     if (const auto new_value = syncpoint_manager.UpdateMin(fence_id);
         syncpoint_manager.IsFenceSignalled(params.fence)) {
         params.value.raw = new_value;
-        note_wait(0, Kernel::StallRing::NowMs(), Kernel::StallRing::NowMs());
+        note_wait(0, Kernel::StallRing::NowIfOn(), Kernel::StallRing::NowIfOn());
         return NvResult::Success;
     }
 
@@ -155,13 +155,13 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
 
     const auto check_failing = [&]() {
         if (events[slot].fails > 2) {
-            const double stall_t0 = Kernel::StallRing::NowMs();
+            const double stall_t0 = Kernel::StallRing::NowIfOn();
             {
                 auto lk = system.StallApplication();
                 host1x_syncpoint_manager.WaitHost(fence_id, target_value);
                 system.UnstallApplication();
             }
-            note_wait(3, stall_t0, Kernel::StallRing::NowMs());
+            note_wait(3, stall_t0, Kernel::StallRing::NowIfOn());
             params.value.raw = target_value;
             return true;
         }
@@ -173,7 +173,7 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     }
 
     if (params.timeout == 0) {
-        note_wait(2, Kernel::StallRing::NowMs(), Kernel::StallRing::NowMs());
+        note_wait(2, Kernel::StallRing::NowIfOn(), Kernel::StallRing::NowIfOn());
         if (check_failing()) {
             events[slot].fails = 0;
             return NvResult::Success;
@@ -198,7 +198,7 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
 
     params.value.raw = 0;
 
-    note_wait(1, Kernel::StallRing::NowMs(), Kernel::StallRing::NowMs());
+    note_wait(1, Kernel::StallRing::NowIfOn(), Kernel::StallRing::NowIfOn());
     event.status.store(EventState::Waiting, std::memory_order_release);
     event.assigned_syncpt = fence_id;
     event.assigned_value = target_value;
@@ -213,8 +213,8 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     event.wait_handle =
         host1x_syncpoint_manager.RegisterHostAction(fence_id, target_value, [this, slot, fence_id, target_value]() {
             Kernel::StallRing::Add(Kernel::StallRing::CtrlWait, Kernel::StallRing::t_gtid, 4, 0,
-                                   fence_id, target_value, Kernel::StallRing::NowMs(),
-                                   Kernel::StallRing::NowMs());
+                                   fence_id, target_value, Kernel::StallRing::NowIfOn(),
+                                   Kernel::StallRing::NowIfOn());
             auto& event_ = events[slot];
             if (event_.status.exchange(EventState::Signalling, std::memory_order_acq_rel) ==
                 EventState::Waiting) {

@@ -5,12 +5,15 @@
 
 #include <string>
 
+#include "common/common_types.h"
+
 #include <vulkan/vulkan.h>
 
 namespace Vulkan {
 
 class Device;
 class MemoryAllocator;
+class MasterSemaphore;
 
 /// G3c: our own Vulkan renderer for the game's NVN calls (core/arm/recomp/nvn_rec). In shadow mode
 /// (game_settings.ini [Debug] nvn_vulkan = shadow) it renders the same frames into images of its own
@@ -23,6 +26,10 @@ void NvnVkWaitRenderIdle();
 /// Present mode (nvn_vulkan = present): the newest frame the game presented, as a finished copy in
 /// GENERAL layout that suyu's compositor may read. False until the first frame exists.
 bool NvnVkPresentImage(VkImage& image, unsigned& width, unsigned& height);
+/// Present mode with [Debug] present_nodrain: called by the composite right after it recorded its read of the image
+/// NvnVkPresentImage returned. `tick` = the scheduler tick whose completion ends that read (scheduler.CurrentTick()
+/// before the Flush); the ring slot is not written again before the GPU reached it. No-op in drain mode.
+void NvnVkPresentImageUsed(MasterSemaphore& sem, u64 tick);
 /// Frame counter shared by the comparison dumps (ticked once per suyu composite).
 unsigned NvnVkSuyuFrame();
 void NvnVkSuyuFrameTick();
@@ -30,10 +37,14 @@ void NvnVkSuyuFrameTick();
 bool NvnVkCaptureActive();
 /// Appends text to a file in suyu's user directory (comparison dumps).
 void NvnVkDumpLine(const char* file, const std::string& text);
+/// Appends buffered dump lines (nvn_bq.txt is written about once a second) now.
+void NvnVkFlushDumpLines();
 /// Present-path probe (logging only, present mode): stage 0 at Composite entry, 1 after the present.
 void NvnVkCompositeProbe(int stage);
 /// Shared probe clock (steady_clock, ms) so all wiggle-hitch logs line up.
 double NvnVkNowMs();
+/// Status text of the automatic benchmark ([Debug] nvn_bench) for the window title; empty when none. Thread safe.
+std::string NvnVkBenchStatus();
 void NvnVkSavePng(const char* name, unsigned w, unsigned h, const unsigned char* rgba);
 
 } // namespace Vulkan

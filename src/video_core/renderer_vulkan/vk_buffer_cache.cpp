@@ -10,6 +10,8 @@
 #include <span>
 #include <vector>
 
+#include "common/logging.h"
+#include "core/arm/recomp/game_settings.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 
@@ -68,6 +70,10 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
     }
     if (device.IsExtConditionalRendering()) {
         flags |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+    }
+    if (device.IsDescriptorBufferEnabled()) {
+        // Descriptor buffers address uniform/storage buffers by device address.
+        flags |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     const VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -340,6 +346,10 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
       staging_pool{staging_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue) {
+    multi_range_enabled = Core::GameSettings::MultiRangeBuffers();
+    if (multi_range_enabled) {
+        LOG_INFO(Render_Vulkan, "Multi-range storage buffers on (gather path)");
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                     driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
@@ -521,6 +531,54 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                0, WRITE_BARRIER);
     });
+}
+
+bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
+    if (!multi_range_enabled || is_written || multi_range_sources.empty() ||
+        multi_range_total == 0) {
+        return false;
+    }
+    const MultiRangeRef ref = multi_range_buffers.Get(device, scheduler, memory_allocator, key,
+                                                     multi_range_sources, multi_range_total);
+    if (ref.handle == VK_NULL_HANDLE) {
+        ++multi_range_fallbacks;
+        if (multi_range_fallbacks <= 20) {
+            LOG_INFO(Render_Vulkan, "Multi-range buffer {:#x}: size {:#x} not gathered",
+                     key, multi_range_total);
+        }
+        return false;
+    }
+    ++multi_range_binds;
+    if (ref.needs_gather) {
+        PreCopyBarrier();
+        VkDeviceSize dst_offset = 0;
+        for (const MultiRangeSource& source : multi_range_sources) {
+            const std::array<VideoCommon::BufferCopy, 1> copy{VideoCommon::BufferCopy{
+                .src_offset = static_cast<u64>(source.offset),
+                .dst_offset = static_cast<u64>(dst_offset),
+                .size = static_cast<size_t>(source.size),
+            }};
+            CopyBuffer(ref.handle, source.handle, copy, false);
+            dst_offset += source.size;
+        }
+        PostCopyBarrier();
+        multi_range_buffers.MarkGathered(scheduler, key);
+        ++multi_range_gathers;
+        multi_range_gather_bytes += ref.size;
+        if (multi_range_gathers <= 20) {
+            LOG_INFO(Render_Vulkan, "Multi-range buffer {:#x}: gathered {} ranges, {:#x} bytes",
+                     key, multi_range_sources.size(), ref.size);
+        }
+    }
+    if ((multi_range_binds % 5000) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Multi-range buffers: binds={}, gathers={}, gathered={} KiB, fallbacks={}, "
+                 "entries={}",
+                 multi_range_binds, multi_range_gathers, multi_range_gather_bytes / 1024,
+                 multi_range_fallbacks, multi_range_buffers.NumEntries());
+    }
+    guest_descriptor_queue.AddBuffer(ref.handle, 0, ref.size);
+    return true;
 }
 
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,

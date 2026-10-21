@@ -28,6 +28,8 @@ if (SUYU_CMD OR YUZU_CMD)
         game_menu.h
         multiplayer.cpp
         multiplayer.h
+        relaunch.cpp
+        relaunch.h
         sdl_software_keyboard.cpp
         sdl_software_keyboard.h
         precompiled_headers.h

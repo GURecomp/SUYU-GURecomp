@@ -12,6 +12,7 @@
 
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -50,6 +51,9 @@ public:
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
 
     void Finish();
+
+    /// Realizes any pending deferred clear before its framebuffer can be moved or freed.
+    void FlushDeferredClear();
 
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
@@ -166,6 +170,15 @@ public:
         return renderpass;
     }
 
+    /// Returns the render pass compatible with RenderPass() whose attachments in the given masks
+    /// use a clear load op.
+    [[nodiscard]] VkRenderPass RenderPassVariant(u32 color_clear_mask,
+                                                 bool depth_stencil_clear) const;
+
+    [[nodiscard]] const RenderPassKey& RenderPassKeyBase() const noexcept {
+        return render_pass_key;
+    }
+
     [[nodiscard]] VkExtent2D RenderArea() const noexcept {
         return render_area;
     }
@@ -209,6 +222,8 @@ public:
 private:
     vk::Framebuffer framebuffer;
     VkRenderPass renderpass{};
+    RenderPassCache* render_pass_cache{};
+    RenderPassKey render_pass_key{};
     VkExtent2D render_area{};
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     u32 num_color_buffers = 0;

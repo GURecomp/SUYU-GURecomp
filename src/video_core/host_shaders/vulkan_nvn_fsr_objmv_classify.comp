@@ -1,0 +1,131 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_fsr_bm_compact = 1: block matching pass 1a of vulkan_nvn_fsr_objmv_search.comp, split
+// off so the heavy search (shared tiles of ~9 KB per workgroup) runs only for the blocks that are searched (~8% of the
+// 8x8 blocks in a scene). One workgroup per block, bindings 0-7 and the push constants exactly as the search shader.
+// This pass is steps 0-2 of vulkan_nvn_fsr_objmv_search.comp, unchanged (camera vector, previous hold, silhouette region,
+// low-rate change count). Blocks that are not searched get the same imageStore as there; searched blocks are appended
+// to the list (binding 8) for vulkan_nvn_fsr_objmv_search_list.comp, dispatched indirectly with the count written here.
+// KEEP STEPS 0-2 IN STEP WITH vulkan_nvn_fsr_objmv_search.comp.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D col_cur;
+layout(set = 0, binding = 1) uniform sampler2D col_prev;
+layout(set = 0, binding = 2) uniform sampler2D mv_tex;
+layout(set = 0, binding = 3) uniform sampler2D mask_tex;
+layout(set = 0, binding = 4) uniform sampler2D sil_prev;
+layout(set = 0, binding = 5) uniform sampler2D depth_tex;
+layout(set = 0, binding = 6) uniform sampler2D blk_prev;
+layout(set = 0, binding = 7) uniform writeonly image2D blk_out;
+// x = workgroup count of the search dispatch (zeroed before this pass; y = z = 1), then one entry per searched block:
+// bits 0-14 block x, 15-29 block y, 31 = low-rate (jump) block (search radius 20), else silhouette block (radius 12)
+layout(set = 0, binding = 8, std430) buffer BlockList {
+    uint dispatch_x;
+    uint dispatch_y;
+    uint dispatch_z;
+    uint pad0;
+    uint list[];
+} bl;
+
+layout(push_constant) uniform PushConstants {
+    uint flags;      // bit 0 mask bound, 1 history valid (col_prev, sil_prev), 2 blk_prev valid, 3 depth params valid
+    float jd_x;      // previous picture shift - current picture shift (render px, +y down)
+    float jd_y;
+    float p22;       // projection terms: linear depth = p32 / (d + p22)
+    float p32;
+    float near_limit;
+    float chg_thr;
+    float pad;
+} pc;
+
+shared uint s_sil;
+shared uint s_chg;
+
+float Sil(ivec2 p, ivec2 size) {
+    const ivec2 msize = textureSize(mask_tex, 0);
+    const ivec2 q = clamp(ivec2((vec2(p) + 0.5) * vec2(msize) / vec2(size)), ivec2(0), msize - 1);
+    return texelFetch(mask_tex, q, 0).g;
+}
+
+void main() {
+    const ivec2 size = textureSize(col_cur, 0);
+    const ivec2 blk = ivec2(gl_WorkGroupID.xy);
+    const ivec2 o = blk * 8;
+    const ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    const uint lid = gl_LocalInvocationIndex;
+    const ivec2 bsize = imageSize(blk_out);
+    if (lid == 0u) {
+        s_sil = 0u;
+        s_chg = 0u;
+    }
+    barrier();
+    const bool hist = (pc.flags & 2u) != 0u;
+    // camera vector at the block centre (the search is centred on it)
+    vec2 cmv = texelFetch(mv_tex, clamp(o + 4, ivec2(0), size - 1), 0).rg;
+    if (any(isnan(cmv)) || any(isinf(cmv))) cmv = vec2(0.0);
+    // hold of this block's content in the previous frame (block image, reprojected by the camera vector)
+    float hold_prev = 0.0;
+    if ((pc.flags & 4u) != 0u) {
+        const ivec2 pb = ivec2(floor((vec2(o) + 4.0 + cmv) / 8.0));
+        if (all(greaterThanEqual(pb, ivec2(0))) && all(lessThan(pb, bsize))) hold_prev = texelFetch(blk_prev, pb, 0).a;
+    }
+    if (!hist) {
+        if (lid == 0u) imageStore(blk_out, blk, vec4(cmv, -1.0, 0.0));
+        return;
+    }
+    // 1. region: silhouette (16x16 around the block, stride 2 = ~4 px dilation), now or in the previous frame
+    {
+        const ivec2 t = clamp(o - 4 + 2 * l, ivec2(0), size - 1);
+        bool s = (pc.flags & 1u) != 0u && Sil(t, size) > 0.5;
+        if (!s) {
+            vec2 m = texelFetch(mv_tex, t, 0).rg;
+            if (any(isnan(m)) || any(isinf(m))) m = vec2(0.0);
+            const ivec2 q = ivec2(floor(vec2(t) + 0.5 + m));
+            s = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size)) && texelFetch(sil_prev, q, 0).r > 0.5;
+        }
+        if (s) atomicOr(s_sil, 1u);
+    }
+    // 2. region: low-rate change (this texel outside the previous input's 3x3 box at the reprojected texel, near camera)
+    {
+        const ivec2 p = min(o + l, size - 1);
+        bool near = false;
+        if ((pc.flags & 8u) != 0u) {
+            const float dist = pc.p32 / (texelFetch(depth_tex, p, 0).r + pc.p22);
+            near = dist > 0.0 && dist < pc.near_limit;
+        }
+        if (near) {
+            vec2 m = texelFetch(mv_tex, p, 0).rg;
+            if (any(isnan(m)) || any(isinf(m))) m = vec2(0.0);
+            const ivec2 q = ivec2(floor(vec2(p) + 0.5 + m));
+            if (all(greaterThanEqual(q, ivec2(1))) && all(lessThan(q, size - 1))) {
+                const vec3 cur = texelFetch(col_cur, p, 0).rgb;
+                vec3 lo = vec3(1.0), hi = vec3(0.0);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const vec3 c = texelFetch(col_prev, q + ivec2(dx, dy), 0).rgb;
+                        lo = min(lo, c);
+                        hi = max(hi, c);
+                    }
+                }
+                const vec3 ob = max(max(lo - cur, cur - hi), vec3(0.0));
+                if (max(ob.r, max(ob.g, ob.b)) > pc.chg_thr) atomicAdd(s_chg, 1u);
+            }
+        }
+    }
+    barrier();
+    if (lid != 0u) return;
+    const bool sil = s_sil != 0u;
+    const bool jump = !sil && s_chg >= 8u;
+    if (!sil && !jump) {
+        const float hold = max(hold_prev - 0.34, 0.0); // = the search shader's hold for a block that is not searched
+        imageStore(blk_out, blk, vec4(cmv, -1.0, hold));
+        return;
+    }
+    // searched: the search pass recomputes cmv itself and uses hold = jump ? 1 : 0 (silhouette blocks hold 0)
+    const uint at = atomicAdd(bl.dispatch_x, 1u);
+    bl.list[at] = uint(blk.x) | (uint(blk.y) << 15) | (jump ? 0x80000000u : 0u);
+}

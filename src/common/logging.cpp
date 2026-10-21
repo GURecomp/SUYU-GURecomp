@@ -32,6 +32,7 @@
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 
+#include "common/log_redact.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -426,9 +427,12 @@ void SetColorConsoleBackendEnabled(bool enabled) {
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) {
     if (logging_instance && logging_instance->filter.CheckMessage(log_class, log_level)) {
         auto const flush = ::Settings::values.log_flush_line.GetValue();
-        logging_instance->ForEachBackend([=](Backend& backend) {
+        // Paths / user name / computer name are redacted once, here, for every backend
+        // ([Debug] log_redact_paths in game_settings.ini; on by default).
+        auto const message = RedactText(fmt::vformat(format, args));
+        logging_instance->ForEachBackend([=, &message](Backend& backend) {
             backend.Write(Entry{
-                .message = fmt::vformat(format, args),
+                .message = message,
                 .timestamp = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - logging_instance->time_origin),
                 .log_class = log_class,
                 .log_level = log_level,

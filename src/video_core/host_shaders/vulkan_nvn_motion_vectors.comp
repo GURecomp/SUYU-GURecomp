@@ -1,0 +1,59 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_mv_pass: camera-reprojection motion vectors from the scene depth.
+//
+// Conventions (the matrices are built on the CPU in nvn_vk.cpp, MvBuildMatrices):
+//  - Game matrices are row-major, row-vector: clip = [x y z 1]_world * View * Proj. The CPU uploads a row-major
+//    matrix X unchanged; GLSL reads it column-major, so `M * c` here computes the row-vector product c * X.
+//  - Pixel p (integer, row 0 = top) has its centre at cur = p + 0.5. NDC: x = 2*cur.x/W - 1, y = 1 - 2*cur.y/H
+//    (the renderer flips Y with a negative-height viewport, so NDC +y is the top row; with the 'noflipy' option the
+//    CPU folds the flip into the matrices). Depth d is stored as NDC z (Vulkan [0,1]; the game's projection gives
+//    z_ndc = 0 at the near plane, standard, not reversed).
+//  - reproj     = inv(Proj_cur) * inv(View_cur) * View_prev * Proj_prev (unjittered projections).
+//    c = (x_ndc, y_ndc, d, 1); q = c * reproj = previous frame's clip position of the same world point.
+//  - reproj_dir = inv(Proj_cur) * Z * Rot * Proj_prev, Z = diag(1,1,1,0) (drops w: view position -> direction),
+//    Rot = rotation part of inv(View_cur) * View_prev with the translation row zeroed: a point at infinity only
+//    rotates. Used when d >= kFar (sky / far field).
+//  - prev_ndc = q.xy / q.w; prev = ((prev_ndc.x + 1) * W / 2, (1 - prev_ndc.y) * H / 2).
+//  - Output motion = prev - cur in render pixels (FSR convention: current position + motion = previous position).
+//    Points behind the previous camera (q.w <= 0) keep the raw value (the upscaler rejects them); |q.w| is kept away
+//    from 0 and the result is clamped to +-16384 px, NaN/Inf -> 0, so the image never holds NaN.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depth_tex;
+layout(set = 0, binding = 1) uniform writeonly image2D mv_out;
+
+layout(push_constant) uniform PushConstants {
+    mat4 reproj;
+    mat4 reproj_dir;
+} pc;
+
+const float kFar = 0.99999;
+
+void main() {
+    const ivec2 size = imageSize(mv_out);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+    const float d = texelFetch(depth_tex, p, 0).r;
+    const vec2 sz = vec2(size);
+    const vec2 cur = vec2(p) + 0.5;
+    const vec4 c = vec4(2.0 * cur.x / sz.x - 1.0, 1.0 - 2.0 * cur.y / sz.y, d, 1.0);
+    const vec4 q = d >= kFar ? pc.reproj_dir * c : pc.reproj * c;
+    float w = q.w;
+    if (abs(w) < 1e-12) {
+        w = w < 0.0 ? -1e-12 : 1e-12;
+    }
+    const vec2 ndc = q.xy / w;
+    const vec2 prev = vec2((ndc.x + 1.0) * 0.5 * sz.x, (1.0 - ndc.y) * 0.5 * sz.y);
+    vec2 mv = prev - cur;
+    if (isnan(mv.x) || isinf(mv.x)) mv.x = 0.0;
+    if (isnan(mv.y) || isinf(mv.y)) mv.y = 0.0;
+    mv = clamp(mv, vec2(-16384.0), vec2(16384.0));
+    imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
+}

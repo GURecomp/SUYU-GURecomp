@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #ifdef __ANDROID__
@@ -50,7 +52,21 @@ static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
         // Choose Mailbox or Immediate if unlocked and those modes are supported
         auto mode = Settings::values.vsync_mode.GetValue();
         // exported games: game_settings.ini [Display] vsync decides
-        if (const std::string v = Core::GameSettings::Value("Display", "vsync"); !v.empty()) {
+        // This runs on every present (NeedsPresentModeUpdate): the ini is parsed only again after an in-game SetValue,
+        // not per frame. (Editing the file by hand while the game runs is picked up at the next restart, as documented.)
+        static std::mutex vsync_lock;
+        static u64 vsync_gen = ~0ull;
+        static std::string vsync_value;
+        std::string v;
+        {
+            std::scoped_lock lk{vsync_lock};
+            if (const u64 g = Core::GameSettings::SettingsGeneration(); g != vsync_gen) {
+                vsync_value = Core::GameSettings::Value("Display", "vsync");
+                vsync_gen = g;
+            }
+            v = vsync_value;
+        }
+        if (!v.empty()) {
             if (v == "off" || v == "false" || v == "0" || v == "immediate") {
                 return Settings::VSyncMode::Immediate;
             } else if (v == "mailbox") {

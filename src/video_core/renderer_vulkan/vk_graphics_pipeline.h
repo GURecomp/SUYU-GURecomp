@@ -17,7 +17,9 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -76,7 +78,8 @@ public:
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
-        GuestDescriptorQueue& guest_descriptor_queue, Common::ThreadWorker* worker_thread,
+        GuestDescriptorQueue& guest_descriptor_queue, DescriptorBufferRing& descriptor_buffer_ring,
+        Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos);
@@ -132,7 +135,7 @@ private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
-    void ConfigureDraw(const RescalingPushConstant& rescaling,
+    bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
     void MakePipeline(VkRenderPass render_pass);
@@ -148,6 +151,7 @@ private:
     vk::PipelineCache& pipeline_cache;
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
+    DescriptorBufferRing& descriptor_buffer_ring;
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
 
@@ -174,6 +178,14 @@ private:
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
     bool uses_push_descriptor{false};
+    /// VK_EXT_descriptor_buffer in use (decided in the constructor, layouts made there too).
+    bool uses_descriptor_buffer{false};
+    DescriptorBufferLayout descriptor_buffer_layout;
+    /// Last descriptor buffer write, reused while the payload and ring generation are unchanged.
+    std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    VkDeviceSize last_descriptor_buffer_offset{};
+    u32 last_descriptor_buffer_chunk{};
+    u64 last_descriptor_buffer_generation{};
     /// The fragment shader reads the alpha test reference from a push constant every draw.
     bool uses_dynamic_alpha_ref{false};
 };

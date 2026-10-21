@@ -908,7 +908,10 @@ constexpr size_t kNativeCount = sizeof(kNativeCmds) / sizeof(kNativeCmds[0]);
 
 template <size_t I>
 bool NativeCommand(u32* r, Memory::Memory& mem) {
-    if (GameSettings::NvnVulkanMode() != 0) NvnRec::OnCall(kNativeCmds[I].name, r, mem);
+    if (GameSettings::NvnVulkanMode() != 0) {
+        static const int rec_index = NvnRec::ResolveCall(kNativeCmds[I].name); // name -> recorder entry, once
+        NvnRec::OnCallResolved(rec_index, kNativeCmds[I].name, r, mem);
+    }
     const u32 cmd = r[0];
     const u32 wp = mem.Read32(cmd + 12);
     const u32 end = mem.Read32(cmd + 16);

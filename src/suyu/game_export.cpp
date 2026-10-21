@@ -48,6 +48,7 @@
 #include "common/settings.h"
 #include "common/settings_input.h"
 #include "common/logging/log.h"
+#include "common/memory_detect.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
@@ -1485,6 +1486,53 @@ static bool SerializeTranslatedBlocks(const NsoAnalysisResult& mod, const QStrin
     return true;
 }
 
+// Parallel job count for cmake --build of recompiled sources. Each compiler job on these
+// huge generated files can take gigabytes, so scale with available RAM, not just threads.
+// SUYU_EXPORT_JOBS (positive int) overrides.
+static int ExportBuildJobs() {
+    static const int jobs = [] {
+        const int threads = std::max(1, QThread::idealThreadCount());
+        u64 ram_bytes = 0;
+#if defined(_WIN32)
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) {
+            ram_bytes = status.ullAvailPhys;
+        }
+#elif defined(__linux__)
+        QFile meminfo(QStringLiteral("/proc/meminfo"));
+        if (meminfo.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            while (!meminfo.atEnd()) {
+                const QByteArray line = meminfo.readLine();
+                if (line.startsWith("MemAvailable:")) {
+                    ram_bytes = line.mid(13).trimmed().split(' ').value(0).toULongLong() * 1024;
+                    break;
+                }
+            }
+        }
+#endif
+        if (ram_bytes == 0) {
+            ram_bytes = Common::GetMemInfo().TotalPhysicalMemory;
+        }
+        constexpr u64 bytes_per_job = 3ULL << 30;
+        int chosen = threads;
+        if (ram_bytes != 0) {
+            chosen = static_cast<int>(
+                std::min<u64>(static_cast<u64>(threads), ram_bytes / bytes_per_job));
+        }
+        chosen = std::clamp(chosen, 1, threads);
+        bool ok = false;
+        const int override_jobs = qEnvironmentVariable("SUYU_EXPORT_JOBS").toInt(&ok);
+        if (ok && override_jobs > 0) {
+            chosen = override_jobs;
+        }
+        LOG_INFO(Frontend, "Export build: using {} parallel jobs ({} threads, {} MiB RAM)", chosen,
+                 threads, ram_bytes >> 20);
+        return chosen;
+    }();
+    return jobs;
+}
+
 #ifdef _WIN32
 // Every Visual Studio installation that carries the x64 C++ toolset, newest
 // first.
@@ -2412,7 +2460,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     RunProcessDrained(build, cmake,
                                       {QStringLiteral("--build"), build_dir,
                                        QStringLiteral("--config"), QStringLiteral("Release"),
-                                       QStringLiteral("--parallel")},
+                                       QStringLiteral("--parallel"),
+                                       QString::number(ExportBuildJobs())},
                                       &build_log);
                 if (build_rc != 0) {
                     LOG_ERROR(Frontend, "Recompiled module {} failed to compile:\n{}",
@@ -2741,7 +2790,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                              QStringLiteral("--target"),
                                              QStringLiteral("suyu-cmd-static"),
                                              QStringLiteral("--config"), QStringLiteral("Release"),
-                                             QStringLiteral("--parallel")},
+                                             QStringLiteral("--parallel"),
+                                             QString::number(ExportBuildJobs())},
                                             &link_log);
                 if (link_rc != 0) {
                     LOG_ERROR(Frontend, "suyu-cmd-static failed to link:\n{}",

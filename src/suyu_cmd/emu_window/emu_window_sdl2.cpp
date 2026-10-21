@@ -9,6 +9,7 @@ static constexpr Uint8 SDL_PRESSED = 1;
 static constexpr Uint8 SDL_RELEASED = 0;
 
 #include "common/fs/path_util.h"
+#include "common/host_key.h"
 #include "common/logging/log.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
@@ -599,8 +600,44 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
 } // namespace
 #endif
 
+namespace {
+// Debug / benchmark hotkeys: maps the Windows virtual-key codes polled by the renderer to SDL scancodes.
+// KP_* scancodes do not depend on NumLock. Only reflects the state while the SDL window has keyboard focus.
+bool HostKeyPollSDL(int vk) {
+    SDL_Scancode sc = SDL_SCANCODE_UNKNOWN;
+    if (vk >= 0x60 && vk <= 0x69) {
+        static constexpr SDL_Scancode kp[10] = {
+            SDL_SCANCODE_KP_0, SDL_SCANCODE_KP_1, SDL_SCANCODE_KP_2, SDL_SCANCODE_KP_3,
+            SDL_SCANCODE_KP_4, SDL_SCANCODE_KP_5, SDL_SCANCODE_KP_6, SDL_SCANCODE_KP_7,
+            SDL_SCANCODE_KP_8, SDL_SCANCODE_KP_9};
+        sc = kp[vk - 0x60];
+    } else if (vk >= 0x70 && vk <= 0x7B) {
+        sc = static_cast<SDL_Scancode>(SDL_SCANCODE_F1 + (vk - 0x70));
+    } else {
+        switch (vk) {
+        case 0x6A: sc = SDL_SCANCODE_KP_MULTIPLY; break;
+        case 0x6B: sc = SDL_SCANCODE_KP_PLUS; break;
+        case 0x6D: sc = SDL_SCANCODE_KP_MINUS; break;
+        case 0x6E: sc = SDL_SCANCODE_KP_PERIOD; break;
+        case 0x6F: sc = SDL_SCANCODE_KP_DIVIDE; break;
+        case 0x11: {
+            int n = 0;
+            const bool* st = SDL_GetKeyboardState(&n);
+            return st && ((SDL_SCANCODE_LCTRL < n && st[SDL_SCANCODE_LCTRL]) ||
+                          (SDL_SCANCODE_RCTRL < n && st[SDL_SCANCODE_RCTRL]));
+        }
+        default: return false;
+        }
+    }
+    int n = 0;
+    const bool* st = SDL_GetKeyboardState(&n);
+    return st && sc < n && st[sc];
+}
+} // namespace
+
 EmuWindow_SDL2::EmuWindow_SDL2(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
     : input_subsystem{input_subsystem_}, system{system_} {
+    Common::SetHostKeyPoller(&HostKeyPollSDL);
     input_subsystem->Initialize();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
         LOG_CRITICAL(Frontend, "Failed to initialize SDL3: {}, Exiting...", SDL_GetError());
@@ -704,6 +741,7 @@ void EmuWindow_SDL2::OnResize() {
     if (width <= 0 || height <= 0) {
         return;
     }
+    Core::GameSettings::SetWindowSize(static_cast<u32>(width), static_cast<u32>(height));
     UpdateCurrentFramebufferLayout(width, height);
 }
 

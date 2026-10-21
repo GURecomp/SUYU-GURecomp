@@ -13,6 +13,8 @@ add_library(core STATIC
     arm/recomp/arm_recomp32.h
     arm/recomp/game_settings.cpp
     arm/recomp/game_settings.h
+    arm/recomp/game_settings_ini.cpp
+    arm/recomp/game_settings_ini.h
     arm/recomp/host_threads.cpp
     arm/recomp/host_threads.h
     arm/recomp/mod_host.cpp

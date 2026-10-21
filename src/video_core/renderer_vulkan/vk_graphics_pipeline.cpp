@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <iostream>
 #include <span>
 
@@ -28,6 +30,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "common/logging.h"
 
 #if defined(_MSC_VER) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE [[msvc::forceinline]]
@@ -245,13 +248,15 @@ GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
     vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
     const Device& device_, DescriptorPool& descriptor_pool,
-    GuestDescriptorQueue& guest_descriptor_queue_, Common::ThreadWorker* worker_thread,
+    GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
+    Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
-      guest_descriptor_queue{guest_descriptor_queue_}, spv_modules{std::move(stages)} {
+      guest_descriptor_queue{guest_descriptor_queue_},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -273,19 +278,55 @@ GraphicsPipeline::GraphicsPipeline(
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
     uses_dynamic_alpha_ref = infos[NUM_STAGES - 1] != nullptr &&
                              !FixedPipelineState::IsAlphaTestTrivial(key.state.alpha_test_func.Value());
-    auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics] {
+    // VK_EXT_descriptor_buffer (Eden port): decided here rather than in the build job, because
+    // ConfigureDraw writes the descriptors on the GPU thread, possibly before the build finishes.
+    // Only pipelines that would otherwise use pooled descriptor sets qualify.
+    if (descriptor_buffer_ring.IsValid()) {
         DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
-        uses_push_descriptor = builder.CanUsePushDescriptor();
-        descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
-
-        if (!uses_push_descriptor) {
-            descriptor_allocator = descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, stage_infos);
+        if (builder.CanUseDescriptorBuffer()) {
+            static std::atomic<u64> db_pipelines{0};
+            static std::atomic<u64> db_fallbacks{0};
+            vk::DescriptorSetLayout db_set_layout{builder.CreateDescriptorSetLayout(false, true)};
+            DescriptorBufferLayout db_layout{builder.MakeDescriptorBufferLayout(*db_set_layout)};
+            if (descriptor_buffer_ring.CanAllocate(db_layout.size)) {
+                descriptor_set_layout = std::move(db_set_layout);
+                descriptor_buffer_layout = std::move(db_layout);
+                pipeline_layout = builder.CreatePipelineLayout(*descriptor_set_layout);
+                uses_descriptor_buffer = true;
+                const u64 n = ++db_pipelines;
+                if (n <= 20 || n % 100 == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Descriptor buffers: pipeline {:016x} uses one ({} bytes, {} "
+                             "descriptors; n={}, fallbacks={})",
+                             key.Hash(), descriptor_buffer_layout.size, num_descriptor_entries, n,
+                             db_fallbacks.load());
+                }
+            } else {
+                const u64 n = ++db_fallbacks;
+                if (n <= 20 || n % 100 == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Descriptor buffers: pipeline {:016x} needs {} bytes per draw, using "
+                             "descriptor sets (n={})",
+                             key.Hash(), db_layout.size, n);
+                }
+            }
         }
+    }
+    auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics] {
+        if (!uses_descriptor_buffer) {
+            DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+            uses_push_descriptor = builder.CanUsePushDescriptor();
+            descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
 
-        const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
-        pipeline_layout = builder.CreatePipelineLayout(set_layout);
-        descriptor_update_template =
-            builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
+            if (!uses_push_descriptor) {
+                descriptor_allocator = descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, stage_infos);
+            }
+
+            const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
+            pipeline_layout = builder.CreatePipelineLayout(set_layout);
+            descriptor_update_template =
+                builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
+        }
 
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state))};
         Validate();
@@ -521,13 +562,59 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     texture_cache.UpdateRenderTargets(false);
     texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
                                                                                  views.size()});
-    ConfigureDraw(rescaling, render_area);
-
-    return true;
+    return ConfigureDraw(rescaling, render_area);
 }
 
-void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
+    const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+
+    // VK_EXT_descriptor_buffer: write this draw's descriptors into the ring (before the render
+    // pass request, since a full ring may submit and wait), or reuse the last write when the
+    // payload is unchanged within the same ring generation.
+    VkDeviceSize descriptor_buffer_offset{};
+    u32 descriptor_buffer_chunk{};
+    if (uses_descriptor_buffer) {
+        static std::atomic<u64> db_draws{0};
+        static std::atomic<u64> db_reused{0};
+        const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        const bool reuse_allocation =
+            last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
+            last_descriptor_payload.size() == num_descriptor_entries &&
+            std::memcmp(last_descriptor_payload.data(), entries,
+                        num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+        if (reuse_allocation) {
+            descriptor_buffer_offset = last_descriptor_buffer_offset;
+            descriptor_buffer_chunk = last_descriptor_buffer_chunk;
+            descriptor_buffer_ring.TouchFrame(scheduler);
+            ++db_reused;
+        } else {
+            const DescriptorBufferRing::Allocation alloc{
+                descriptor_buffer_ring.Allocate(scheduler, descriptor_buffer_layout.size)};
+            if (!alloc.host) {
+                LOG_INFO(Render_Vulkan,
+                         "Descriptor buffers: no ring memory for pipeline {:016x}, draw skipped",
+                         key.Hash());
+                return false;
+            }
+            WriteDescriptorBuffer(device, descriptor_buffer_layout, entries, alloc.host);
+            descriptor_buffer_offset = alloc.offset;
+            descriptor_buffer_chunk = alloc.chunk;
+            last_descriptor_buffer_offset = alloc.offset;
+            last_descriptor_buffer_chunk = alloc.chunk;
+            last_descriptor_buffer_generation = alloc.generation;
+            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+        }
+        const u64 n = ++db_draws;
+        if (n <= 20 || n % 20000 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Descriptor buffers: draw with pipeline {:016x} (offset {}, chunk {}, "
+                     "reused={}; draws={}, reused total={})",
+                     key.Hash(), descriptor_buffer_offset, descriptor_buffer_chunk,
+                     reuse_allocation, n, db_reused.load());
+        }
+    }
+
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
@@ -539,6 +626,8 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
+    const bool bind_descriptor_buffer{
+        uses_descriptor_buffer && scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
 
     // Log graphics pipeline binding
     if (bind_pipeline && GPU::Logging::IsActive() &&
@@ -547,13 +636,17 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         GPU::Logging::GPULogger::GetInstance().LogPipelineBind(false, pipeline_info);
     }
 
-    const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
     const f32 alpha_ref{uses_dynamic_alpha_ref ? maxwell3d->regs.alpha_test_ref : 0.0f};
     scheduler.Record([this, descriptor_data, bind_pipeline, rescaling_data = rescaling.Data(),
                       alpha_ref,
                       is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words, descriptor_buffer_offset,
+                      descriptor_buffer_chunk, bind_descriptor_buffer](vk::CommandBuffer cmdbuf) {
+        if (bind_descriptor_buffer) {
+            cmdbuf.BindDescriptorBuffersEXT(
+                descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk));
+        }
         if (bind_pipeline) {
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         }
@@ -580,7 +673,10 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!descriptor_set_layout) {
             return;
         }
-        if (uses_push_descriptor) {
+        if (uses_descriptor_buffer) {
+            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                                 0, 0, descriptor_buffer_offset);
+        } else if (uses_push_descriptor) {
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
                                                     0, descriptor_data);
         } else {
@@ -591,6 +687,7 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
+    return true;
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
@@ -981,6 +1078,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     VkPipelineCreateFlags flags{};
     if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
         flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    if (uses_descriptor_buffer) {
+        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
     pipeline = device.GetLogical().CreateGraphicsPipeline({

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
@@ -497,6 +497,10 @@ void VisitUsages(Info& info, IR::Inst& inst) {
     case IR::Opcode::ShuffleDown:
     case IR::Opcode::ShuffleButterfly:
         info.uses_subgroup_shuffles = true;
+        break;
+    case IR::Opcode::QuadBroadcast:
+    case IR::Opcode::QuadSwap:
+        info.uses_quad_shuffles = true;
         break;
     case IR::Opcode::GetCbufU8:
     case IR::Opcode::GetCbufS8:

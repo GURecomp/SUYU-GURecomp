@@ -207,6 +207,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
       staging_pool(device, memory_allocator, scheduler), descriptor_pool(device, scheduler),
       guest_descriptor_queue(device), compute_pass_descriptor_queue(device),
+      descriptor_buffer_ring(device, memory_allocator),
       blit_image(device, scheduler, state_tracker, descriptor_pool), render_pass_cache(device),
       texture_cache_runtime{
           device,     scheduler,         memory_allocator, staging_pool,
@@ -219,7 +220,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                           staging_pool, compute_pass_descriptor_queue, descriptor_pool, texture_cache),
       query_cache(gpu, *this, device_memory, query_cache_runtime),
       pipeline_cache(device_memory, device, scheduler, descriptor_pool, guest_descriptor_queue,
-                     render_pass_cache, buffer_cache, texture_cache, gpu.ShaderNotify()),
+                     descriptor_buffer_ring, render_pass_cache, buffer_cache, texture_cache, gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
@@ -509,17 +510,23 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    scheduler.RequestRenderpass(framebuffer);
 
-    query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    // Full-attachment clears with no active render pass are deferred, so a draw that follows in
+    // the same render target folds them into the render pass load op.
+    const bool color_full_channels = regs.clear_surface.R && regs.clear_surface.G &&
+                                     regs.clear_surface.B && regs.clear_surface.A;
+    const bool stencil_partial = use_stencil && framebuffer->HasAspectStencilBit() &&
+                                 regs.stencil_front_mask != 0xFF && regs.stencil_front_mask != 0;
+    const bool ds_used = use_depth || use_stencil;
+    const bool ds_deferrable =
+        !ds_used || ((!framebuffer->HasAspectDepthBit() || use_depth) &&
+                     (!framebuffer->HasAspectStencilBit() || use_stencil) && !stencil_partial);
     u32 up_scale = 1;
     u32 down_shift = 0;
     if (texture_cache.IsRescaling()) {
         up_scale = Settings::values.resolution_info.up_scale;
         down_shift = Settings::values.resolution_info.down_shift;
     }
-    UpdateViewportsState(regs);
 
     VkRect2D default_scissor{};
     default_scissor.offset.x = 0;
@@ -576,6 +583,22 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         return;
     }
 
+    const bool clear_covers_render_area =
+        clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
+        clear_rect.rect.extent.width >= render_area.width &&
+        clear_rect.rect.extent.height >= render_area.height;
+    const bool can_defer_clear = (!regs.clear_control.use_scissor || clear_covers_render_area) &&
+                                 regs.clear_surface.layer == 0 && layer_count == 1 &&
+                                 !scheduler.IsRenderPassActive() &&
+                                 (!use_color || color_full_channels) && ds_deferrable;
+    if (!can_defer_clear) {
+        scheduler.RequestRenderpass(framebuffer);
+    }
+
+    query_cache.NotifySegment(true);
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    UpdateViewportsState(regs);
+
     const u32 color_attachment = regs.clear_surface.RT;
     if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
         const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
@@ -593,15 +616,19 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                 clear_value.color.int32[i] = s32(f32(s64(int_size - 1) << 1) * (regs.clear_color[i] - 0.5f));
         }
 
-        if (regs.clear_surface.R && regs.clear_surface.G && regs.clear_surface.B && regs.clear_surface.A) {
-            scheduler.Record([color_attachment, clear_value, clear_rect](vk::CommandBuffer cmdbuf) {
-                const VkClearAttachment attachment{
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .colorAttachment = color_attachment,
-                    .clearValue = clear_value,
-                };
-                cmdbuf.ClearAttachments(attachment, clear_rect);
-            });
+        if (color_full_channels) {
+            if (can_defer_clear) {
+                scheduler.DeferColorClear(framebuffer, color_attachment, clear_value);
+            } else {
+                scheduler.Record([color_attachment, clear_value, clear_rect](vk::CommandBuffer cmdbuf) {
+                    const VkClearAttachment attachment{
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .colorAttachment = color_attachment,
+                        .clearValue = clear_value,
+                    };
+                    cmdbuf.ClearAttachments(attachment, clear_rect);
+                });
+            }
         } else {
             u8 color_mask = u8(regs.clear_surface.R | regs.clear_surface.G << 1 | regs.clear_surface.B << 2 | regs.clear_surface.A << 3);
             Region2D dst_region = {
@@ -635,6 +662,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         blit_image.ClearDepthStencil(framebuffer, use_depth, regs.clear_depth,
                                      u8(regs.stencil_front_mask), regs.clear_stencil,
                                      regs.stencil_front_func_mask, dst_region);
+    } else if (can_defer_clear) {
+        VkClearValue clear_value{};
+        clear_value.depthStencil.depth = regs.clear_depth;
+        clear_value.depthStencil.stencil = regs.clear_stencil;
+        scheduler.DeferDepthStencilClear(framebuffer, clear_value);
     } else {
         scheduler.Record([clear_depth = regs.clear_depth, clear_stencil = regs.clear_stencil,
                           clear_rect, aspect_flags](vk::CommandBuffer cmdbuf) {
@@ -870,6 +902,8 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapGPUMemory(as_id, addr, size);
     }
+    // Multi-range lookup cache; thread safe (deferred), no buffer cache lock needed.
+    buffer_cache.UnmapGPUMemory(as_id, addr, size);
 }
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
@@ -986,6 +1020,7 @@ void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
+    descriptor_buffer_ring.TickFrame();
     fence_manager.TickFrame();
     staging_pool.TickFrame();
     {

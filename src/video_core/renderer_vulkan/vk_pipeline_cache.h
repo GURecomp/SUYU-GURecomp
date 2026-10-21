@@ -105,6 +105,7 @@ public:
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
+                           DescriptorBufferRing& descriptor_buffer_ring,
                            RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
@@ -150,6 +151,7 @@ private:
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
+    DescriptorBufferRing& descriptor_buffer_ring;
     RenderPassCache& render_pass_cache;
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
