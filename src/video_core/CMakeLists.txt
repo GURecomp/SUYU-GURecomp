@@ -20,6 +20,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
+    buffer_cache/virtual_range_cache.h
     buffer_cache/word_manager.h
     cache_types.h
     capture.h
@@ -158,6 +159,10 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pass.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
+    renderer_vulkan/vk_descriptor_buffer.cpp
+    renderer_vulkan/vk_descriptor_buffer.h
+    renderer_vulkan/vk_multi_range_buffer.cpp
+    renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_descriptor_pool.cpp
     renderer_vulkan/vk_descriptor_pool.h
     renderer_vulkan/vk_fence_manager.cpp
@@ -192,6 +197,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_texture_cache.h
     renderer_vulkan/vk_texture_cache_base.cpp
     renderer_vulkan/nvn_vk.cpp
+    renderer_vulkan/emu_bench.cpp
+    renderer_vulkan/emu_bench.h
     renderer_vulkan/nvn_vk.h
     renderer_vulkan/vk_turbo_mode.cpp
     renderer_vulkan/vk_turbo_mode.h
@@ -350,6 +357,19 @@ target_link_libraries(video_core PRIVATE sirit::sirit)
 # Header-only stuff needed by all dependent targets
 target_link_libraries(video_core PUBLIC Vulkan::Headers Vulkan::UtilityHeaders GPUOpen::VulkanMemoryAllocator)
 
+# [Debug] nvn_fsr: FSR 3.1 temporal upscaler in the NVN replacement renderer (externals/fsr-vulkan)
+if (SUYU_FSR_VULKAN AND TARGET ffx_vulkan_fsr3_upscaler)
+    target_link_libraries(video_core PRIVATE ffx_vulkan_fsr3_upscaler ffx_vulkan_fsr3_host_headers)
+    target_compile_definitions(video_core PRIVATE SUYU_HAS_FSR_VULKAN=1)
+    # [Debug] nvn_fsr_backend = 4: FSR 4 through the driver's DX12 ffx-api loader (loaded at run time from System32;
+    # d3d12.dll / dxgi.dll are loaded at run time too, so nothing new is linked). MIT ffx-api v1.1.4 headers only.
+    if (WIN32)
+        target_sources(video_core PRIVATE renderer_vulkan/nvn_fsr4.cpp renderer_vulkan/nvn_fsr4.h)
+        target_include_directories(video_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../externals/ffx-api/include)
+        target_compile_definitions(video_core PRIVATE SUYU_HAS_FSR4_BRIDGE=1)
+    endif()
+endif()
+
 if (ENABLE_NSIGHT_AFTERMATH)
     if (NOT DEFINED ENV{NSIGHT_AFTERMATH_SDK})
         message(FATAL_ERROR "Environment variable NSIGHT_AFTERMATH_SDK has to be provided")
@@ -374,7 +394,9 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-shadow>
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-local-typedef>)
     else()
-        target_compile_options(video_core PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=conversion>)
+        if (YUZU_WERROR)
+            target_compile_options(video_core PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=conversion>)
+        endif()
     endif()
 
     target_compile_options(video_core PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-sign-conversion>)

@@ -23,6 +23,7 @@
 
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
+#include "common/log_redact.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/fs/path_util.h"
@@ -63,6 +64,7 @@
 #include "suyu_cmd/emu_window/emu_window_sdl2_null.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2_vk.h"
 #include "suyu_cmd/multiplayer.h"
+#include "suyu_cmd/relaunch.h"
 #include "suyu_cmd/sdl_software_keyboard.h"
 #include "video_core/renderer_base.h"
 
@@ -394,6 +396,8 @@ static int ProbeIsaList(const std::string& list_path, const std::string& out_pat
 }
 
 int main(int argc, char** argv) {
+    // Started by the menu's "Restart now": wait until the previous instance has shut down (saves, config, logs).
+    Relaunch::OnStart(argc, argv);
 #if defined(__linux__) && !defined(__ANDROID__)
     // The bundled SDL3 can come without the render subsystem the game menu window needs
     // ("SDL not built with rendering support"). SDL3 can redirect all its calls to the system
@@ -480,6 +484,21 @@ int main(int argc, char** argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+
+    // Logs are shared with other people: hide paths / user and computer name ([Debug] log_redact_paths).
+    {
+        Common::Log::SetRedactEnabled(Core::GameSettings::LogRedactPaths());
+        Common::Log::AddRedactRoot(
+            Common::FS::GetSuyuPathString(Common::FS::SuyuPath::SuyuDir), "<user>");
+#ifdef _WIN32
+        wchar_t redact_exe_w[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, redact_exe_w, MAX_PATH);
+        Common::Log::AddRedactRoot(
+            Common::UTF16ToUTF8(std::filesystem::path(redact_exe_w).parent_path().wstring()), "<game>");
+#else
+        Common::Log::AddRedactRoot(Common::FS::GetExeDirectory().string(), "<game>");
+#endif
+    }
 
     // mk8-recomp: --probe-isa <rom> prints the title's CPU architecture and
     // exits, before any config, window or emulation setup.

@@ -1,0 +1,79 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_fsr_objvel: merge of the geometry object vectors into the FSR motion vectors.
+// out = object vector where the velocity pass left a valid one (b = 1), else the base vector (camera reprojection, or
+// the block-matched vectors when nvn_fsr_objmv ran this frame). Per-workgroup counters go to a small R32UI image
+// (logs, once a second): [0] valid texels, [1] valid texels whose object vector differs from the camera vector by
+// more than 0.5 px (really moving), [2] valid texels within 0.25 px of the camera vector (static objects: the check
+// that the jitter removal / y convention is right), [3] sum of |object - camera| x 16, [4] sum of |object| x 16,
+// [5] texels of the dynamic-object mask target (flags bit 1; g > 0.25), [6] of those with a valid object vector,
+// [7] valid texels in a low-rate pose update (jump) frame.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D base_mv;
+layout(set = 0, binding = 1) uniform sampler2D cam_mv;
+layout(set = 0, binding = 2) uniform sampler2D vel_tex;
+layout(set = 0, binding = 3) uniform writeonly image2D mv_out;
+layout(set = 0, binding = 4, r32ui) uniform uimage2D stats;
+layout(set = 0, binding = 5) uniform sampler2D mask_tex;
+
+layout(push_constant) uniform PushConstants {
+    uint flags;
+    float pad0;
+    float pad1;
+    float pad2;
+} pc;
+
+shared uint s_cnt[8];
+
+void main() {
+    const uint li = gl_LocalInvocationIndex;
+    if (li < 8u) {
+        s_cnt[li] = 0u;
+    }
+    barrier();
+    const ivec2 size = imageSize(mv_out);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < size.x && p.y < size.y) {
+        vec2 o = texelFetch(base_mv, p, 0).rg;
+        const vec4 v = texelFetch(vel_tex, p, 0);
+        bool in_mask = false;
+        if ((pc.flags & 2u) != 0u) {
+            const ivec2 msize = textureSize(mask_tex, 0);
+            const ivec2 q = clamp(ivec2((vec2(p) + 0.5) * vec2(msize) / vec2(size)), ivec2(0), msize - 1);
+            in_mask = texelFetch(mask_tex, q, 0).g > 0.25;
+        }
+        if (in_mask) {
+            atomicAdd(s_cnt[5], 1u);
+            if (v.b > 0.5) {
+                atomicAdd(s_cnt[6], 1u);
+            }
+        }
+        if (v.b > 0.5 && !any(isnan(v.rg)) && !any(isinf(v.rg))) {
+            const vec2 cam = texelFetch(cam_mv, p, 0).rg;
+            o = v.rg;
+            const float d = length(v.rg - cam);
+            atomicAdd(s_cnt[0], 1u);
+            if (d > 0.5) {
+                atomicAdd(s_cnt[1], 1u);
+            }
+            if (d < 0.25) {
+                atomicAdd(s_cnt[2], 1u);
+            }
+            atomicAdd(s_cnt[3], uint(min(d, 32.0) * 16.0));
+            atomicAdd(s_cnt[4], uint(min(length(v.rg), 32.0) * 16.0));
+            if (v.a > 0.5) {
+                atomicAdd(s_cnt[7], 1u);
+            }
+        }
+        imageStore(mv_out, p, vec4(o, 0.0, 0.0));
+    }
+    barrier();
+    if (li < 8u && (pc.flags & 1u) != 0u && s_cnt[li] != 0u) {
+        imageAtomicAdd(stats, ivec2(int(li), 0), s_cnt[li]);
+    }
+}

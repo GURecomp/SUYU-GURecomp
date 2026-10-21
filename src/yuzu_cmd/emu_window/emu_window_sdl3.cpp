@@ -16,6 +16,7 @@
 #include "input_common/drivers/mouse.h"
 #include "input_common/drivers/touch_screen.h"
 #include "input_common/main.h"
+#include "video_core/renderer_vulkan/nvn_vk.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #include "yuzu_cmd/yuzu_icon.h"
 
@@ -236,12 +237,13 @@ void EmuWindow_SDL3::WaitEvent() {
     const u32 current_time = SDL_GetTicks();
     if (current_time > last_time + 2000) {
         const auto results = system.GetAndResetPerfStats();
-        const auto title = fmt::format("{} | {}-{} | FPS: {:.0f} ({:.0f}%)",
-                                       Common::g_build_fullname,
-                                       Common::g_scm_branch,
-                                       Common::g_scm_desc,
-                                       results.average_game_fps,
-                                       results.emulation_speed * 100.0);
+        auto title = fmt::format("{} | {}-{} | FPS: {:.0f} ({:.0f}%)",
+                                 Common::g_build_fullname,
+                                 Common::g_scm_branch,
+                                 Common::g_scm_desc,
+                                 results.average_game_fps,
+                                 results.emulation_speed * 100.0);
+        if (const std::string bench = Vulkan::NvnVkBenchStatus(); !bench.empty()) title += " | " + bench;
         SDL_SetWindowTitle(render_window, title.c_str());
         last_time = current_time;
     }

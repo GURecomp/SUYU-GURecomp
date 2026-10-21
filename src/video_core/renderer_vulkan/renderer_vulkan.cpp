@@ -36,6 +36,7 @@
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "core/arm/recomp/game_settings.h"
 #include "video_core/renderer_vulkan/nvn_vk.h"
+#include "video_core/renderer_vulkan/emu_bench.h"
 #include "video_core/vulkan_common/vulkan_library.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
@@ -220,6 +221,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         return;
     }
 
+    EmuBenchFrame();
     if (Core::GameSettings::NvnVulkanMode() != 0) {
         NvnVkSuyuFrameTick();
         static bool capture_was = false;
@@ -227,7 +229,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         capture_was = NvnVkCaptureActive();
         static u32 nvn_compare_frame = 0;
         ++nvn_compare_frame;
-        if (nvn_compare_frame == 600 || NvnVkCaptureActive()) {
+        if ((nvn_compare_frame == 600 && Core::GameSettings::GpuDiagnosticsEnabled()) || NvnVkCaptureActive()) {
             // Diagnostics: suyu's own picture of this frame, to compare with the NVN renderer's.
             const Layout::FramebufferLayout layout{render_window.GetFramebufferLayout()};
             const auto buf = RenderToBuffer(framebuffers, layout, VK_FORMAT_B8G8R8A8_UNORM, layout.width * layout.height * 4);
@@ -262,9 +264,16 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         if (have_nvn || (NvnVkPresentImage(src, sw, sh) && sw && sh)) {
             const VkImage dst = *frame->image;
             const u32 dw = frame->width, dh = frame->height;
-            const f64 scale = std::min(static_cast<f64>(dw) / sw, static_cast<f64>(dh) / sh);
-            const s32 w = std::max<s32>(1, static_cast<s32>(sw * scale)), h = std::max<s32>(1, static_cast<s32>(sh * scale));
-            const s32 x0 = (static_cast<s32>(dw) - w) / 2, y0 = (static_cast<s32>(dh) - h) / 2;
+            // The guest renders at console size (16:9); the window layout (aspect_ratio setting: Stretch / 21:9 / ...) decides
+            // the shape it is shown in, so a wide window is filled instead of pillarboxed.
+            const auto& screen = render_window.GetFramebufferLayout().screen;
+            s32 x0 = static_cast<s32>(screen.left), y0 = static_cast<s32>(screen.top);
+            s32 w = static_cast<s32>(screen.GetWidth()), h = static_cast<s32>(screen.GetHeight());
+            if (w <= 0 || h <= 0 || x0 + w > static_cast<s32>(dw) || y0 + h > static_cast<s32>(dh)) {
+                const f64 scale = std::min(static_cast<f64>(dw) / sw, static_cast<f64>(dh) / sh);
+                w = std::max<s32>(1, static_cast<s32>(sw * scale)), h = std::max<s32>(1, static_cast<s32>(sh * scale));
+                x0 = (static_cast<s32>(dw) - w) / 2, y0 = (static_cast<s32>(dh) - h) / 2;
+            }
             scheduler.Record([=](vk::CommandBuffer cmdbuf) {
                 const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
                                              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
@@ -276,6 +285,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                 cmdbuf.BlitImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, blit, VK_FILTER_LINEAR);
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, before);
             });
+            // present_nodrain: the read of src ends when this chunk's tick completes (signalled by the Flush below).
+            NvnVkPresentImageUsed(scheduler.GetMasterSemaphore(), scheduler.CurrentTick());
         }
     }
     scheduler.Flush(*frame->render_ready);

@@ -17,6 +17,7 @@
 
 #include <fmt/format.h>
 
+#include "common/logging/log.h"
 #include "core/hle/kernel/stall_ring.h"
 #include "core/arm/recomp/game_settings.h"
 #include "core/arm/recomp/nvn_rec.h"
@@ -49,6 +50,33 @@ std::unordered_map<u32, SimplePool> s_texpools, s_samplerpools; // pool object -
 std::vector<u32> s_window_textures;
 std::vector<std::pair<u32, u32>> s_dirty; // guest memory ranges the game wrote through NVN texture calls
 
+// Lock-free reads of the pool tables: GpuToCpu, PoolMemory and Texture/SamplerDescriptor run several times per draw on
+// the render thread (and the workers) while the guest thread takes s_lock for every BindProgram / submit. Every change of
+// s_pools / s_texpools / s_samplerpools bumps s_pool_gen under s_lock; each thread keeps its own copy and refreshes it
+// (under s_lock) when the generation moved. The tables change only at pool initialisation (a handful per run).
+std::atomic<u64> s_pool_gen{1};
+struct PoolTables {
+    u64 gen{};
+    std::vector<std::pair<u32, Pool>> pools; // s_pools in its iteration order: GpuToCpu matches in this order, as before
+    std::unordered_map<u32, Pool> pool_map;
+    std::unordered_map<u32, SimplePool> tex, smp;
+};
+void PoolTablesChanged() { // caller holds s_lock
+    s_pool_gen.fetch_add(1, std::memory_order_release);
+}
+const PoolTables& Tables() {
+    thread_local PoolTables t;
+    if (t.gen != s_pool_gen.load(std::memory_order_acquire)) [[unlikely]] {
+        Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
+        t.gen = s_pool_gen.load(std::memory_order_relaxed);
+        t.pools.assign(s_pools.begin(), s_pools.end());
+        t.pool_map = s_pools;
+        t.tex = s_texpools;
+        t.smp = s_samplerpools;
+    }
+    return t;
+}
+
 u64 Read64(Memory::Memory& mem, u32 a) {
     return mem.Read32(a) | (u64{mem.Read32(a + 4)} << 32);
 }
@@ -72,8 +100,8 @@ u32 StackWord(Memory::Memory& mem, const u32* r, u32 k) {
     return mem.IsValidVirtualAddressRange(r[13] + 4 * k, 4) ? mem.Read32(r[13] + 4 * k) : 0;
 }
 
-Rec Capture(Op op, const u32* r, Memory::Memory& mem) {
-    Rec rec{};
+// Fills a value-initialised (all zero) record in place: the records are built inside the list (no 344-byte copy).
+void Capture(Rec& rec, Op op, const u32* r, Memory::Memory& mem) {
     rec.op = op;
     for (u32 k = 0; k < 4; ++k) rec.r[k] = r[k];
     if (mem.IsValidVirtualAddressRange(r[13], 16)) {
@@ -82,7 +110,6 @@ Rec Capture(Op op, const u32* r, Memory::Memory& mem) {
         for (u32 k = 0; k < 4; ++k) rec.sp[k] = StackWord(mem, r, k);
     }
     for (u32 k = 0; k < 4; ++k) rec.s[k] = Vfp(r)[k];
-    return rec;
 }
 
 void Snapshot(Rec& rec, Memory::Memory& mem, u32 addr, u32 words) {
@@ -184,8 +211,9 @@ constexpr size_t kCountOnlyCount = sizeof(kCountOnly) / sizeof(kCountOnly[0]);
 void Sampled(const char* name, const u32* r, Memory::Memory& mem) {
     // Probe bookkeeping only (call counts + the first raw samples, dumped at exit). It cost a global lock and two
     // string-keyed map lookups on every recorded NVN call, on the guest thread: tens of thousands per second.
-    static const bool diag = Core::GameSettings::GpuDiagnosticsEnabled();
-    if (!diag) return;
+    // Own key [Debug] nvn_call_sampling (default off), so gpu_diagnostics (timing) runs do not pay for it.
+    static const bool sampling = Core::GameSettings::NvnCallSampling();
+    if (!sampling) return;
     Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
     ++s_counts[name];
     auto& v = s_samples[name];
@@ -206,41 +234,18 @@ void Sampled(const char* name, const u32* r, Memory::Memory& mem) {
 
 void RecordSpec(const Spec& sp, u32* r, Memory::Memory& mem) {
     if (!mem.IsValidVirtualAddressRange(r[0], 24)) return;
-    Rec rec = Capture(sp.op, r, mem);
+    Rec& rec = ListFor(r[0])->recs.emplace_back();
+    Capture(rec, sp.op, r, mem);
     if (sp.ptr) Snapshot(rec, mem, r[sp.ptr], sp.words);
-    switch (sp.op) {
-    case Op::BindColor:
-    case Op::BindVertexAttrib:
-    case Op::BindVertexStream:
-    case Op::BindBlend:
-    case Op::BindPolygon:
-    case Op::BindDepthStencil:
-    case Op::BindChannelMask:
-    case Op::SetDepthClamp:
-        static const std::array<NvnShadow::NativeBuilder, kSpecCount> builders = [] {
-            std::array<NvnShadow::NativeBuilder, kSpecCount> b{};
-            for (size_t i = 0; i < kSpecCount; ++i) b[i] = NvnShadow::FindBuilder(kSpecs[i].name);
-            return b;
-        }();
-        if (const auto build = builders[&sp - kSpecs]) {
-            NvnShadow::NativeWords w;
-            if (build(r, mem, w)) {
-                rec.nwords = w.n;
-                for (u32 k = 0; k < w.n && k < 24; ++k) rec.words[k] = w.v[k];
-            }
-        }
-        break;
-    default:
-        break;
-    }
-    ListFor(r[0])->recs.push_back(rec);
+    // (The native word builder's output used to be stored here as Rec::words; nothing read it.)
     Sampled(sp.name, r, mem);
 }
 
 // nvnCommandBufferBindProgram(cmd, program, stages)
 void RecordBindProgram(u32* r, Memory::Memory& mem) {
     if (!mem.IsValidVirtualAddressRange(r[0], 24)) return;
-    Rec rec = Capture(Op::BindProgram, r, mem);
+    Rec& rec = ListFor(r[0])->recs.emplace_back();
+    Capture(rec, Op::BindProgram, r, mem);
     if (mem.IsValidVirtualAddressRange(r[1], 48)) {
         for (u32 k = 0; k < 12; ++k) rec.pobj[k] = mem.Read32(r[1] + 4 * k);
         const u32 blk = rec.pobj[2], n = std::min<u32>(rec.pobj[4], 40);
@@ -256,7 +261,6 @@ void RecordBindProgram(u32* r, Memory::Memory& mem) {
             rec.program[1] = p->second[1];
         }
     }
-    ListFor(r[0])->recs.push_back(rec);
     Sampled("nvnCommandBufferBindProgram", r, mem);
 }
 
@@ -264,20 +268,22 @@ void RecordBindProgram(u32* r, Memory::Memory& mem) {
 // snapshot = color texture pointers (up to 4), then the depth texture pointer.
 void RecordRenderTargets(u32* r, Memory::Memory& mem) {
     if (!mem.IsValidVirtualAddressRange(r[0], 24)) return;
-    Rec rec = Capture(Op::SetRenderTargets, r, mem);
+    Rec& rec = ListFor(r[0])->recs.emplace_back();
+    Capture(rec, Op::SetRenderTargets, r, mem);
     const u32 count = std::min<u32>(r[1], 4);
     if (count && mem.IsValidVirtualAddressRange(r[2], count * 4)) {
         for (u32 k = 0; k < count; ++k) rec.snap[k] = mem.Read32(r[2] + 4 * k);
     }
     rec.snap[4] = rec.sp[0];
     rec.snap_words = 5;
-    ListFor(r[0])->recs.push_back(rec);
     Sampled("nvnCommandBufferSetRenderTargets", r, mem);
 }
 
 void RecordBegin(u32* r, Memory::Memory& mem) {
     if (!mem.IsValidVirtualAddressRange(r[0], 24)) return;
-    ListFor(r[0])->recs.clear();
+    List* l = ListFor(r[0]);
+    l->recs.clear();
+    l->handed = false;
     Sampled("nvnCommandBufferBeginRecording", r, mem);
 }
 
@@ -297,9 +303,31 @@ void RecordEnd(u32* r, Memory::Memory& mem) {
     ++s_counts["nvnCommandBufferEndRecording"];
 }
 
+// Lists the renderer has replayed and handed back (RecycleLists): their record buffers keep their capacity, so the
+// hand-off in RecordSubmit allocates nothing in steady state. Own lock (not s_lock, which the render thread's lookups use).
+std::mutex s_recycle_lock;
+std::vector<std::unique_ptr<List>> s_recycled;
+constexpr size_t kMaxRecycled = 8;
+std::atomic<bool> s_copy_mode{false}; // set once if a list is submitted again without BeginRecording (see RecordSubmit)
+
+std::unique_ptr<List> TakeRecycled() {
+    {
+        std::scoped_lock lk{s_recycle_lock};
+        if (!s_recycled.empty()) {
+            auto l = std::move(s_recycled.back());
+            s_recycled.pop_back();
+            l->recs.clear();
+            l->handed = false;
+            return l;
+        }
+    }
+    return std::make_unique<List>();
+}
+
 // nvnQueueSubmitCommands(queue, count, const CommandHandle* handles)
 void RecordSubmit(u32* r, Memory::Memory& mem) {
     std::vector<std::unique_ptr<List>> out;
+    std::vector<List*> picked; // handed over after s_lock is released (lists are never erased from s_lists)
     Sink sink;
     {
         Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
@@ -320,13 +348,45 @@ void RecordSubmit(u32* r, Memory::Memory& mem) {
             if (it == s_handle_cmd.end()) continue;
             ++s_submit_matches["match"];
             auto& l = s_lists[it->second];
-            if (l && sink) {
-                auto copy = std::make_unique<List>();
-                copy->cmd = l->cmd;
-                copy->recs = l->recs;
-                out.push_back(std::move(copy));
-            }
+            if (l && sink) picked.push_back(l.get());
         }
+    }
+    // The records of a list are only written by the guest thread that records it, as before. Observed pattern
+    // (nvn_rec.txt): BeginRecording, record, EndRecording, one submit, alternating two command buffers. So the records
+    // are handed over (swapped into a recycled List whose capacity the renderer returns via RecycleLists) instead of
+    // copied (~2.3 MB per submit). Exactness guard: a list submitted again with no BeginRecording since its hand-off
+    // (re-submit, or records appended after the submit) would have delivered all of its records in the old code;
+    // the first time that happens the recorder warns once and copies from then on (that one submit delivers only the
+    // records made after the hand-off).
+    std::vector<std::pair<List*, size_t>> given; // the same list twice in one submit: the second gets a copy of the first
+    for (List* l : picked) {
+        if (const auto g = std::find_if(given.begin(), given.end(), [l](const auto& e) { return e.first == l; });
+            g != given.end()) {
+            auto copy = TakeRecycled();
+            copy->cmd = l->cmd;
+            const auto& src = out[g->second]->recs;
+            copy->recs.assign(src.begin(), src.end());
+            out.push_back(std::move(copy));
+            continue;
+        }
+        given.emplace_back(l, out.size());
+        if (l->handed && !s_copy_mode.exchange(true)) {
+            LOG_WARNING(Core_ARM, "NVN recorder: command buffer {:x} submitted again without BeginRecording; "
+                                  "switching to copying submits for this run", l->cmd);
+        }
+        if (s_copy_mode.load(std::memory_order_relaxed)) {
+            auto copy = TakeRecycled();
+            copy->cmd = l->cmd;
+            copy->recs.assign(l->recs.begin(), l->recs.end());
+            out.push_back(std::move(copy));
+            continue;
+        }
+        auto give = TakeRecycled();
+        give->cmd = l->cmd;
+        give->recs.swap(l->recs); // l->recs = the recycled (empty) buffer
+        if (l->recs.capacity() < give->recs.size()) l->recs.reserve(give->recs.size());
+        l->handed = true;
+        out.push_back(std::move(give));
     }
     if (sink && !out.empty()) {
         sink(mem, std::move(out), r[0]);
@@ -343,7 +403,10 @@ void RecordPoolBuilderStorage(u32* r, Memory::Memory&) {
 void RecordPoolInit(u32* r, Memory::Memory&) {
     Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
     const auto b = s_builders.find(r[1]);
-    if (b != s_builders.end()) s_pools[r[0]] = {b->second.first, b->second.second};
+    if (b != s_builders.end()) {
+        s_pools[r[0]] = {b->second.first, b->second.second};
+        PoolTablesChanged();
+    }
     ++s_counts["nvnMemoryPoolInitialize"];
 }
 // nvnProgramSetShaders(program, count, stages)
@@ -360,11 +423,13 @@ void RecordSetShaders(u32* r, Memory::Memory& mem) {
 void RecordTexPoolInit(u32* r, Memory::Memory&) {
     Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
     s_texpools[r[0]] = {r[1], r[2], r[3]};
+    PoolTablesChanged();
     ++s_counts["nvnTexturePoolInitialize"];
 }
 void RecordSamplerPoolInit(u32* r, Memory::Memory&) {
     Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
     s_samplerpools[r[0]] = {r[1], r[2], r[3]};
+    PoolTablesChanged();
     ++s_counts["nvnSamplerPoolInitialize"];
 }
 // nvnWindowBuilderSetTextures(builder, count, textures**)
@@ -474,35 +539,43 @@ void SetSink(Sink sink) {
     Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
     s_sink = sink;
 }
+void RecycleLists(std::vector<std::unique_ptr<List>>&& lists) {
+    std::scoped_lock lk{s_recycle_lock};
+    for (auto& l : lists) {
+        if (l && s_recycled.size() < kMaxRecycled) s_recycled.push_back(std::move(l));
+    }
+    lists.clear(); // the rest is freed here, as before (on the caller's thread)
+}
+
 void SetPresentSink(PresentSink sink) {
     Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
     s_present_sink = sink;
 }
 
 bool PoolMemory(u32 pool_obj, u32& cpu, u32& size) {
-    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
-    const auto it = s_pools.find(pool_obj);
-    if (it == s_pools.end()) return false;
+    const auto& t = Tables();
+    const auto it = t.pool_map.find(pool_obj);
+    if (it == t.pool_map.end()) return false;
     cpu = it->second.cpu;
     size = it->second.size;
     return true;
 }
 
-static bool PoolEntry(const std::unordered_map<u32, SimplePool>& pools, u32 pool, u32 id, u32& cpu) {
+static bool PoolEntry(const PoolTables& t, const std::unordered_map<u32, SimplePool>& pools, u32 pool, u32 id, u32& cpu) {
     const auto it = pools.find(pool);
     if (it == pools.end() || id >= it->second.count) return false;
-    const auto mp = s_pools.find(it->second.mempool);
-    if (mp == s_pools.end()) return false;
+    const auto mp = t.pool_map.find(it->second.mempool);
+    if (mp == t.pool_map.end()) return false;
     cpu = mp->second.cpu + it->second.offset + id * 32;
     return true;
 }
 bool TextureDescriptor(u32 pool, u32 id, u32& cpu) {
-    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
-    return PoolEntry(s_texpools, pool, id, cpu);
+    const auto& t = Tables();
+    return PoolEntry(t, t.tex, pool, id, cpu);
 }
 bool SamplerDescriptor(u32 pool, u32 id, u32& cpu) {
-    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
-    return PoolEntry(s_samplerpools, pool, id, cpu);
+    const auto& t = Tables();
+    return PoolEntry(t, t.smp, pool, id, cpu);
 }
 void TakeDirty(std::vector<std::pair<u32, u32>>& out) {
     Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
@@ -530,7 +603,34 @@ bool LearnedAttrib(u32 code, u32& out) {
     return true;
 }
 
+namespace {
+// The spec index of BindVertexAttribState (its call also arms the learned-attribute check), resolved once.
+int AttribSpecIndex() {
+    static const int i = [] {
+        for (size_t k = 0; k < kSpecCount; ++k) {
+            if (!std::strcmp(kSpecs[k].name, "nvnCommandBufferBindVertexAttribState")) return static_cast<int>(k);
+        }
+        return -2;
+    }();
+    return i;
+}
+} // namespace
+
+int ResolveCall(const char* name) {
+    for (size_t i = 0; i < kSpecCount; ++i) {
+        if (!std::strcmp(kSpecs[i].name, name)) return static_cast<int>(i);
+    }
+    for (size_t i = 0; i < kSpecialCount; ++i) {
+        if (!std::strcmp(kSpecials[i].name, name)) return static_cast<int>(kSpecCount + i);
+    }
+    return -1;
+}
+
 void OnCall(const char* name, u32* regs, Memory::Memory& mem) {
+    OnCallResolved(ResolveCall(name), name, regs, mem);
+}
+
+void OnCallResolved(int index, const char* name, u32* regs, Memory::Memory& mem) {
     if (Kernel::StallRing::On()) {
         // Probe for the Wiggle Hitch: where one guest thread sits idle for a long time between two NVN calls.
         thread_local std::chrono::steady_clock::time_point last{};
@@ -570,24 +670,18 @@ void OnCall(const char* name, u32* regs, Memory::Memory& mem) {
             }
         }
     }
-    if (!std::strcmp(name, "nvnCommandBufferBindVertexAttribState") && regs[1] == 16 &&
+    if (index == AttribSpecIndex() && regs[1] == 16 &&
         mem.IsValidVirtualAddressRange(regs[0], 24) && mem.IsValidVirtualAddressRange(regs[2], 64)) {
         s_attr_pending.valid = true;
         s_attr_pending.cmd = regs[0];
         s_attr_pending.wp = mem.Read32(regs[0] + 12);
         for (u32 i = 0; i < 16; ++i) s_attr_pending.codes[i] = mem.Read32(regs[2] + 4 * i);
     }
-    for (size_t i = 0; i < kSpecCount; ++i) {
-        if (!std::strcmp(kSpecs[i].name, name)) {
-            kSpecFns[i](regs, mem);
-            return;
-        }
-    }
-    for (size_t i = 0; i < kSpecialCount; ++i) {
-        if (!std::strcmp(kSpecials[i].name, name)) {
-            kSpecials[i].fn(regs, mem);
-            return;
-        }
+    // Was a strcmp scan over all spec and special names on every call (up to ~47 compares for the specials).
+    if (index >= 0 && static_cast<size_t>(index) < kSpecCount) {
+        kSpecFns[index](regs, mem);
+    } else if (index >= 0 && static_cast<size_t>(index) < kSpecCount + kSpecialCount) {
+        kSpecials[index - kSpecCount].fn(regs, mem);
     }
 }
 
@@ -618,7 +712,12 @@ void RegisterAll() {
     std::array<const char*, kSpecCount> a{};
     for (size_t i = 0; i < kSpecCount; ++i) a[i] = kSpecs[i].name;
     RegisterKind<0>(std::make_index_sequence<kSpecCount>{}, a.data());
-    RegisterKind<1>(std::make_index_sequence<kCountOnlyCount>{}, kCountOnly);
+    // The count-only entries do nothing but Sampled(): without nvn_call_sampling they are not hooked at all (in lean
+    // mode an unhooked entry costs nothing; each hooked one also lengthens NvnTrace's fast-table scan). With
+    // [Debug] diagnostics (full trace mode) they stay registered: there a replacement also keeps the census off them.
+    if (Core::GameSettings::NvnCallSampling() || Core::GameSettings::DiagnosticsEnabled()) {
+        RegisterKind<1>(std::make_index_sequence<kCountOnlyCount>{}, kCountOnly);
+    }
     std::array<const char*, kSpecialCount> b{};
     for (size_t i = 0; i < kSpecialCount; ++i) b[i] = kSpecials[i].name;
     RegisterKind<2>(std::make_index_sequence<kSpecialCount>{}, b.data());
@@ -638,11 +737,15 @@ void RegisterPresentProbeOnly() {
 }
 
 bool GpuToCpu(Memory::Memory& mem, u64 gpu_va, u32& cpu, u32& avail) {
-    Kernel::StallRing::TimedGuard lk{s_lock, Kernel::StallRing::LockRec};
-    for (const auto& [obj, pool] : s_pools) {
+    const auto& t = Tables();
+    for (const auto& [obj, pool] : t.pools) {
         if (!mem.IsValidVirtualAddressRange(obj, 80)) continue;
+        // The four GPU address words at +40, +56, +72, +80 in one read (was eight Read32 calls, each a page walk).
+        u32 w[12];
+        mem.ReadBlock(obj + 40, w, sizeof(w));
         for (const u32 off : {40u, 56u, 72u, 80u}) {
-            const u64 base = Read64(mem, obj + off);
+            const u32 i = (off - 40) / 4;
+            const u64 base = w[i] | (u64{w[i + 1]} << 32);
             if (base != 0 && gpu_va >= base && gpu_va < base + pool.size) {
                 cpu = pool.cpu + static_cast<u32>(gpu_va - base);
                 avail = pool.size - static_cast<u32>(gpu_va - base);
@@ -651,7 +754,7 @@ bool GpuToCpu(Memory::Memory& mem, u64 gpu_va, u32& cpu, u32& avail) {
         }
     }
     // Observed: a pool can also be viewed at the address just behind its +56 range (render targets sampled later).
-    for (const auto& [obj, pool] : s_pools) {
+    for (const auto& [obj, pool] : t.pools) {
         if (!mem.IsValidVirtualAddressRange(obj, 80)) continue;
         const u64 base = Read64(mem, obj + 56) + pool.size;
         if (base != pool.size && gpu_va >= base && gpu_va < base + pool.size) {

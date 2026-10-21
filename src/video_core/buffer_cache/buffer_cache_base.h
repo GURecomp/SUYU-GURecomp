@@ -29,6 +29,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/dirty_flags.h"
@@ -81,8 +82,18 @@ static constexpr u32 DEFAULT_SKIP_CACHE_SIZE = static_cast<u32>(4_KiB);
 
 struct Binding {
     DAddr device_addr{};
+    GPUVAddr gpu_addr{}; ///< Set for storage buffers only (multi-range lookup)
     u32 size{};
     BufferId buffer_id;
+    u32 segment_first{}; ///< Multi-range: first entry in the segment pool
+    u32 segment_count{}; ///< Multi-range: number of segments (0 = ordinary binding)
+};
+
+/// One device-contiguous piece of a storage buffer whose GPU range is split in device memory.
+struct MultiRangeSegment {
+    BufferId buffer_id;
+    DAddr device_addr{};
+    u32 size{};
 };
 
 struct TextureBufferBinding : Binding {
@@ -216,6 +227,9 @@ public:
     void TickFrame();
 
     void WriteMemory(DAddr device_addr, u64 size);
+
+    /// GPU virtual range [gpu_addr, gpu_addr + size) changed mapping; any thread.
+    void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
@@ -382,6 +396,15 @@ private:
 
     void BindHostComputeStorageBuffers();
 
+    /// Multi-range storage buffers (port of Eden): Resolve splits a storage binding into
+    /// device-contiguous segments, Bind gathers them into one host buffer. No-ops unless the
+    /// runtime supports it and [Debug] multi_range_buffers is on.
+    void ResolveMultiRangeStorage(Binding& binding, bool is_written,
+                                  std::vector<MultiRangeSegment>& pool);
+
+    bool BindMultiRangeStorage(const Binding& binding, bool is_written,
+                               std::span<const MultiRangeSegment> pool);
+
     void BindHostComputeTextureBuffers();
 
     void DoUpdateGraphicsBuffers(bool is_indexed);
@@ -495,6 +518,10 @@ private:
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
+    VirtualRangeCache virtual_ranges;
+    std::vector<MultiRangeSegment> graphics_segments;
+    std::vector<MultiRangeSegment> compute_segments;
+    u64 multi_range_resolved{};
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers

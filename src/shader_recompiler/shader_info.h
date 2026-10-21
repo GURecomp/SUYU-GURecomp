@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
@@ -252,6 +252,7 @@ struct Info {
     bool uses_is_helper_invocation{};
     bool uses_subgroup_invocation_id{};
     bool uses_subgroup_shuffles{};
+    bool uses_quad_shuffles{};
     std::array<bool, 30> uses_patches{};
 
     std::array<Interpolation, 32> interpolation{};

@@ -1,9 +1,10 @@
-// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <span>
 #include <tuple>
 #include <type_traits>
@@ -322,6 +323,11 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
         if (ctx.runtime_info.force_early_z) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
         }
+        if (ctx.profile.support_shader_quad_control && program.info.uses_quad_shuffles) {
+            ctx.AddExtension("SPV_KHR_quad_control");
+            ctx.AddCapability(spv::Capability::QuadControlKHR);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::RequireFullQuadsKHR);
+        }
         break;
     default:
         throw NotImplementedException("Stage {}", program.stage);
@@ -335,7 +341,7 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
     if (info.uses_fp32_denorms_flush && info.uses_fp32_denorms_preserve) {
         LOG_DEBUG(Shader_SPIRV, "Fp32 denorm flush and preserve on the same shader");
     } else if (info.uses_fp32_denorms_flush) {
-        if (profile.support_fp32_denorm_flush) {
+        if (profile.support_fp32_denorm_flush && !profile.has_broken_fp32_denorm_flush) {
             ctx.AddCapability(spv::Capability::DenormFlushToZero);
             ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 32U);
         } else {
@@ -434,14 +440,23 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         ctx.AddCapability(spv::Capability::DrawParameters);
     }
     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
-         info.uses_subgroup_shuffles) &&
+         info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
         profile.support_vote && profile.SupportsSubgroupStage(ctx.stage)) {
         ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+        if (info.uses_subgroup_shuffles && profile.support_shuffle_relative) {
+            ctx.AddCapability(spv::Capability::GroupNonUniformShuffleRelative);
+        }
         if (!profile.warp_size_potentially_larger_than_guest) {
             // vote ops are only used when not taking the long path
             ctx.AddCapability(spv::Capability::GroupNonUniformVote);
         }
+    }
+    if (info.uses_quad_shuffles) {
+        if (profile.support_quad_shuffles) {
+            ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
+        }
+        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
     }
     if (info.uses_int64_bit_atomics && profile.support_int64_atomics) {
         ctx.AddCapability(spv::Capability::Int64Atomics);
@@ -465,12 +480,22 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     ctx.AddCapability(spv::Capability::ImageGatherExtended);
     ctx.AddCapability(spv::Capability::ImageQuery);
     ctx.AddCapability(spv::Capability::SampledBuffer);
-    // TODO: this usage needs to be tracked properly
-    if (ctx.profile.support_sampled_image_array_nonuniform_indexing) {
-        if (ctx.profile.supported_spirv < 0x00010400)
+    if (!ctx.non_uniform_ids.empty()) {
+        if (ctx.profile.supported_spirv < 0x00010500)
             ctx.AddExtension("SPV_EXT_descriptor_indexing");
         ctx.AddCapability(spv::Capability::ShaderNonUniform);
-        ctx.AddCapability(spv::Capability::SampledImageArrayNonUniformIndexing);
+        if (ctx.uses_nonuniform_sampled_image) {
+            ctx.AddCapability(spv::Capability::SampledImageArrayNonUniformIndexing);
+        }
+        if (ctx.uses_nonuniform_storage_image) {
+            ctx.AddCapability(spv::Capability::StorageImageArrayNonUniformIndexing);
+        }
+        if (ctx.uses_nonuniform_uniform_texel_buffer) {
+            ctx.AddCapability(spv::Capability::UniformTexelBufferArrayNonUniformIndexing);
+        }
+        if (ctx.uses_nonuniform_storage_texel_buffer) {
+            ctx.AddCapability(spv::Capability::StorageTexelBufferArrayNonUniformIndexing);
+        }
     }
 }
 
@@ -500,6 +525,29 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
                 return { ctx.Def(phi->Arg(phi_arg)), parent };
             });
         }
+
+void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::Op>> rewrites) {
+    if (rewrites.empty()) {
+        return;
+    }
+    size_t offset = 5;
+    while (offset + 2 < code.size()) {
+        const u32 word_count{code[offset] >> 16};
+        const auto opcode{static_cast<spv::Op>(code[offset] & 0xFFFFu)};
+        if (word_count == 0) {
+            return;
+        }
+        if (opcode == spv::Op::OpGroupNonUniformShuffleXor ||
+            opcode == spv::Op::OpGroupNonUniformQuadBroadcast) {
+            const auto it{std::ranges::find(rewrites, code[offset + 2],
+                                            &std::pair<u32, spv::Op>::first)};
+            if (it != rewrites.end()) {
+                code[offset] = (code[offset] & 0xFFFF0000u) | static_cast<u32>(it->second);
+            }
+        }
+        offset += word_count;
+    }
+}
 } // Anonymous namespace
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
@@ -514,7 +562,9 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     SetupCapabilities(profile, program.info, ctx);
     SetupTransformFeedbackCapabilities(ctx, main);
     PatchPhiNodes(program, ctx);
-    return ctx.Assemble();
+    std::vector<u32> code{ctx.Assemble()};
+    RewriteOpcodes(code, ctx.opcode_rewrites);
+    return code;
 }
 
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {

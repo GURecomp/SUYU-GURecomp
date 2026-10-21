@@ -64,6 +64,17 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_color_clear.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_color_clear.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_depthstencil_clear.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_motion_vectors.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_prep.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_composite.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_objmv_apply.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_objmv_search.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_objmv_classify.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_objmv_search_list.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_objvel.vert
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_objvel.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_objvel_merge.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_nvn_fsr_animsurf.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_easu_fp16.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_easu_fp32.frag

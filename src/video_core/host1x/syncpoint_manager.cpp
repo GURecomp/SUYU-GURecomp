@@ -59,7 +59,7 @@ void SyncpointManager::DeregisterHostAction(u32 syncpoint_id, const ActionHandle
 }
 
 void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
-    const double t = Kernel::StallRing::NowMs();
+    const double t = Kernel::StallRing::NowIfOn();
     Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id]);
     Kernel::StallRing::Add(Kernel::StallRing::Sync, Kernel::StallRing::t_gtid, 1, 0, syncpoint_id,
                            syncpoints_guest[syncpoint_id].load(), t, t);
@@ -67,7 +67,7 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
-    const double t = Kernel::StallRing::NowMs();
+    const double t = Kernel::StallRing::NowIfOn();
     Increment(syncpoints_host[syncpoint_id], wait_host_cv, host_action_storage[syncpoint_id]);
     Kernel::StallRing::Add(Kernel::StallRing::Sync, Kernel::StallRing::t_gtid, 0, 0, syncpoint_id,
                            syncpoints_host[syncpoint_id].load(), t, t);

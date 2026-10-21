@@ -22,7 +22,18 @@
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "common/fs/path_util.h"
+#include "common/logging/backend.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -37,6 +48,7 @@
 #include "suyu_cmd/controls.h"
 #include "suyu_cmd/game_menu.h"
 #include "suyu_cmd/multiplayer.h"
+#include "suyu_cmd/relaunch.h"
 
 namespace GameMenu {
 
@@ -942,6 +954,7 @@ struct SettingHint {
     const char* key;
     const char* label;
     const char* presets; // '|' separated, offered in a drop-down beside the field
+    bool closed;         // true: only these values (a labelled drop-down instead of a text field)
 };
 
 constexpr SettingHint kSettingHints[] = {
@@ -952,13 +965,28 @@ constexpr SettingHint kSettingHints[] = {
     {"Display", "fullscreen", "Start fullscreen", ""},
     {"Display", "show_fps", "FPS in the window title", ""},
     {"Display", "console_mode", "Console mode", "docked|handheld"},
+    {"Graphics", "renderer", "Renderer", "Emulated|Direct", true},
     {"Graphics", "native_render", "Render at the set resolution", ""},
-    {"Graphics", "draw_distance", "Draw distance", "1.0|1.5|2.0|3.0|4.0|8.0"},
-    {"Debug", "diagnostics", "Run reports", ""},
-    {"Debug", "gpu_diagnostics", "Run reports (replacement renderer)", ""},
-    {"Debug", "rtss_overlay", "Allow RivaTuner overlay", ""},
+    {"Upscaler", "nvn_fsr_quality", "Quality", "Native AA|Quality|Balanced|Performance|Ultra Performance", true},
+    {"Upscaler", "nvn_fsr_sharpness", "Sharpness", ""},
+    {"Upscaler", "render_scale_override", "Override render scale", ""},
+    {"Upscaler", "nvn_fsr_split_scale", "Render below the output (split scale)", ""},
+    {"Diagnostics", "diagnostics", "Run reports", ""},
+    {"Diagnostics", "gpu_diagnostics", "Run reports (replacement renderer)", ""},
+    {"Diagnostics", "log_redact_paths", "Hide personal data in logs", ""},
+    {"Diagnostics", "nvn_call_sampling", "NVN call sampling", ""},
+    {"Diagnostics", "nvn_perf_gpu", "GPU timestamps", "1|0"},
+    {"Diagnostics", "nvn_fsr_texel_stats", "FSR texel statistics", "1|0"},
+    {"Diagnostics", "nvn_bench", "Benchmark mode", "0|1"},
+    {"Diagnostics", "nvn_bench_scene", "Benchmark scene", ""},
+    {"Diagnostics", "nvn_bench_warmup", "Benchmark warm-up (s)", ""},
+    {"Diagnostics", "nvn_bench_measure", "Benchmark measure (s)", ""},
+    {"Diagnostics", "nvn_upscaler_probe", "Upscaler probes", ""},
+    {"Diagnostics", "vulkan_validation", "Vulkan validation layer", ""},
+    {"Diagnostics", "probes", "Wiggle-hitch probes", ""},
+    {"Display", "rtss_overlay", "Allow RivaTuner overlay", ""},
     {"Menu", "key", "Menu key", "F10|F9|F8|Home|none"},
-    {"Menu", "show_advanced", "Show advanced settings", ""},
+    {"Menu", "show_advanced", "Advanced mode", ""},
     {"Menu", "pad_combo", "Menu controller combo",
      "back+start|back+guide|leftstick+rightstick|none"},
 #ifdef _WIN32
@@ -996,6 +1024,48 @@ std::string CurrentValue(const GS::OptionInfo& o) {
     return v.empty() ? o.default_value : v;
 }
 
+/// game_settings.ini [Menu] show_advanced (Advanced mode), re-read about once a second and right after the menu changes it.
+Clock::time_point g_adv_next{};
+bool ShowAdvancedTab() {
+    static bool shown{};
+    if (Clock::now() >= g_adv_next) {
+        const std::string v = GS::Value("Menu", "show_advanced");
+        shown = v == "true" || v == "1" || v == "yes" || v == "on";
+        g_adv_next = Clock::now() + std::chrono::seconds(1);
+    }
+    return shown;
+}
+
+/// The Upscaler section's state (ini values + the Render scale the Quality mode would pick), refreshed when a setting was
+/// changed through the menu and about once a second (the files are read, so not every frame).
+struct UpState {
+    GS::UpscalerChoice choice{};
+    GS::FsrQuality quality{};
+    bool direct{};         // [Graphics] renderer = Direct
+    bool by_mode{};        // the Quality mode (not the saved Render scale) decides the render scale
+    int effective_step{3}; // Settings::ResolutionSetup index in use
+    std::string why;
+    bool verbose{};        // suyu log_filter is at Debug
+};
+const UpState& Up() {
+    static UpState up;
+    static std::uint64_t gen = ~std::uint64_t{0};
+    static Clock::time_point next{};
+    const std::uint64_t now_gen = GS::SettingsGeneration();
+    if (gen != now_gen || Clock::now() >= next) {
+        gen = now_gen;
+        next = Clock::now() + std::chrono::seconds(1);
+        up.choice = GS::UpscalerChoiceNow();
+        up.quality = GS::FsrQualityNow();
+        up.direct = GS::DirectRendererNow();
+        up.effective_step = GS::EffectiveResolutionStep(static_cast<int>(Settings::values.resolution_setup.GetValue()),
+                                                        &up.by_mode, &up.why);
+        const std::string f = Settings::values.log_filter.GetValue();
+        up.verbose = f.rfind("*:Debug", 0) == 0 || f.rfind("*:Trace", 0) == 0;
+    }
+    return up;
+}
+
 void LoadSettingsFields() {
     g_options.clear();
     for (GS::OptionInfo& o : GS::Options()) {
@@ -1017,8 +1087,8 @@ std::string CheckSetting(const GS::OptionInfo& o, const std::string& v) {
     if (o.section == "Display" && o.key == "fps" && v != "auto" && !in_range(10.0f, 360.0f)) {
         return "Frame rate: a number from 10 to 360, or auto.";
     }
-    if (o.section == "Graphics" && o.key == "draw_distance" && !in_range(1.0f, 8.0f)) {
-        return "Draw distance: a number from 1.0 to 8.0.";
+    if (o.section == "Upscaler" && o.key == "nvn_fsr_sharpness" && !in_range(0.0f, 1.0f)) {
+        return "Sharpness: a number from 0 to 1.";
     }
     return {};
 }
@@ -1038,6 +1108,7 @@ void CommitSetting(const GS::OptionInfo& o, const std::string& label, const std:
     bool live = GS::ApplyLive(o.section, o.key, value);
     if (o.section == "Menu") {
         ReadMenuSettings();
+        g_adv_next = {}; // Advanced mode: the tab and the rows follow at once
         live = true;
     }
     if (live) {
@@ -1053,6 +1124,153 @@ void CommitSetting(const GS::OptionInfo& o, const std::string& label, const std:
 }
 
 void DrawAdvancedRow(Settings::BasicSetting& setting);
+void DrawAdvancedValue(Settings::BasicSetting& setting);
+
+bool g_restart_confirm{}; // "Restart now" was clicked once: ask before closing
+bool g_restarting{};      // the new process is started and this one is closing
+std::string g_restart_error; // why the last restart could not start the new process
+
+/// The yellow "Restart the game to apply: ..." line (settings read only at start that changed this session) with
+/// a "Restart now" button beside it: a second click confirms, then the game starts again with the same command line
+/// and this instance closes normally (the new one waits for it). If the start fails, the error is shown and
+/// nothing closes.
+void DrawRestartLine() {
+    if (g_restart_needed.empty()) {
+        return;
+    }
+    std::string list;
+    for (const auto& name : g_restart_needed) {
+        list += (list.empty() ? "" : ", ") + name;
+    }
+    ImGui::TextColored(kYellow, "Restart the game to apply: %s", list.c_str());
+    if (!g_restart_error.empty()) {
+        ImGui::TextColored(kRed, "%s", g_restart_error.c_str());
+    }
+    if (g_restarting) {
+        ImGui::SameLine();
+        ImGui::TextColored(kYellow, "(restarting...)");
+        return;
+    }
+    ImGui::SameLine();
+    if (!g_restart_confirm) {
+        if (ImGui::SmallButton("Restart now")) {
+            g_restart_confirm = true;
+            g_restart_error.clear();
+        }
+        return;
+    }
+    ImGui::TextColored(kYellow, "Close the game and start it again?");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Yes, restart")) {
+        std::string error;
+        unsigned long pid = 0;
+        if (Relaunch::StartNewInstance(&error, &pid)) {
+            LOG_INFO(Frontend, "game menu: restart: new instance started (pid {}), closing this one", pid);
+            g_restarting = true;
+            g_settings_message = "Restarting: the game closes and starts again.";
+            g_settings_message_bad = false;
+            SDL_Event quit{};
+            quit.type = SDL_EVENT_QUIT; // the normal close path (window closed): saves and shuts down cleanly
+            SDL_PushEvent(&quit);
+        } else {
+            LOG_ERROR(Frontend, "game menu: restart failed: {}", error);
+            g_restart_error = "Restart failed: " + error + ". The game keeps running.";
+            g_restart_confirm = false;
+            return;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Cancel")) {
+        g_restart_confirm = false;
+    }
+}
+
+void MarkRestart(const std::string& label) {
+    if (std::find(g_restart_needed.begin(), g_restart_needed.end(), label) == g_restart_needed.end()) {
+        g_restart_needed.push_back(label);
+    }
+}
+
+/// Starts a two-column settings row: label (+ help marker) and the value cell.
+void RowStart(const std::string& label, const std::string& help) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label.c_str());
+    if (!help.empty()) {
+        HelpMarker(help.c_str());
+    }
+    ImGui::TableNextColumn();
+}
+
+/// "Upscaler": Off | FSR 3.1 | FSR 4. Stored as [Upscaler] nvn_fsr (bool) + nvn_fsr_backend (3 | 4).
+void DrawUpscalerChoiceRow(const UpState& up, bool grey) {
+    constexpr const char* kNames[] = {"Off", "FSR 3.1", "FSR 4"};
+    ImGui::PushID("upscaler_choice");
+    ImGui::BeginDisabled(grey);
+    RowStart("Upscaler",
+             "[Upscaler] nvn_fsr + nvn_fsr_backend\n\nOff, FSR 3.1 (Vulkan) or FSR 4 (through the graphics driver's DX12 library, "
+             "falls back to 3.1). Needs the Direct renderer. Applies after a restart.");
+    const int cur = static_cast<int>(up.choice);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
+    if (ImGui::BeginCombo("##value", kNames[cur])) {
+        for (int i = 0; i < 3; ++i) {
+            if (ImGui::Selectable(kNames[i], i == cur) && i != cur) {
+                GS::SetUpscalerChoice(static_cast<GS::UpscalerChoice>(i));
+                LOG_INFO(Frontend, "game menu: Upscaler = {}", kNames[i]);
+                g_settings_message = fmt::format("Upscaler: {} (saved; restart the game to apply)", kNames[i]);
+                g_settings_message_bad = false;
+                MarkRestart("Upscaler");
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    ImGui::PopID();
+}
+
+/// "Render scale": the saved Graphics > Resolution scale (suyu's resolution_setup, kept as the backing store). Greyed and
+/// showing the effective value while an upscaler's Quality mode decides it.
+void DrawRenderScaleRow(const UpState& up) {
+    ImGui::PushID("render_scale");
+    RowStart("Render scale",
+             "How much sharper than the game's own resolution the picture is drawn (1X = native). Not the window size: "
+             "that is Display > Resolution. With the replacement renderer it applies after a restart.\n\nWhile an Upscaler "
+             "is on (and Advanced mode's Override render scale is off) the Quality mode decides this value.");
+    if (up.by_mode) {
+        ImGui::BeginDisabled(true);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+        if (ImGui::BeginCombo("##value", fmt::format("{}", GS::ResolutionStepName(up.effective_step)).c_str())) {
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        ImGui::TextColored(kGrey, "Set by the Upscaler's Quality mode (%s). Your saved value is kept.", up.why.c_str());
+    } else {
+        DrawAdvancedValue(Settings::values.resolution_setup);
+    }
+    ImGui::PopID();
+}
+
+/// "Verbose log": suyu's log_filter *:Debug (on) or the default *:Info (off), applied to the running logger at once.
+void DrawVerboseLogRow(const UpState& up) {
+    ImGui::PushID("verbose_log");
+    RowStart("Verbose log",
+             "suyu's log_filter: on = *:Debug (much bigger suyu log), off = the default *:Info. Applies at once and is "
+             "saved with suyu's config. A custom log_filter is replaced when you switch this.");
+    bool on = up.verbose;
+    if (ImGui::Checkbox("##value", &on)) {
+        const std::string filter_text = on ? "*:Debug" : "*:Info";
+        Settings::values.log_filter.SetValue(filter_text);
+        Common::Log::Filter filter;
+        filter.ParseFilterString(filter_text);
+        Common::Log::SetGlobalFilter(filter);
+        Controls::SaveConfig();
+        LOG_INFO(Frontend, "game menu: verbose log {} (log_filter = {})", on ? "on" : "off", filter_text);
+        g_settings_message = fmt::format("Verbose log: {} (applied now)", on ? "on" : "off");
+        g_settings_message_bad = false;
+    }
+    ImGui::PopID();
+}
 
 void DrawSettings() {
     ImGui::TextWrapped("The options in game_settings.ini beside the game. Changes are saved right "
@@ -1061,44 +1279,53 @@ void DrawSettings() {
     if (ImGui::Button("Open game_settings.ini")) {
         OpenPath(Common::FS::GetExeDirectory() / "game_settings.ini");
     }
-    if (!g_restart_needed.empty()) {
-        std::string list;
-        for (const auto& name : g_restart_needed) {
-            list += (list.empty() ? "" : ", ") + name;
-        }
-        ImGui::TextColored(kYellow, "Restart the game to apply: %s", list.c_str());
-    }
+    DrawRestartLine();
     if (!g_settings_message.empty()) {
         ImGui::TextColored(g_settings_message_bad ? kRed : kGrey, "%s",
                            g_settings_message.c_str());
     }
 
-    SectionTitle("Resolution scale");
-    if (ImGui::BeginTable("resscale", 2)) {
-        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
-                                ImGui::GetFontSize() * 14.0f);
-        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
-        DrawAdvancedRow(Settings::values.resolution_setup);
-        ImGui::EndTable();
-    }
-    ImGui::TextColored(kGrey, "How much sharper than the game's own resolution suyu renders "
-                              "(1X = native). Not the window size: that is Display > Resolution. "
-                              "With the replacement renderer it applies after a restart.");
-
+    const bool advanced_mode = ShowAdvancedTab();
+    const UpState& up = Up();
     std::string section;
     bool table_open = false;
     const float label_width = ImGui::GetFontSize() * 14.0f;
+    // rows that close a section: the Render scale row ends Graphics, Verbose log ends Diagnostics
+    const auto end_section = [&](const std::string& finished) {
+        if (!table_open) {
+            return;
+        }
+        if (finished == "Graphics") {
+            DrawRenderScaleRow(up);
+        } else if (finished == "Diagnostics") {
+            DrawVerboseLogRow(up);
+        }
+    };
     for (const GS::OptionInfo& o : g_options) {
+        if (o.advanced && !advanced_mode) {
+            continue; // Advanced mode rows (the Diagnostics group, Override render scale)
+        }
         if (o.section != section) {
+            end_section(section);
             if (table_open) {
                 ImGui::EndTable();
             }
             section = o.section;
             SectionTitle(section.c_str());
+            if (section == "Upscaler") {
+                if (!up.direct) {
+                    ImGui::TextColored(kYellow, "FSR needs the Direct renderer: set Renderer (Graphics) to Direct and restart.");
+                } else if (up.by_mode) {
+                    ImGui::TextColored(kGrey, "The Quality mode decides the Render scale (Graphics).");
+                }
+            }
             table_open = ImGui::BeginTable(section.c_str(), 2);
             if (table_open) {
                 ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed, label_width);
                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+                if (section == "Upscaler") {
+                    DrawUpscalerChoiceRow(up, !up.direct);
+                }
             }
         }
         if (!table_open) {
@@ -1108,8 +1335,13 @@ void DrawSettings() {
         const std::string label = hint != nullptr ? hint->label : o.key;
         const std::string id = o.section + "/" + o.key;
         auto& text = g_setting_text[id];
+        // Upscaler rows are greyed with the Direct renderer missing; Quality and Sharpness also with the Upscaler off
+        const bool grey = o.section == "Upscaler" &&
+                          (!up.direct || ((o.key == "nvn_fsr_quality" || o.key == "nvn_fsr_sharpness") &&
+                                          up.choice == GS::UpscalerChoice::Off));
 
         ImGui::PushID(id.c_str());
+        ImGui::BeginDisabled(grey);
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::AlignTextToFramePadding();
@@ -1122,6 +1354,35 @@ void DrawSettings() {
             bool on = IsOn(text.data());
             if (ImGui::Checkbox("##value", &on)) {
                 CopyTo(text, on ? "true" : "false");
+                CommitSetting(o, label, text.data());
+            }
+        } else if (hint != nullptr && hint->closed) {
+            // a labelled drop-down with only the listed values
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+            if (ImGui::BeginCombo("##value", text.data())) {
+                const std::string_view all{hint->presets};
+                std::size_t start = 0;
+                while (start <= all.size()) {
+                    const std::size_t end = std::min(all.find('|', start), all.size());
+                    const std::string choice{all.substr(start, end - start)};
+                    std::string a = choice, b = text.data();
+                    for (char& c : a) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    for (char& c : b) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (ImGui::Selectable(choice.c_str(), a == b)) {
+                        CopyTo(text, choice);
+                        CommitSetting(o, label, choice);
+                    }
+                    start = end + 1;
+                }
+                ImGui::EndCombo();
+            }
+        } else if (o.section == "Upscaler" && o.key == "nvn_fsr_sharpness") {
+            float f = std::strtof(text.data(), nullptr);
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+            if (ImGui::SliderFloat("##value", &f, 0.0f, 1.0f, "%.2f")) {
+                CopyTo(text, fmt::format("{:.2f}", f));
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
                 CommitSetting(o, label, text.data());
             }
         } else {
@@ -1152,8 +1413,10 @@ void DrawSettings() {
                 }
             }
         }
+        ImGui::EndDisabled();
         ImGui::PopID();
     }
+    end_section(section);
     if (table_open) {
         ImGui::EndTable();
     }
@@ -1273,6 +1536,11 @@ void CommitAdvanced(Settings::BasicSetting& setting, const std::string& value) {
     } else {
         g_adv_message =
             fmt::format("{}: {} (saved; restart the game to apply)", setting.GetLabel(), after);
+        // read only at start: listed for the Settings tab's "Restart now" line too
+        if (std::find(g_restart_needed.begin(), g_restart_needed.end(), setting.GetLabel()) ==
+            g_restart_needed.end()) {
+            g_restart_needed.push_back(setting.GetLabel());
+        }
     }
     g_adv_message_bad = false;
 }
@@ -1345,18 +1613,6 @@ void DrawAdvancedRow(Settings::BasicSetting& setting) {
     ImGui::PopID();
 }
 
-/// game_settings.ini [Menu] show_advanced, re-read about once a second (the Settings tab edits it).
-bool ShowAdvancedTab() {
-    static bool shown{};
-    static Clock::time_point next{};
-    if (Clock::now() >= next) {
-        const std::string v = GS::Value("Menu", "show_advanced");
-        shown = v == "true" || v == "1" || v == "yes" || v == "on";
-        next = Clock::now() + std::chrono::seconds(1);
-    }
-    return shown;
-}
-
 void DrawAdvanced() {
     ImGui::TextWrapped("Every setting of suyu's own configuration, grouped like its config tab. "
                        "Changes are saved with the game's config when it closes; settings that "
@@ -1367,6 +1623,7 @@ void DrawAdvanced() {
     if (!g_adv_message.empty()) {
         ImGui::TextColored(g_adv_message_bad ? kRed : kGrey, "%s", g_adv_message.c_str());
     }
+    DrawRestartLine();
     std::string needle = g_adv_filter;
     std::transform(needle.begin(), needle.end(), needle.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -1608,7 +1865,24 @@ void Open() {
         SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
                               SDL_WINDOWPOS_CENTERED_DISPLAY(display));
     }
-    g_renderer = SDL_CreateRenderer(g_window, nullptr);
+    // RivaTuner's injected hooks (RTSSHooks64.dll, loaded even with its Vulkan layer kept out) crash
+    // when this window presents through D3D11 on the main thread while the game presents through
+    // Vulkan on the GPU thread (null read in d3d11.dll under RTSSHooks64, called from the Vulkan
+    // driver's present). With RTSS in the process the menu draws in software and blits through GDI,
+    // so it has no D3D/GL/Vulkan swapchain for RTSS to hook.
+    bool software = false;
+#ifdef _WIN32
+    software = GetModuleHandleW(L"RTSSHooks64.dll") != nullptr;
+#endif
+    if (software) {
+        SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0"); // window surface via GDI, not a D3D11 texture
+        g_renderer = SDL_CreateRenderer(g_window, SDL_SOFTWARE_RENDERER);
+        LOG_INFO(Frontend, "game menu: RivaTuner hooks in the process, software renderer ({})",
+                 g_renderer != nullptr ? "ok" : SDL_GetError());
+    }
+    if (g_renderer == nullptr) {
+        g_renderer = SDL_CreateRenderer(g_window, nullptr);
+    }
     if (g_renderer == nullptr) {
         g_renderer = SDL_CreateRenderer(g_window, SDL_SOFTWARE_RENDERER);
     }

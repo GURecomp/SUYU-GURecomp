@@ -73,6 +73,7 @@ endif()
 option(ENABLE_QT "Enable the Qt frontend" ON)
 option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" OFF)
 option(ENABLE_UPDATE_CHECKER "Enable update checker (for Qt and Android)" OFF)
+option(YUZU_WERROR "Treat selected compiler warnings as errors" ON)
 cmake_dependent_option(YUZU_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera"  OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
 cmake_dependent_option(YUZU_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
 set(YUZU_QT_MIRROR "" CACHE STRING "What mirror to use for downloading the bundled Qt libraries")
@@ -260,6 +261,9 @@ set(YUZU_TZDB_PATH "" CACHE STRING "Path to a pre-downloaded timezone database")
 cmake_dependent_option(YUZU_USE_BUNDLED_MOLTENVK "Download bundled MoltenVK lib" ON "APPLE" OFF)
 
 option(YUZU_DISABLE_LLVM "Disable LLVM (useful for CI)" OFF)
+
+# Vendored FSR 3.1 Vulkan upscaler (externals/fsr-vulkan) for the NVN replacement renderer's [Debug] nvn_fsr.
+cmake_dependent_option(SUYU_FSR_VULKAN "Build the vendored FSR 3.1 Vulkan upscaler (nvn_fsr)" ON "NOT ANDROID AND NOT APPLE" OFF)
 
 set(DEFAULT_YUZU_USE_BUNDLED_OPENSSL OFF)
 if (EXT_DEFAULT OR PLATFORM_SUN OR PLATFORM_OPENBSD)

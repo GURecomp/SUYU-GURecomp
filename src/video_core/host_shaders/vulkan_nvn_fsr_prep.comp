@@ -1,0 +1,148 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_fsr: FSR input preparation at render size.
+//  - depth: the scene depth (D32_S8, read through its depth-only sampled view) copied to an R32_SFLOAT image, so FSR
+//    never sees (or transitions) a depth/stencil image. Value unchanged (device depth, standard Z).
+//  - silhouette (flags bit 0 = the mask target is bound this frame): the game's dynamic-object mask (background
+//    (0,0,0,0); players, NPCs, small monsters, tents and their cast shadows (0, g, g, g), g up to 1 with soft edges;
+//    checked on dumps of 754f: 0 or 255 except edge texels): sil = smoothstep(0.5/255, 0.25, g). Written to sil_out
+//    every frame (0 when off) so the next frame can read it as sil_prev. Mask and depth may differ in size (nearest).
+//  - previous silhouette (flags bit 4, history valid bit 2): the ghost trail of a moving character lies where it WAS:
+//    FSR fetches history at p + mv (cur + mv = prev, camera-only vectors), so the previous frame's silhouette is read
+//    at that same reprojected texel (3x3 max = 1 texel of dilation). Without this the mask only covers where the
+//    character IS, where FSR's colour clamp already rejects most of the stale history.
+//  - motion mask (flags bit 1, history valid bit 2): d = how far the current colour lies outside the min/max box of
+//    the previous frame's input colour in the 3x3 texels around the reprojected texel (the box absorbs the sub-pixel
+//    jitter between frames); m = smoothstep(mot_lo, mot_hi, d). Large where the picture changed in a way the camera
+//    vectors do not explain (moving characters, their trails, effects).
+//  - colour history: the current input colour is copied to col_out (next frame's col_prev).
+//  - object vectors (flags bit 5, [Debug] nvn_fsr_objmv): objw.r = fit of the history FSR fetches with the vector it
+//    gets at this texel (vulkan_nvn_fsr_objmv_apply.comp: object vector where block matching found one, else camera);
+//    the silhouette terms are lowered by 65% x fit there (the reactive mask stays as the safety net where it does not
+//    fit, e.g. the ghost trail). objw.g = the low-rate (cloth)
+//    reactive of the jump frame and its 2-frame hold, added to the max.
+//  - the silhouette is stored whenever the mask target is bound (the object vector pass reads it next frame); it only
+//    enters the reactive mask with flags bit 4 (Numpad2).
+//  - geometry object vectors (flags bit 6, [Debug] nvn_fsr_objvel): vel_tex.b = 1 where the velocity pass left a
+//    valid object vector (vulkan_nvn_fsr_objvel.frag). There the motion vector itself is right, so the reactive mask is
+//    capped (vel_cap, [Debug] nvn_fsr_objvel_reactive, default 0.1) instead of making FSR show the raw jittered sample
+//    (that is what made NPCs shimmer). The cap is blended by the share of valid texels in the 3x3 neighbourhood, so
+//    silhouette edges do not switch between full and capped reactive from frame to frame.
+//  - animated surfaces (flags bit 7, [Debug] nvn_fsr_animsurf, Numpad0): 8x8 tiles flagged by vulkan_nvn_fsr_animsurf.comp
+//    (this frame or the last) get at least anim_react.
+//    Texels of a draw whose CPU-animated vertices changed this frame after >= 2 unchanged frames (cloth at its low
+//    animation rate; velocity alpha = 1) get at least jump_react.
+// reactive = strength * max(sil x (1 - 0.65 w), sil_prev x (1 - 0.65 w), m, cloth) (strength: [Debug]
+// nvn_fsr_reactive_strength, default 0.9 = FSR's recommended maximum), then the object-vector cap.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depth_tex;
+layout(set = 0, binding = 1) uniform sampler2D mask_tex;
+layout(set = 0, binding = 2) uniform writeonly image2D depth_out;
+layout(set = 0, binding = 3) uniform writeonly image2D reactive_out;
+layout(set = 0, binding = 4) uniform sampler2D sil_prev;
+layout(set = 0, binding = 5) uniform writeonly image2D sil_out;
+layout(set = 0, binding = 6) uniform sampler2D col_cur;
+layout(set = 0, binding = 7) uniform sampler2D col_prev;
+layout(set = 0, binding = 8) uniform writeonly image2D col_out;
+layout(set = 0, binding = 9) uniform sampler2D mv_tex;
+layout(set = 0, binding = 10) uniform sampler2D objw_tex;
+layout(set = 0, binding = 11) uniform sampler2D vel_tex;
+layout(set = 0, binding = 12) uniform sampler2D anim_tex; // animated-surface tiles (vulkan_nvn_fsr_animsurf.comp)
+
+layout(push_constant) uniform PushConstants {
+    uint flags;
+    float strength;
+    float mot_lo;
+    float mot_hi;
+    float vel_cap;
+    float jump_react;
+    float anim_react;
+    float pad2;
+} pc;
+
+void main() {
+    const ivec2 size = imageSize(depth_out);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+    if ((pc.flags & 256u) == 0u) { // bit 8: still-picture frame, the depth image keeps the last scene depth
+        imageStore(depth_out, p, vec4(texelFetch(depth_tex, p, 0).r, 0.0, 0.0, 0.0));
+    }
+    const vec3 cur = texelFetch(col_cur, p, 0).rgb;
+    imageStore(col_out, p, vec4(cur, 1.0));
+    float sil = 0.0;
+    if ((pc.flags & 1u) != 0u) {
+        const ivec2 msize = textureSize(mask_tex, 0);
+        const ivec2 q = clamp(ivec2((vec2(p) + 0.5) * vec2(msize) / vec2(size)), ivec2(0), msize - 1);
+        sil = smoothstep(0.5 / 255.0, 0.25, texelFetch(mask_tex, q, 0).g);
+    }
+    imageStore(sil_out, p, vec4(sil, 0.0, 0.0, 0.0));
+    float r = (pc.flags & 16u) != 0u ? sil : 0.0;
+    if ((pc.flags & 4u) != 0u && (pc.flags & 18u) != 0u) {
+        const vec2 mv = texelFetch(mv_tex, p, 0).rg;
+        if (!any(isnan(mv)) && !any(isinf(mv))) {
+            const ivec2 q = ivec2(floor(vec2(p) + 0.5 + mv));
+            if (q.x >= 0 && q.y >= 0 && q.x < size.x && q.y < size.y) {
+                float sp = 0.0;
+                vec3 lo = vec3(1.0), hi = vec3(0.0);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const ivec2 t = clamp(q + ivec2(dx, dy), ivec2(0), size - 1);
+                        if ((pc.flags & 16u) != 0u) {
+                            sp = max(sp, texelFetch(sil_prev, t, 0).r);
+                        }
+                        if ((pc.flags & 2u) != 0u) {
+                            const vec3 c = texelFetch(col_prev, t, 0).rgb;
+                            lo = min(lo, c);
+                            hi = max(hi, c);
+                        }
+                    }
+                }
+                r = max(r, sp);
+                if ((pc.flags & 32u) != 0u) {
+                    r *= 1.0 - 0.65 * texelFetch(objw_tex, p, 0).r;
+                }
+                if ((pc.flags & 2u) != 0u) {
+                    const vec3 out_box = max(max(lo - cur, cur - hi), vec3(0.0));
+                    const float d = max(out_box.r, max(out_box.g, out_box.b));
+                    r = max(r, smoothstep(pc.mot_lo, max(pc.mot_hi, pc.mot_lo + 1e-4), d));
+                }
+            }
+        }
+    }
+    if ((pc.flags & 32u) != 0u) {
+        r = max(r, texelFetch(objw_tex, p, 0).g);
+    }
+    float react = pc.strength * r;
+    if ((pc.flags & 64u) != 0u) {
+        const ivec2 vsize = textureSize(vel_tex, 0);
+        float cov = 0.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const ivec2 t = clamp(p + ivec2(dx, dy), ivec2(0), vsize - 1);
+                cov += texelFetch(vel_tex, t, 0).b > 0.5 ? 1.0 : 0.0;
+            }
+        }
+        react = mix(react, min(react, pc.vel_cap), cov / 9.0);
+        // low-rate (cloth) pose update in this frame: the vector is exact, but the history of the old pose is a poor
+        // match for the new shading; raise the reactive there (alpha of the velocity image, objvel.frag)
+        if (texelFetch(vel_tex, clamp(p, ivec2(0), vsize - 1), 0).a > 0.5) {
+            react = max(react, pc.jump_react);
+        }
+    }
+    if ((pc.flags & 128u) != 0u) {
+        // a static surface whose low-passed colour changed (texture / UV flipbook step): update frame and the next
+        const ivec2 tsize = textureSize(anim_tex, 0);
+        const vec4 t = texelFetch(anim_tex, clamp(p / 8, ivec2(0), tsize - 1), 0);
+        if (t.r > 0.2 || t.b > 0.2) { // weight 1 (repeating cadence) or 0.35 (first flag)
+            react = max(react, pc.anim_react);
+        }
+    }
+    imageStore(reactive_out, p, vec4(react, 0.0, 0.0, 0.0));
+}

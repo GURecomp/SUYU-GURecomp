@@ -55,6 +55,12 @@ enum : u64 {
     DEFAULT_STACK_SIZE = 0x100000,
 };
 
+/// The calling thread's guest reads skip the rasterizer download (suyu GPU-side copies are not flushed back first),
+/// i.e. every read on this thread behaves like ReadBlockUnsafe. For host threads that are not CPU cores (NVN renderer).
+void SetThreadSkipsRasterizerDownload(bool skip);
+/// How many rasterizer downloads were requested from threads that are not CPU core threads (diagnostics).
+u64 NonCoreRasterizerDownloads();
+
 /// Central class that handles all memory operations and state.
 class Memory {
 public:
@@ -166,6 +172,9 @@ public:
      */
     u8* GetPointer(Common::ProcessAddress vaddr);
     u8* GetPointerSilent(Common::ProcessAddress vaddr);
+    /// Host pointer when vaddr's page is plain memory (what Read32 / ReadBlock copy from directly), else nullptr
+    /// (unmapped, debug or rasterizer-cached pages: read those with ReadBlock). Valid up to the end of that page.
+    const u8* GetPlainPointer(Common::ProcessAddress vaddr) const;
 
     template <typename T>
     T* GetPointer(Common::ProcessAddress vaddr) {

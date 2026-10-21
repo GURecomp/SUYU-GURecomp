@@ -69,8 +69,6 @@ struct Rec {
     u32 s[4];     // VFP s0..s3 as the call started
     u32 snap[16]; // words of the object the call points at (per op, see nvn_rec.cpp)
     u64 program[2]{}; // BindProgram: code addresses of the vertex and pixel programs
-    u32 nwords{};     // state binds: the words the proven word builder makes for the call (see nvn_shadow.cpp)
-    u32 words[24]{};
     u32 pobj[12]{};   // BindProgram diagnostics: first words of the program object
     u32 pblock[40]{}; // BindProgram diagnostics: the command words the object points at
     u32 pblock_n{};
@@ -79,11 +77,16 @@ struct Rec {
 struct List {
     u32 cmd{};
     std::vector<Rec> recs;
+    bool handed{}; // recorder-internal: the records went to a submit and no BeginRecording followed yet
 };
 
-/// Called with the lists of one queue submit, in submit order (on the game thread).
+/// Called with the lists of one queue submit, in submit order (on the game thread). The lists own their records
+/// (handed over, not shared with the recorder).
 using Sink = void (*)(Memory::Memory& mem, std::vector<std::unique_ptr<List>>&& lists, u32 queue);
 void SetSink(Sink sink);
+/// Optional: gives replayed lists back so their record buffers are reused by the next submits (no 2 MB allocation
+/// per submit). Frees what the pool does not keep. Any thread.
+void RecycleLists(std::vector<std::unique_ptr<List>>&& lists);
 
 /// Called when the game presents a window texture (texture object address).
 using PresentSink = void (*)(Memory::Memory& mem, u32 texture);
@@ -105,6 +108,9 @@ void RegisterPresentProbeOnly();
 /// The recorder instead of a native word builder: called first by the native entry (any
 /// outcome), so nothing is missed when the native declines.
 void OnCall(const char* name, u32* regs, Memory::Memory& mem);
+/// The same with the name resolved once (ResolveCall; -1 = an entry the recorder does not record).
+int ResolveCall(const char* name);
+void OnCallResolved(int index, const char* name, u32* regs, Memory::Memory& mem);
 
 void Flush(const std::filesystem::path& file);
 

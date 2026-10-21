@@ -9,6 +9,7 @@
 #include <array>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <span>
@@ -210,6 +211,12 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdBeginRenderPass vkCmdBeginRenderPass{};
     PFN_vkCmdBeginTransformFeedbackEXT vkCmdBeginTransformFeedbackEXT{};
     PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets{};
+    PFN_vkCmdBindDescriptorBuffersEXT vkCmdBindDescriptorBuffersEXT{};
+    PFN_vkCmdSetDescriptorBufferOffsetsEXT vkCmdSetDescriptorBufferOffsetsEXT{};
+    PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress{};
+    PFN_vkGetDescriptorEXT vkGetDescriptorEXT{};
+    PFN_vkGetDescriptorSetLayoutSizeEXT vkGetDescriptorSetLayoutSizeEXT{};
+    PFN_vkGetDescriptorSetLayoutBindingOffsetEXT vkGetDescriptorSetLayoutBindingOffsetEXT{};
     PFN_vkCmdBindIndexBuffer vkCmdBindIndexBuffer{};
     PFN_vkCmdBindPipeline vkCmdBindPipeline{};
     PFN_vkCmdBindTransformFeedbackBuffersEXT vkCmdBindTransformFeedbackBuffersEXT{};
@@ -793,6 +800,11 @@ public:
         return !mapped.empty();
     }
 
+    /// Returns true if the buffer's memory is host coherent.
+    bool IsHostCoherent() const noexcept {
+        return is_coherent;
+    }
+
     void Flush() const;
 
     void Invalidate() const;
@@ -822,21 +834,41 @@ public:
 
     VkResult Submit(Span<VkSubmitInfo> submit_infos,
                     VkFence fence = VK_NULL_HANDLE) const noexcept {
+        const Lock lock{mutex};
         return dld->vkQueueSubmit(queue, submit_infos.size(), submit_infos.data(), fence);
     }
 
     /// Submits using VK_KHR_synchronization2 / Vulkan 1.3 vkQueueSubmit2.
     VkResult Submit2(Span<VkSubmitInfo2> submit_infos,
                      VkFence fence = VK_NULL_HANDLE) const noexcept {
+        const Lock lock{mutex};
         return dld->vkQueueSubmit2(queue, submit_infos.size(), submit_infos.data(), fence);
     }
 
     VkResult Present(const VkPresentInfoKHR& present_info) const noexcept {
+        const Lock lock{mutex};
         return dld->vkQueuePresentKHR(queue, &present_info);
     }
 
+    /// Serialises submits/presents with every other handle of the same VkQueue that got the same
+    /// mutex (Vulkan queues are externally synchronised).
+    void SetMutex(std::mutex* mutex_) noexcept {
+        mutex = mutex_;
+    }
+
 private:
+    struct Lock {
+        explicit Lock(std::mutex* m_) : m{m_} {
+            if (m) m->lock();
+        }
+        ~Lock() {
+            if (m) m->unlock();
+        }
+        std::mutex* m;
+    };
+
     VkQueue queue = nullptr;
+    std::mutex* mutex = nullptr;
     const DeviceDispatch* dld = nullptr;
 };
 
@@ -1087,6 +1119,35 @@ public:
         dld->vkUpdateDescriptorSetWithTemplate(handle, set, update_template, data);
     }
 
+    // VK_EXT_descriptor_buffer (only called when Device::IsDescriptorBufferEnabled()).
+    [[nodiscard]] VkDeviceAddress GetBufferDeviceAddress(VkBuffer buffer) const noexcept {
+        const VkBufferDeviceAddressInfo info{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .pNext = nullptr,
+            .buffer = buffer,
+        };
+        return dld->vkGetBufferDeviceAddress(handle, &info);
+    }
+
+    [[nodiscard]] VkDeviceSize GetDescriptorSetLayoutSizeEXT(
+        VkDescriptorSetLayout layout) const noexcept {
+        VkDeviceSize size{};
+        dld->vkGetDescriptorSetLayoutSizeEXT(handle, layout, &size);
+        return size;
+    }
+
+    [[nodiscard]] VkDeviceSize GetDescriptorSetLayoutBindingOffsetEXT(VkDescriptorSetLayout layout,
+                                                                      u32 binding) const noexcept {
+        VkDeviceSize offset{};
+        dld->vkGetDescriptorSetLayoutBindingOffsetEXT(handle, layout, binding, &offset);
+        return offset;
+    }
+
+    void GetDescriptorEXT(const VkDescriptorGetInfoEXT& info, size_t data_size,
+                          void* descriptor) const noexcept {
+        dld->vkGetDescriptorEXT(handle, &info, data_size, descriptor);
+    }
+
     VkResult AcquireNextImageKHR(VkSwapchainKHR swapchain, u64 timeout, VkSemaphore semaphore,
                                  VkFence fence, u32* image_index) const noexcept {
         return dld->vkAcquireNextImageKHR(handle, swapchain, timeout, semaphore, fence,
@@ -1208,6 +1269,17 @@ public:
                                           VkPipelineLayout layout, u32 set,
                                           const void* data) const noexcept {
         dld->vkCmdPushDescriptorSetWithTemplateKHR(handle, update_template, layout, set, data);
+    }
+
+    void BindDescriptorBuffersEXT(const VkDescriptorBufferBindingInfoEXT& binding) const noexcept {
+        dld->vkCmdBindDescriptorBuffersEXT(handle, 1, &binding);
+    }
+
+    void SetDescriptorBufferOffsetsEXT(VkPipelineBindPoint bind_point, VkPipelineLayout layout,
+                                       u32 first_set, u32 buffer_index,
+                                       VkDeviceSize offset) const noexcept {
+        dld->vkCmdSetDescriptorBufferOffsetsEXT(handle, bind_point, layout, first_set, 1,
+                                                &buffer_index, &offset);
     }
 
     void BindPipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline) const noexcept {

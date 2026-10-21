@@ -1,0 +1,239 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_fsr_objmv: object motion by block matching, pass 1 of 2 (one workgroup per 8x8 block
+// of the render-size input). The motion vector pass only knows the camera, so moving characters and animated cloth get
+// camera vectors and FSR fetches their history from the wrong place (ghost trails). Here each block of the dynamic
+// region is matched against the previous FSR input (luma SAD, 12x12 window = block + 2 px), the search centred on the
+// camera vector, and the best offset becomes the block's object vector when it clearly beats the camera vector.
+// Dynamic region, two kinds:
+//  - silhouette blocks: the game's dynamic-object mask (players, NPCs, small monsters) of this frame (dilated ~4 px) or
+//    of the previous frame at the camera-reprojected texel. They move at the full frame rate: search +-12 px.
+//  - low-rate blocks (cloth / banners: vertex-animated, not in the mask, animated at the game's base rate, so they are
+//    still for several presented frames and then jump): >= 8 of the 64 texels changed against the previous input at
+//    the camera-reprojected texel (outside its 3x3 colour box by > chg_thr), the texel near the camera (linear depth
+//    < near_limit; excludes distant ropes / fine edges, which shimmer under any frame-difference test). Searched only
+//    in the jump frame, +-20 px (coarse step 2, then +-1, then a parabola for the sub-pixel part). hold (alpha) = 1
+//    in the jump frame, then -0.34 per frame (read from the previous block image at the reprojected block), so the
+//    reactive hold of pass 2 lasts 2 frames after a jump.
+// Output (RGBA16F per block): rg = object vector (render px, cur + mv = prev, jitter removed: the matched picture
+// displacement minus (prev picture shift - current picture shift)), b = confidence 0..1 (-1 = block not searched),
+// a = low-rate hold.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D col_cur;
+layout(set = 0, binding = 1) uniform sampler2D col_prev;
+layout(set = 0, binding = 2) uniform sampler2D mv_tex;
+layout(set = 0, binding = 3) uniform sampler2D mask_tex;
+layout(set = 0, binding = 4) uniform sampler2D sil_prev;
+layout(set = 0, binding = 5) uniform sampler2D depth_tex;
+layout(set = 0, binding = 6) uniform sampler2D blk_prev;
+layout(set = 0, binding = 7) uniform writeonly image2D blk_out;
+
+layout(push_constant) uniform PushConstants {
+    uint flags;      // bit 0 mask bound, 1 history valid (col_prev, sil_prev), 2 blk_prev valid, 3 depth params valid
+    float jd_x;      // previous picture shift - current picture shift (render px, +y down)
+    float jd_y;
+    float p22;       // projection terms: linear depth = p32 / (d + p22)
+    float p32;
+    float near_limit;
+    float chg_thr;
+    float pad;
+} pc;
+
+const int kR = 20;           // largest search radius (low-rate blocks)
+const int kW = 12;           // match window (block + 2 px border)
+const int kT = kW + 2 * (kR + 1); // previous tile edge: window + coarse radius + fine step
+shared float s_cur[kW * kW];
+shared float s_prev[kT * kT];
+shared uint s_sil;
+shared uint s_chg;
+shared float s_sad[64];
+shared int s_idx[64];
+shared float s_fine[9];
+shared float s_sub[4];
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+float Sil(ivec2 p, ivec2 size) {
+    const ivec2 msize = textureSize(mask_tex, 0);
+    const ivec2 q = clamp(ivec2((vec2(p) + 0.5) * vec2(msize) / vec2(size)), ivec2(0), msize - 1);
+    return texelFetch(mask_tex, q, 0).g;
+}
+
+float Sad(ivec2 off) {
+    // off: offset of the window in s_prev relative to the zero-offset position (kR + 1, kR + 1)
+    float s = 0.0;
+    const int bx = kR + 1 + off.x, by = kR + 1 + off.y;
+    for (int y = 0; y < kW; ++y) {
+        for (int x = 0; x < kW; ++x) {
+            s += abs(s_cur[y * kW + x] - s_prev[(by + y) * kT + bx + x]);
+        }
+    }
+    return s;
+}
+
+void main() {
+    const ivec2 size = textureSize(col_cur, 0);
+    const ivec2 blk = ivec2(gl_WorkGroupID.xy);
+    const ivec2 o = blk * 8;
+    const ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    const uint lid = gl_LocalInvocationIndex;
+    const ivec2 bsize = imageSize(blk_out);
+    if (lid == 0u) {
+        s_sil = 0u;
+        s_chg = 0u;
+    }
+    barrier();
+    const bool hist = (pc.flags & 2u) != 0u;
+    // camera vector at the block centre (the search is centred on it)
+    vec2 cmv = texelFetch(mv_tex, clamp(o + 4, ivec2(0), size - 1), 0).rg;
+    if (any(isnan(cmv)) || any(isinf(cmv))) cmv = vec2(0.0);
+    const ivec2 ci = ivec2(round(cmv));
+    // hold of this block's content in the previous frame (block image, reprojected by the camera vector)
+    float hold_prev = 0.0;
+    if ((pc.flags & 4u) != 0u) {
+        const ivec2 pb = ivec2(floor((vec2(o) + 4.0 + cmv) / 8.0));
+        if (all(greaterThanEqual(pb, ivec2(0))) && all(lessThan(pb, bsize))) hold_prev = texelFetch(blk_prev, pb, 0).a;
+    }
+    if (!hist) {
+        if (lid == 0u) imageStore(blk_out, blk, vec4(cmv, -1.0, 0.0));
+        return;
+    }
+    // 1. region: silhouette (16x16 around the block, stride 2 = ~4 px dilation), now or in the previous frame
+    {
+        const ivec2 t = clamp(o - 4 + 2 * l, ivec2(0), size - 1);
+        bool s = (pc.flags & 1u) != 0u && Sil(t, size) > 0.5;
+        if (!s) {
+            vec2 m = texelFetch(mv_tex, t, 0).rg;
+            if (any(isnan(m)) || any(isinf(m))) m = vec2(0.0);
+            const ivec2 q = ivec2(floor(vec2(t) + 0.5 + m));
+            s = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size)) && texelFetch(sil_prev, q, 0).r > 0.5;
+        }
+        if (s) atomicOr(s_sil, 1u);
+    }
+    // 2. region: low-rate change (this texel outside the previous input's 3x3 box at the reprojected texel, near camera)
+    {
+        const ivec2 p = min(o + l, size - 1);
+        bool near = false;
+        if ((pc.flags & 8u) != 0u) {
+            const float dist = pc.p32 / (texelFetch(depth_tex, p, 0).r + pc.p22);
+            near = dist > 0.0 && dist < pc.near_limit;
+        }
+        if (near) {
+            vec2 m = texelFetch(mv_tex, p, 0).rg;
+            if (any(isnan(m)) || any(isinf(m))) m = vec2(0.0);
+            const ivec2 q = ivec2(floor(vec2(p) + 0.5 + m));
+            if (all(greaterThanEqual(q, ivec2(1))) && all(lessThan(q, size - 1))) {
+                const vec3 cur = texelFetch(col_cur, p, 0).rgb;
+                vec3 lo = vec3(1.0), hi = vec3(0.0);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const vec3 c = texelFetch(col_prev, q + ivec2(dx, dy), 0).rgb;
+                        lo = min(lo, c);
+                        hi = max(hi, c);
+                    }
+                }
+                const vec3 ob = max(max(lo - cur, cur - hi), vec3(0.0));
+                if (max(ob.r, max(ob.g, ob.b)) > pc.chg_thr) atomicAdd(s_chg, 1u);
+            }
+        }
+    }
+    barrier();
+    const bool sil = s_sil != 0u;
+    const bool jump = !sil && s_chg >= 8u;
+    const float hold = jump ? 1.0 : (!sil ? max(hold_prev - 0.34, 0.0) : 0.0);
+    if (!sil && !jump) {
+        if (lid == 0u) imageStore(blk_out, blk, vec4(cmv, -1.0, hold));
+        return;
+    }
+    const int R = jump ? kR : 12;
+    // 3. tiles: current window (block + 2 px), previous tile around the camera-reprojected window
+    for (uint i = lid; i < uint(kW * kW); i += 64u) {
+        const ivec2 t = clamp(o - 2 + ivec2(int(i) % kW, int(i) / kW), ivec2(0), size - 1);
+        s_cur[i] = Luma(texelFetch(col_cur, t, 0).rgb);
+    }
+    const ivec2 po = o - 2 + ci - ivec2(kR + 1);
+    for (uint i = lid; i < uint(kT * kT); i += 64u) {
+        const ivec2 t = clamp(po + ivec2(int(i) % kT, int(i) / kT), ivec2(0), size - 1);
+        s_prev[i] = Luma(texelFetch(col_prev, t, 0).rgb);
+    }
+    barrier();
+    // 4. coarse search, step 2 over [-R, R]^2
+    const int n1 = R + 1; // candidates per axis: -R, -R+2, ..., R
+    const int nc = n1 * n1;
+    float best = 1e30;
+    int bi = 0;
+    for (int i = int(lid); i < nc; i += 64) {
+        const ivec2 off = ivec2(i % n1, i / n1) * 2 - R;
+        float s = Sad(off);
+        s += 1e-3 * float(abs(off.x) + abs(off.y)); // ties -> the smaller motion
+        if (s < best) {
+            best = s;
+            bi = i;
+        }
+    }
+    s_sad[lid] = best;
+    s_idx[lid] = bi;
+    barrier();
+    if (lid == 0u) {
+        for (int i = 1; i < 64; ++i) {
+            if (s_sad[i] < s_sad[0]) {
+                s_sad[0] = s_sad[i];
+                s_idx[0] = s_idx[i];
+            }
+        }
+    }
+    barrier();
+    const ivec2 coarse = ivec2(s_idx[0] % n1, s_idx[0] / n1) * 2 - R;
+    // 5. fine: 3x3 around the coarse best
+    if (lid < 9u) {
+        const ivec2 off = coarse + ivec2(int(lid) % 3 - 1, int(lid) / 3 - 1);
+        s_fine[lid] = Sad(clamp(off, ivec2(-kR - 1), ivec2(kR + 1)));
+    }
+    barrier();
+    int fi = 4;
+    for (int i = 0; i < 9; ++i) {
+        if (s_fine[i] < s_fine[fi]) fi = i;
+    }
+    const ivec2 fbest = clamp(coarse + ivec2(fi % 3 - 1, fi / 3 - 1), ivec2(-kR), ivec2(kR));
+    // 6. sub-pixel (parabola through the best and its 4 neighbours); camera candidate SAD; texture energy
+    if (lid < 4u) {
+        const ivec2 d4[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+        s_sub[lid] = Sad(clamp(fbest + d4[lid], ivec2(-kR - 1), ivec2(kR + 1)));
+    }
+    barrier();
+    if (lid != 0u) return;
+    const float sb = Sad(fbest);
+    const float s0 = Sad(ivec2(0));
+    vec2 sub = vec2(0.0);
+    {
+        const float dx = s_sub[0] - 2.0 * sb + s_sub[1], dy = s_sub[2] - 2.0 * sb + s_sub[3];
+        if (dx > 1e-4) sub.x = clamp(0.5 * (s_sub[0] - s_sub[1]) / dx, -0.5, 0.5);
+        if (dy > 1e-4) sub.y = clamp(0.5 * (s_sub[2] - s_sub[3]) / dy, -0.5, 0.5);
+    }
+    float energy = 0.0;
+    for (int y = 0; y < kW - 1; ++y) {
+        for (int x = 0; x < kW - 1; ++x) {
+            const float c = s_cur[y * kW + x];
+            energy += abs(s_cur[y * kW + x + 1] - c) + abs(s_cur[(y + 1) * kW + x] - c);
+        }
+    }
+    // confident: the best offset is not the camera vector, beats it by >= 40% (full weight at 60%) and by a clear
+    // absolute margin (mean luma difference 0.01 .. 0.03 per window texel), on a textured window (flat windows match
+    // anywhere)
+    const float n = float(kW * kW);
+    float conf = 0.0;
+    if (fbest != ivec2(0) && s0 > 0.0) {
+        conf = smoothstep(0.4, 0.6, 1.0 - sb / s0) * smoothstep(0.01 * n, 0.03 * n, s0 - sb) *
+               smoothstep(0.02 * n, 0.06 * n, energy);
+    }
+    const vec2 disp = vec2(ci + fbest) + sub;      // matched picture displacement, cur -> prev
+    const vec2 omv = disp - vec2(pc.jd_x, pc.jd_y); // minus the jitter change: surface motion
+    imageStore(blk_out, blk, vec4(omv, conf, hold));
+}

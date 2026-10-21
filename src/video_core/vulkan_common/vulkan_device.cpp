@@ -20,6 +20,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "core/arm/recomp/game_settings.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -714,6 +715,55 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
 
+    // VK_EXT_descriptor_buffer (port of Eden's path). Strictly optional: when any requirement is
+    // missing, both it and buffer device address stay disabled and nothing else changes.
+    {
+        const VkPhysicalDeviceDescriptorBufferPropertiesEXT& db = properties.descriptor_buffer;
+        std::string why;
+        if (!Core::GameSettings::DescriptorBuffer()) {
+            why = "off ([Debug] descriptor_buffer in game_settings.ini)";
+        } else if (!extensions.descriptor_buffer || !features.descriptor_buffer.descriptorBuffer) {
+            why = "device lacks VK_EXT_descriptor_buffer";
+        } else if (ApiVersion() < VK_API_VERSION_1_3) {
+            why = "needs Vulkan 1.3";
+        } else if (!features.buffer_device_address.bufferDeviceAddress) {
+            why = "device lacks bufferDeviceAddress";
+        } else if (!db.bufferlessPushDescriptors) {
+            why = "device lacks bufferlessPushDescriptors (push descriptors stay in use)";
+        } else if (!db.combinedImageSamplerDescriptorSingleArray) {
+            why = "device lacks combinedImageSamplerDescriptorSingleArray";
+        } else if (!HasNullDescriptor()) {
+            why = "device lacks nullDescriptor";
+        } else if (db.descriptorBufferOffsetAlignment == 0 ||
+                   db.maxResourceDescriptorBufferBindings == 0 ||
+                   db.maxSamplerDescriptorBufferBindings == 0) {
+            why = "unusable descriptor buffer limits";
+        }
+        descriptor_buffer_enabled = why.empty();
+        descriptor_buffer_reason = why;
+        if (descriptor_buffer_enabled) {
+            // Only the base features are used.
+            features.descriptor_buffer.descriptorBufferCaptureReplay = VK_FALSE;
+            features.descriptor_buffer.descriptorBufferImageLayoutIgnored = VK_FALSE;
+            features.descriptor_buffer.descriptorBufferPushDescriptors = VK_FALSE;
+            features.buffer_device_address.bufferDeviceAddressCaptureReplay = VK_FALSE;
+            features.buffer_device_address.bufferDeviceAddressMultiDevice = VK_FALSE;
+            LOG_INFO(Render_Vulkan,
+                     "Descriptor buffers: ACTIVE (offset alignment {}, uniform {} B, robust "
+                     "uniform {} B, combined image sampler {} B, robust buffer access {})",
+                     db.descriptorBufferOffsetAlignment, db.uniformBufferDescriptorSize,
+                     db.robustUniformBufferDescriptorSize, db.combinedImageSamplerDescriptorSize,
+                     IsRobustBufferAccessEnabled());
+        } else {
+            RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
+                                   VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+            RemoveExtensionFeature(extensions.buffer_device_address,
+                                   features.buffer_device_address,
+                                   VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+            LOG_INFO(Render_Vulkan, "Descriptor buffers: not active ({})", why);
+        }
+    }
+
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -723,6 +773,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         nvn_queue = logical.GetQueue(graphics_family, 1);
         nvn_queue_separate = true;
     }
+    // One VkQueue may be used by suyu's own renderer and by the NVN renderer (single-queue drivers such as
+    // RADV): every submit/present on it takes the same mutex.
+    graphics_queue.SetMutex(&queue_mutex);
+    if (present_family == graphics_family) {
+        present_queue.SetMutex(&queue_mutex);
+    }
+    if (!nvn_queue_separate) {
+        nvn_queue.SetMutex(&queue_mutex);
+    }
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
@@ -731,6 +790,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    }
+    if (descriptor_buffer_enabled) {
+        flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
     const VmaAllocatorCreateInfo allocator_info{
             .flags = flags,
@@ -957,6 +1019,24 @@ bool Device::GetSuitability(bool requires_swapchain) {
         extensions.robustness_2 = false;
     }
 
+    // [Debug] nvn_fsr = on + nvn_fsr_backend = 4: D3D12 <-> Vulkan image / fence sharing for the FSR 4 bridge
+    // (renderer_vulkan/nvn_fsr4.cpp). Nothing is added for any other setting.
+    fsr4_interop = false;
+#ifdef _WIN32
+    if (Core::GameSettings::NvnFsr() && Core::GameSettings::NvnFsrBackend() == 4) {
+        static constexpr const char* kMemWin32 = "VK_KHR_external_memory_win32";
+        static constexpr const char* kSemWin32 = "VK_KHR_external_semaphore_win32";
+        if (supported_extensions.contains(kMemWin32) && supported_extensions.contains(kSemWin32)) {
+            loaded_extensions.insert(kMemWin32);
+            loaded_extensions.insert(kSemWin32);
+            fsr4_interop = true;
+        } else {
+            LOG_WARNING(Render_Vulkan, "nvn_fsr_backend = 4: device lacks {} / {}; FSR 4 unavailable",
+                        kMemWin32, kSemWin32);
+        }
+    }
+#endif
+
 #undef FEATURE_EXTENSION
 #undef EXTENSION
 
@@ -1103,6 +1183,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.maintenance5.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR;
         SetNext(next, properties.maintenance5);
+    }
+    if (extensions.descriptor_buffer) {
+        properties.descriptor_buffer.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
+        SetNext(next, properties.descriptor_buffer);
     }
 
     // Perform the property fetch.
@@ -1359,12 +1444,14 @@ void Device::RemoveUnsuitableExtensions() {
                                VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
 
+    // VK_KHR_shader_quad_control
+    extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;
+    RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
+                                       VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
+
     // VK_KHR_workgroup_memory_explicit_layout
     extensions.workgroup_memory_explicit_layout =
-        features.features.shaderInt16 &&
         features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout &&
-        features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout8BitAccess &&
-        features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout16BitAccess &&
         features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayoutScalarBlockLayout;
     RemoveExtensionFeatureIfUnsuitable(extensions.workgroup_memory_explicit_layout,
                                        features.workgroup_memory_explicit_layout,

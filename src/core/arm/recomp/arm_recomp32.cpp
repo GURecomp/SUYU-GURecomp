@@ -121,7 +121,43 @@ u32 FpsrFpcrToFpscr(u64 fpsr, u64 fpcr) {
     return s | c;
 }
 
-std::atomic<u64> g_blocks{0}, g_svcs{0}, g_miss{0}, g_unhandled{0}, g_thumb{0};
+std::atomic<u64> g_miss{0}, g_unhandled{0}, g_thumb{0};
+
+// Static blocks run and SVCs: counted per core instance (one writer each: the core's host thread), so the hot dispatch
+// loop does a plain increment instead of a locked add on one shared cache line. Reports sum the live cores plus the
+// counts of destroyed ones, so the totals mean what the old global counters meant (whole run, all cores).
+struct HotCounters {
+    alignas(64) std::atomic<u64> blocks{0};
+    std::atomic<u64> svcs{0};
+};
+std::mutex g_hot_lock;
+std::vector<const HotCounters*> g_hot_live;
+u64 g_hot_retired_blocks{0}, g_hot_retired_svcs{0};
+inline void Bump(std::atomic<u64>& c) {
+    c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); // single writer: no lock prefix
+}
+void HotRegister(const HotCounters* c) {
+    std::scoped_lock lk{g_hot_lock};
+    g_hot_live.push_back(c);
+}
+void HotRetire(const HotCounters* c) {
+    std::scoped_lock lk{g_hot_lock};
+    g_hot_live.erase(std::remove(g_hot_live.begin(), g_hot_live.end(), c), g_hot_live.end());
+    g_hot_retired_blocks += c->blocks.load(std::memory_order_relaxed);
+    g_hot_retired_svcs += c->svcs.load(std::memory_order_relaxed);
+}
+u64 TotalBlocks() {
+    std::scoped_lock lk{g_hot_lock};
+    u64 n = g_hot_retired_blocks;
+    for (const HotCounters* c : g_hot_live) n += c->blocks.load(std::memory_order_relaxed);
+    return n;
+}
+u64 TotalSvcs() {
+    std::scoped_lock lk{g_hot_lock};
+    u64 n = g_hot_retired_svcs;
+    for (const HotCounters* c : g_hot_live) n += c->svcs.load(std::memory_order_relaxed);
+    return n;
+}
 // JIT fallback episodes: instructions single-stepped, episodes that stepped back onto covered
 // code, and episodes handed to a full JIT run (long or remembered regions, or a halt).
 std::atomic<u64> g_fb_steps{0}, g_fb_returned{0}, g_fb_full_runs{0};
@@ -283,7 +319,7 @@ void WriteReportLocked() {
     }
     out << fmt::format("# uptime {:.1f} s: {} static blocks, {} SVCs, JIT fallbacks: {} missing "
                        "block, {} unhandled instruction, {} Thumb\n",
-                       g_last_report, g_blocks.load(), g_svcs.load(), g_miss.load(),
+                       g_last_report, TotalBlocks(), TotalSvcs(), g_miss.load(),
                        g_unhandled.load(), g_thumb.load());
     out << fmt::format("# fallback: {} JIT instructions stepped, {} returns to recompiled code, "
                        "{} full JIT runs\n",
@@ -845,6 +881,10 @@ struct ArmRecomp32::Impl {
         bridge.read_counter = &Impl::HostReadCounter;
         bridge.page_entries = nullptr; // until RefreshPageTable: every access takes the callbacks
         ctx.host = &bridge;
+        HotRegister(&hot);
+    }
+    ~Impl() {
+        HotRetire(&hot);
     }
 
     static u64 HostLoad(void* user, u64 va, u32 size) {
@@ -1088,6 +1128,7 @@ struct ArmRecomp32::Impl {
     // JIT directly next time instead of stepping again.
     std::unordered_set<u32> long_regions;
     bool fallback_unavailable{false};
+    HotCounters hot{}; // static blocks / SVCs run on this core (summed by TotalBlocks / TotalSvcs)
 };
 
 ArmRecomp32::ArmRecomp32(System& system, bool uses_wall_clock, RecompLookupFn lookup,
@@ -1106,7 +1147,7 @@ ArmRecomp32::~ArmRecomp32() {
         LOG_INFO(Core_ARM,
                  "recomp32 execution: {} static blocks, {} SVCs, JIT fallbacks: {} missing block, "
                  "{} unhandled instruction, {} Thumb",
-                 g_blocks.load(), g_svcs.load(), g_miss.load(), g_unhandled.load(), g_thumb.load());
+                 TotalBlocks(), TotalSvcs(), g_miss.load(), g_unhandled.load(), g_thumb.load());
         {
             std::scoped_lock lk{g_miss_lock};
             if (!g_module_list.empty()) {
@@ -1186,7 +1227,7 @@ HaltReason ArmRecomp32::RunFallback(Kernel::KThread* thread, bool step) {
     this->SetContext(tctx);
     if (True(hr & HaltReason::SupervisorCall)) {
         impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
-        g_svcs.fetch_add(1, std::memory_order_relaxed);
+        Bump(impl->hot.svcs);
     }
     // Back to recompiled code as soon as the PC is covered again.
     if (!impl->ctx.thumb && impl->lookup && impl->lookup(impl->ctx.r[15])) {
@@ -1276,7 +1317,7 @@ HaltReason ArmRecomp32::RunThread(Kernel::KThread* thread) {
             continue;
         }
 
-        g_blocks.fetch_add(1, std::memory_order_relaxed);
+        Bump(impl->hot.blocks);
         impl->bridge.chain_budget = impl->chain_budget;
         block(&impl->ctx);
 
@@ -1298,7 +1339,7 @@ HaltReason ArmRecomp32::RunThread(Kernel::KThread* thread) {
             continue;
         }
         if (impl->ctx.pending_svc != kNoPendingSvc) {
-            g_svcs.fetch_add(1, std::memory_order_relaxed);
+            Bump(impl->hot.svcs);
             impl->ctx.halted = 0;
             return HaltReason::SupervisorCall;
         }

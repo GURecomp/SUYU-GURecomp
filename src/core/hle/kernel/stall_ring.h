@@ -62,6 +62,11 @@ inline double NowMs() {
         .count();
 }
 
+/// NowMs() with probes on, 0 with probes off: for timestamps that only feed Add() (no clock read when off).
+inline double NowIfOn() {
+    return On() ? NowMs() : 0.0;
+}
+
 /// CPU cycles this host thread has consumed (0 off Windows). Compared with wall time it tells
 /// running from descheduled / page-faulting.
 inline u64 ThreadCycles() {

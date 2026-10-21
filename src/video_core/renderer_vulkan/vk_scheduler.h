@@ -59,6 +59,17 @@ public:
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer);
 
+    /// Defers a full-attachment color clear so it becomes the load op of the next render pass.
+    /// Returns false when a render pass is active and the caller has to clear in the pass.
+    bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);
+
+    /// Defers a full depth/stencil clear so it becomes the load op of the next render pass.
+    /// Returns false when a render pass is active and the caller has to clear in the pass.
+    bool DeferDepthStencilClear(const Framebuffer* framebuffer, const VkClearValue& value);
+
+    /// Realizes any pending deferred clear before its framebuffer can be moved or freed.
+    void FlushDeferredClear();
+
     /// Requests the current execution context to be able to execute operations only allowed outside
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext();
@@ -73,6 +84,10 @@ public:
 
     /// Update the rescaling state. Returns true if the state has to be updated.
     bool UpdateRescaling(bool is_rescaling);
+
+    /// Descriptor buffer chunk bound in the current command buffer (VK_EXT_descriptor_buffer).
+    /// Returns true if it has to be bound.
+    bool UpdateDescriptorBufferChunk(u32 descriptor_chunk);
 
     /// Invalidates current command buffer state except for render passes
     void InvalidateState();
@@ -254,7 +269,27 @@ private:
         bool is_rescaling = false;
         bool rescaling_defined = false;
         bool needs_state_enable_refresh = false;
+        u32 descriptor_buffer_chunk = 0;
+        bool descriptor_buffer_bound = false;
     };
+
+    struct DeferredClear {
+        const Framebuffer* framebuffer = nullptr;
+        u32 color_clear_mask = 0;
+        std::array<VkClearValue, 8> color_values{};
+        bool depth_stencil = false;
+        VkClearValue depth_stencil_value{};
+    };
+
+    /// Begins a render pass for the framebuffer, optionally with clear values.
+    void BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
+                             const VkClearValue* clear_values, u32 clear_value_count);
+
+    /// Begins the render pass of a pending deferred clear, folding it into the load ops.
+    /// folded is true when a draw to the same framebuffer requested the pass.
+    void RealizeDeferredClear(bool folded);
+
+    void LogDeferredClear();
 
     void WorkerThread(std::stop_token stop_token);
 
@@ -280,6 +315,11 @@ private:
 
     vk::CommandBuffer current_cmdbuf;
     vk::CommandBuffer current_upload_cmdbuf;
+
+    DeferredClear deferred_clear;
+    u64 deferred_clear_count = 0;
+    u64 folded_clear_count = 0;
+    u64 flushed_clear_count = 0;
 
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;

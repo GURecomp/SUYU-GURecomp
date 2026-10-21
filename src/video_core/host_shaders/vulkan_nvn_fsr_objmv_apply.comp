@@ -1,0 +1,162 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_fsr_objmv: object motion, pass 2 of 2 (per texel, render size). Writes the motion
+// vector image FSR reads (camera vectors, replaced by object vectors where they fit this texel better) and a weight
+// image for the prep shader.
+//  - candidates: the object vectors of the 3x3 blocks around the texel with confidence > 0.05. Texels of blocks
+//    without a confident neighbour keep the camera vector (early out: no texture reads beyond the block image).
+//  - per-texel check: 3x3 luma SAD of the current input against the previous input (bilinear) at p + v + jd (jd: the
+//    jitter change, previous - current picture shift) for the camera vector and every candidate. A block straddles
+//    object and background, so the block vector is only taken where it explains this texel's neighbourhood better.
+//  - smoothing: the vector is the confidence-weighted mean of the candidates within 15% of the best SAD (neighbouring
+//    blocks agreeing pull together, a lone outlier block is outvoted by its neighbours), and is blended with the camera
+//    vector by w = block confidence x how clearly it beats the camera vector.
+//  - low-rate (cloth) reactive (g): in blocks whose hold is 1 (jump frame), the near-camera texels whose colour
+//    changed against the previous input at the camera-reprojected texel: smoothstep(chg_lo, chg_hi, d); then held at
+//    0.6 x the previous value (camera-reprojected) while the block's hold lasts.
+//  - fit: in searched blocks (and texels with candidates), 1 - smoothstep(0.09, 0.27, 3x3 SAD of the vector chosen):
+//    the history FSR fetches with that vector matches this texel.
+// Output: mv_out = final vectors (RG32F); objw_out r = fit (prep lowers the silhouette reactive by 65% x fit), g =
+// low-rate reactive, b = w (object vector weight).
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D col_cur;
+layout(set = 0, binding = 1) uniform sampler2D col_prev;
+layout(set = 0, binding = 2) uniform sampler2D mv_tex;
+layout(set = 0, binding = 3) uniform sampler2D blk_tex;
+layout(set = 0, binding = 4) uniform writeonly image2D mv_out;
+layout(set = 0, binding = 5) uniform sampler2D objw_prev;
+layout(set = 0, binding = 6) uniform writeonly image2D objw_out;
+layout(set = 0, binding = 7) uniform sampler2D col_prev_lin; // col_prev with a linear sampler
+
+layout(push_constant) uniform PushConstants {
+    uint flags; // bit 0 object vectors on, 1 history valid, 2 objw_prev valid
+    float jd_x;
+    float jd_y;
+    float chg_lo;
+    float chg_hi;
+    float pad0;
+    float pad1;
+    float pad2;
+} pc;
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+float Sad3(ivec2 p, vec2 v, vec2 isize, float cl[9]) {
+    // previous input at p + v + jd, bilinear (texel centres at +0.5)
+    const vec2 c = vec2(p) + 0.5 + v + vec2(pc.jd_x, pc.jd_y);
+    float s = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        const vec2 t = (c + vec2(i % 3 - 1, i / 3 - 1)) * isize;
+        s += abs(cl[i] - Luma(textureLod(col_prev_lin, t, 0.0).rgb));
+    }
+    return s;
+}
+
+void main() {
+    const ivec2 size = imageSize(mv_out);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+    vec2 cmv = texelFetch(mv_tex, p, 0).rg;
+    const bool cam_ok = !any(isnan(cmv)) && !any(isinf(cmv));
+    if ((pc.flags & 3u) != 3u || !cam_ok) {
+        imageStore(mv_out, p, vec4(cmv, 0.0, 0.0));
+        imageStore(objw_out, p, vec4(0.0));
+        return;
+    }
+    const ivec2 bsize = textureSize(blk_tex, 0);
+    const ivec2 b = p / 8;
+    const vec4 own = texelFetch(blk_tex, b, 0);
+    // candidates
+    vec2 cand[9];
+    float cconf[9];
+    int nc = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 q = b + ivec2(dx, dy);
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, bsize))) continue;
+            const vec4 k = texelFetch(blk_tex, q, 0);
+            if (k.b > 0.05) {
+                cand[nc] = k.rg;
+                cconf[nc] = k.b;
+                ++nc;
+            }
+        }
+    }
+    const bool lowrate = own.a > 0.0;
+    const bool searched = own.b >= 0.0;
+    if (nc == 0 && !lowrate && !searched) {
+        imageStore(mv_out, p, vec4(cmv, 0.0, 0.0));
+        imageStore(objw_out, p, vec4(0.0));
+        return;
+    }
+    const vec2 isize = 1.0 / vec2(size);
+    float cl[9];
+    for (int i = 0; i < 9; ++i) {
+        cl[i] = Luma(texelFetch(col_cur, clamp(p + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), size - 1), 0).rgb);
+    }
+    vec2 mv = cmv;
+    float w = 0.0;
+    float fit = 0.0;
+    if (nc > 0 || searched) {
+        const float s_cam = Sad3(p, cmv, isize, cl);
+        float s_use = s_cam;
+        float sc[9];
+        float s_best = 1e30;
+        for (int i = 0; i < nc; ++i) {
+            sc[i] = Sad3(p, cand[i], isize, cl);
+            s_best = min(s_best, sc[i]);
+        }
+        vec2 acc = vec2(0.0);
+        float wsum = 0.0, csum = 0.0;
+        for (int i = 0; i < nc; ++i) {
+            if (sc[i] <= s_best * 1.15 + 0.01) {
+                acc += cconf[i] * cand[i];
+                wsum += cconf[i];
+                csum = max(csum, cconf[i]);
+            }
+        }
+        if (wsum > 0.0 && s_best < s_cam) {
+            // beats the camera vector by >= 20% (full at 50%) and by a mean 3x3 luma difference >= 0.01 (full at 0.03)
+            w = csum * smoothstep(0.2, 0.5, 1.0 - s_best / max(s_cam, 1e-6)) * smoothstep(0.09, 0.27, s_cam - s_best);
+            mv = mix(cmv, acc / wsum, w);
+            if (w > 0.5) s_use = s_best;
+        }
+        // how well the history FSR will fetch matches this texel (mean 3x3 luma difference 0.01 -> 1, 0.03 -> 0):
+        // a dynamic texel whose history is right (a still or slowly moving character under the camera vector, or a
+        // tracked one under its object vector) does not need the full silhouette reactive, which would otherwise make
+        // FSR show the raw jittered sample there (sub-pixel shiver)
+        fit = 1.0 - smoothstep(0.09, 0.27, s_use);
+    }
+    // low-rate reactive
+    float r = 0.0;
+    if (lowrate) {
+        const ivec2 q = ivec2(floor(vec2(p) + 0.5 + cmv));
+        if (own.a > 0.99 && all(greaterThanEqual(q, ivec2(1))) && all(lessThan(q, size - 1))) {
+            const vec3 cur = texelFetch(col_cur, p, 0).rgb;
+            vec3 lo = vec3(1.0), hi = vec3(0.0);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const vec3 c = texelFetch(col_prev, q + ivec2(dx, dy), 0).rgb;
+                    lo = min(lo, c);
+                    hi = max(hi, c);
+                }
+            }
+            const vec3 ob = max(max(lo - cur, cur - hi), vec3(0.0));
+            r = smoothstep(pc.chg_lo, pc.chg_hi, max(ob.r, max(ob.g, ob.b)));
+        }
+        if ((pc.flags & 4u) != 0u && all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size))) {
+            r = max(r, 0.6 * texelFetch(objw_prev, q, 0).g);
+        }
+    }
+    imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
+    imageStore(objw_out, p, vec4(fit, r, w, 0.0));
+}

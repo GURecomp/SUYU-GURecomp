@@ -24,6 +24,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/program_header.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -63,7 +64,7 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 18;
+constexpr u32 CACHE_VERSION = 19;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
 
 template <typename Container>
@@ -342,11 +343,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              const Device& device_, Scheduler& scheduler_,
                              DescriptorPool& descriptor_pool_,
                              GuestDescriptorQueue& guest_descriptor_queue_,
+                             DescriptorBufferRing& descriptor_buffer_ring_,
                              RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
                              TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
     : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
-      render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
@@ -359,7 +361,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     const auto subgroup_stage_bit{[subgroup_stages](VkShaderStageFlags flag, Shader::Stage stage) {
         return (subgroup_stages & flag) != 0 ? (1u << static_cast<u32>(stage)) : 0u;
     }};
-    const u32 supported_subgroup_stages{
+    u32 supported_subgroup_stages{
         subgroup_stage_bit(VK_SHADER_STAGE_VERTEX_BIT, Shader::Stage::VertexA) |
         subgroup_stage_bit(VK_SHADER_STAGE_VERTEX_BIT, Shader::Stage::VertexB) |
         subgroup_stage_bit(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
@@ -369,6 +371,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         subgroup_stage_bit(VK_SHADER_STAGE_GEOMETRY_BIT, Shader::Stage::Geometry) |
         subgroup_stage_bit(VK_SHADER_STAGE_FRAGMENT_BIT, Shader::Stage::Fragment) |
         subgroup_stage_bit(VK_SHADER_STAGE_COMPUTE_BIT, Shader::Stage::Compute)};
+    if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+        supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
+    }
     profile = Shader::Profile{
         .supported_spirv = device.SupportedSpirvVersion(),
         .unified_descriptor_binding = true,
@@ -376,9 +381,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_int8 = device.IsInt8Supported(),
         .support_uniform_and_storage_buffer_8bit =
             device.IsUniformAndStorageBuffer8BitAccessSupported(),
+        .support_storage_buffer_8bit = device.IsStorageBuffer8BitAccessSupported(),
         .support_int16 = device.IsShaderInt16Supported(),
         .support_uniform_and_storage_buffer_16bit =
             device.IsUniformAndStorageBuffer16BitAccessSupported(),
+        .support_storage_buffer_16bit = device.IsStorageBuffer16BitAccessSupported(),
         .support_int64 = device.IsShaderInt64Supported(),
         .support_vertex_instance_id = false,
         .support_float_controls = device.IsKhrShaderFloatControlsSupported(),
@@ -397,7 +404,15 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_fp64_signed_zero_nan_preserve =
             float_control.shaderSignedZeroInfNanPreserveFloat64 != VK_FALSE,
         .support_explicit_workgroup_layout = device.IsKhrWorkgroupMemoryExplicitLayoutSupported(),
+        .support_workgroup_layout_8bit_access =
+            device.IsWorkgroupMemoryExplicitLayout8BitAccessSupported(),
+        .support_workgroup_layout_16bit_access =
+            device.IsWorkgroupMemoryExplicitLayout16BitAccessSupported(),
+        .support_shader_quad_control = device.IsKhrShaderQuadControlSupported(),
+        .support_quad_shuffles = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_QUAD_BIT),
         .support_vote = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_VOTE_BIT),
+        .support_shuffle_relative =
+            device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT),
         .supported_subgroup_stages = supported_subgroup_stages,
         .support_viewport_index_layer_non_geometry =
             device.IsExtShaderViewportIndexLayerSupported(),
@@ -406,6 +421,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_demote_to_helper_invocation =
             device.IsExtShaderDemoteToHelperInvocationSupported(),
         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
+        .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
         .support_derivative_control = true,
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_native_ndc = device.IsExtDepthClipControlSupported(),
@@ -414,6 +430,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_geometry_streams = device.AreTransformFeedbackGeometryStreamsSupported(),
         .support_sampled_image_array_nonuniform_indexing =
             device.IsSampledImageArrayNonUniformIndexingSupported(),
+        .support_storage_image_array_nonuniform_indexing =
+            device.IsStorageImageArrayNonUniformIndexingSupported(),
+        .support_uniform_texel_buffer_array_nonuniform_indexing =
+            device.IsUniformTexelBufferArrayNonUniformIndexingSupported(),
+        .support_storage_texel_buffer_array_nonuniform_indexing =
+            device.IsStorageTexelBufferArrayNonUniformIndexingSupported(),
 
         .warp_size_potentially_larger_than_guest = device.IsWarpSizePotentiallyBiggerThanGuest(),
 
@@ -426,12 +448,17 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                        driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA,
 
         .has_broken_spirv_clamp = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS,
-        .has_broken_spirv_position_input = driver_id == false,
+        .has_broken_spirv_position_input = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .has_broken_unsigned_image_offsets = false,
         .has_broken_signed_operations = false,
         .has_broken_fp16_float_controls = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY,
+        .has_broken_fp32_denorm_flush = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .ignore_nan_fp_comparisons = false,
-        .has_broken_spirv_subgroup_mask_vector_extract_dynamic = false,
+        .has_broken_spirv_subgroup_mask_vector_extract_dynamic =
+            driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
+            device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
+        .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
@@ -458,8 +485,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                 driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY,
         .support_snorm_render_buffer = true,
         .support_viewport_index_layer = device.IsExtShaderViewportIndexLayerSupported(),
+        .support_viewport_mask = device.IsNvViewportArray2Supported(),
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
+        .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
     };
     host_info.ApplyDescriptorLimitPolicy();
 
@@ -800,6 +829,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
         }
 
+        if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+            Shader::Optimization::HasBrokenPattern(programs[index])) {
+            LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues",
+                        key.unique_hashes[index]);
+            return nullptr;
+        }
+
         if (Settings::values.dump_guest_shaders) {
             env.Dump(hash, key.unique_hashes[index]);
         }
@@ -859,7 +895,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
-        descriptor_pool, guest_descriptor_queue, thread_worker, statistics, render_pass_cache, key,
+        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+        render_pass_cache, key,
         std::move(modules), infos);
 
 } catch (const Shader::Exception& exception) {

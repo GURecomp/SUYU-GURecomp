@@ -4,15 +4,19 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -21,9 +25,11 @@
 #endif
 
 #include "common/fs/path_util.h"
+#include "common/host_key.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/arm/recomp/game_settings.h"
+#include "core/arm/recomp/game_settings_ini.h"
 #include "core/arm/recomp/recomp_hooks.h"
 #include "core/core.h"
 #include "core/memory.h"
@@ -38,6 +44,11 @@ constexpr u32 kFrameRateGlobal = 0x18A6210; // main offset of the engine object 
 constexpr u32 kFrameRateField = 0x243C;     // float target frame rate in that object
 constexpr float kOriginalFps = 30.0f;
 constexpr u32 kProjection = 0x1C358;        // main offset of the camera projection function
+constexpr u32 kProjectionB = 0x1C3A8;       // probe only: variant, r0 = camera params, r1 = output matrix
+constexpr u32 kLookAtA = 0x1C33C;           // probe only: look-at, r0 = out view matrix, r1 = camera object
+constexpr u32 kLookAtB = 0x1C380;           // probe only: same, r0 = camera object, r1 = out (called by the world-to-screen 0x18A48)
+constexpr u32 kFilterCtors[] = {0x968318, 0x8B2FBC, 0x8B72E0, 0x8B8148, 0x8C090C, 0x9310AC};
+constexpr u32 kProbeReturnPc = 0xFFFFE100u; // sentinel return address of the probe post-hook (outside the modules)
 constexpr u32 kAspectField = 0x38;          // float aspect ratio in its r1 argument
 constexpr float kOriginalAspect = 16.0f / 9.0f;
 constexpr u32 kClipA = 0x30;                // near and far clip planes (which is which: the
@@ -52,112 +63,36 @@ constexpr u32 kDockedH = 1080;
 constexpr u32 kMaxRenderW = 3840; // largest the public resolution patches go
 constexpr u32 kMaxRenderH = 2160;
 
-constexpr const char* kTemplate =
-    "; game_settings.ini: options for this exported game.\n"
-    "; Edit a value, save, and restart the game. Nothing needs to be exported again.\n"
-    "; Lines starting with ; are comments. Defaults are the original game's behaviour.\n";
-
-struct Option {
-    const char* section;
-    const char* key;
-    const char* value; // default
-    const char* comment;
+// ---- Upscaler quality modes (retune here) ------------------------------------------------------------------------------
+// While the Direct renderer runs an upscaler (nvn_fsr) the Quality mode decides the render scale (a Settings::ResolutionSetup
+// step; the user's saved Graphics > Resolution scale is left alone, [Upscaler] render_scale_override = true uses it instead).
+//   ratio = output height / internal render height the mode asks for. The nearest available step (1/4X ... 8X) is used.
+//   kRatioBase1080: render at the game's 1080p base whatever the output ("Quality"; ratio = output height / 1080), capped at
+//                   kQualityMaxRatio so Native AA <= Quality <= Balanced <= Performance holds for outputs above 1620p.
+//   kRatioLowest:   the lowest step (1/4X).
+constexpr double kRatioBase1080 = 0.0;
+constexpr double kRatioLowest = -1.0;
+constexpr double kQualityMaxRatio = 1.5;
+constexpr double kFsrQualityRatios[5] = {
+    1.0,            // Native AA: internal = output (FSR as anti-aliasing)
+    kRatioBase1080, // Quality
+    1.5,            // Balanced
+    2.0,            // Performance
+    kRatioLowest,   // Ultra Performance
 };
+constexpr const char* kFsrQualityNames[5] = {"Native AA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+// Settings::ResolutionSetup order (Res1_4X ... Res8X) and the scale each one means
+constexpr double kStepFactor[13] = {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+constexpr const char* kStepName[13] = {"1/4X", "1/2X", "3/4X", "1X", "5/4X", "3/2X", "2X", "3X", "4X", "5X", "6X", "7X", "8X"};
+// What each step means in pixels (height) on the console's two render sizes: 1X = 720p handheld / 1080p docked.
+//   step:     1/4X 1/2X 3/4X  1X  5/4X 3/2X  2X   3X   4X   5X   6X   7X   8X
+//   handheld:  180  360  540  720  900 1080 1440 2160 2880 3600 4320 5040 5760
+//   docked:    270  540  810 1080 1350 1620 2160 3240 4320 5400 6480 7560 8640
+constexpr u32 kHandheldH = 720;
+constexpr u32 kStepHandheldH[13] = {180, 360, 540, 720, 900, 1080, 1440, 2160, 2880, 3600, 4320, 5040, 5760};
+constexpr u32 kStepDockedH[13] = {270, 540, 810, 1080, 1350, 1620, 2160, 3240, 4320, 5400, 6480, 7560, 8640};
 
-// Written into a new ini, and appended to an older one that lacks them.
-constexpr Option kOptions[] = {
-    {"Display", "fps", "30",
-     "; Target frame rate. 30 = original game. 60 is the usual choice; 90, 120 and up only make\n"
-     "; sense on a monitor that refreshes that fast. The game times itself from this value.\n"
-     "; auto: follow the frame rate the PC actually reaches, up to the monitor's refresh rate.\n"},
-    {"Display", "resolution", "default",
-     "; Screen resolution the game is shaped for. default = original game (16:9).\n"
-     "; auto = this monitor's resolution, or e.g. 3440x1440, 2560x1080, 1280x800. The 3D view\n"
-     "; takes exactly that shape and the picture fills the window (run fullscreen at that size);\n"
-     "; the HUD keeps its 16:9 layout and is stretched with it (the HudFix mod corrects it).\n"},
-    {"Display", "aspect", "16:9",
-     "; Only used with resolution = default: shape of the 3D view as a ratio, 16:9 = original.\n"
-     "; 21:9, 32:9, 16:10, 4:3 or a number such as 2.39.\n"},
-    {"Display", "fullscreen", "false",
-     "; true = start fullscreen. F11 or Alt+Enter switches while playing.\n"},
-    {"Display", "vsync", "on",
-     "; on = frames are locked to the monitor's refresh rate (tear-free, lowest power).\n"
-     "; mailbox = no lock, the newest frame is shown at each refresh (tear-free); lets the game\n"
-     "; run above the refresh rate: set fps higher than your monitor to use it.\n"
-     "; off = no lock and no waiting (can tear). relaxed = on, but a late frame is shown at once.\n"
-     "; Needs a restart. Leave on for the smoothest picture; the others are for testing speed.\n"},
-    {"Display", "show_fps", "false",
-     "; true = show the frame rate in the window title. The game menu (F10) always shows it.\n"},
-    {"Display", "console_mode", "docked",
-     "; docked = the game renders at 1920x1080, as on a TV (original PC default).\n"
-     "; handheld = the game renders at 1280x720, as on the Switch's own screen: much lighter on\n"
-     "; weak PCs and integrated graphics. The picture is scaled up to the window either way;\n"
-     "; native_render doesn't raise the handheld render size.\n"},
-    {"Graphics", "native_gpu", "false",
-     "; false = suyu draws the game (its own renderer, the original behaviour).\n"
-     "; true = the replacement renderer: the game's graphics calls are replayed natively on\n"
-     "; Vulkan on its own thread (faster on the CPU side). Needs a restart.\n"},
-    {"Graphics", "native_render", "true",
-     "; With a resolution set: the game renders at that resolution itself (up to 3840x2160)\n"
-     "; instead of suyu scaling a 1920x1080 picture. Keep suyu's resolution scale at 1x then.\n"
-     "; false = keep the 1920x1080 render (use suyu's resolution scale instead).\n"},
-    {"Debug", "diagnostics", "false",
-     "; Run reports for development that apply to every graphics mode (profiler, call census,\n"
-     "; timing watch, file monitor; written to the user folder). true = write them (a little slower).\n"},
-    {"Debug", "gpu_diagnostics", "false",
-     "; Reports for the replacement renderer only (native_gpu = true): per-second timing buckets\n"
-     "; (nvn_prof.txt) and NVN call recording samples. true = write them (a little slower).\n"},
-    {"Debug", "rtss_overlay", "false",
-     "; RivaTuner Statistics Server's Vulkan overlay crashes the game at start, so it is kept\n"
-     "; out of this game (RivaTuner itself keeps working elsewhere). true = let it load.\n"},
-    {"Graphics", "draw_distance", "1.0",
-     "; Far clip plane multiplier: 1.0 = original game, up to 8.0. Moves the distance beyond which\n"
-     "; nothing is drawn. Objects that fade out by their own distance checks aren't affected yet.\n"},
-    {"Multiplayer", "mode", "off",
-     "; Local play over a suyu room (e.g. through Radmin VPN). off | host | join: what to do at\n"
-     "; start. Also in the game menu (F10), which saves its fields here.\n"},
-    {"Multiplayer", "nickname", "Hunter",
-     "; Your name in suyu rooms and Ryujinx lobbies (the game menu's Name): 4-20\n"
-     "; characters (letters, digits, space, . _ -).\n"},
-    {"Multiplayer", "address", "",
-     "; join: the host's address (their Radmin VPN IP, for example).\n"},
-    {"Multiplayer", "port", "24872", "; Room port (host and join must match).\n"},
-    {"Multiplayer", "password", "", "; Room password; empty = none.\n"},
-    {"Multiplayer", "room_name", "MHGU", "; host: the room's name.\n"},
-    {"Multiplayer", "max_players", "4", "; host: room size (2-16).\n"},
-    {"Multiplayer", "auto_reconnect", "true",
-     "; true = when the connection to a joined room drops, try again every 5 s for a minute.\n"},
-    {"Multiplayer", "recent", "",
-     "; Hosts joined before (address:port, newest first), offered in the game menu.\n"},
-    {"Multiplayer", "backend", "room",
-     "; Who carries local wireless play: room = a suyu room (the settings above);\n"
-     "; ryuldn = a RyuLdn master server, the lobby server Ryujinx uses, so you can play with\n"
-     "; Ryujinx players (everyone uses the same server). Read at start.\n"},
-    {"Multiplayer", "ryuldn_host", "ldn.ryujinx.app",
-     "; ryuldn: the main server's address (host name or IP); lobbies you host live there.\n"
-     "; ldn.ryujinx.app = Ryujinx's public server (empty means the same).\n"},
-    {"Multiplayer", "ryuldn_port", "30456", "; ryuldn: the server's port (Ryujinx uses 30456).\n"},
-    {"Multiplayer", "ryuldn_servers", "",
-     "; ryuldn: more servers whose lobbies you also see and can join, comma separated\n"
-     "; host or host:port (e.g. my-server.example:30456). Lobbies you host stay on the main one.\n"},
-    {"Multiplayer", "ryuldn_passphrase", "",
-     "; ryuldn: empty = public lobbies; Ryujinx-xxxxxxxx (8 hex digits) = only players with the\n"
-     "; same passphrase see each other (Ryujinx's LDN passphrase setting).\n"},
-    {"Menu", "key", "F10",
-     "; Opens the game menu window (controls, multiplayer, folders): a key name such as F10,\n"
-     "; F9 or Home. none = no key. The F12 debug panel (Windows) stays as it is.\n"},
-    {"Menu", "pad_combo", "back+start",
-     "; Controller buttons held together for 1 s to open the menu (SDL names: back, start,\n"
-     "; guide, leftstick, rightstick, leftshoulder, ...). back+start = Minus + Plus on a\n"
-     "; Switch layout, View + Menu on Xbox. none = off.\n"},
-    {"Menu", "show_advanced", "false",
-     "; true = the game menu gets an Advanced tab with every setting of the emulator\n"
-     "; (resolution scale, GPU accuracy, ...). Most of them need a restart of the game.\n"},
-    {"Mods", "loader", kDefaultModLoader,
-     "; Mod loader library (forge.dll on Windows, forge.so on Linux), relative to\n"
-     "; mods/<title id>/ (install Forge PC there for code mods).\n"
-     "; none = load no mod code (file replacements in mods/ still apply).\n"},
-};
+// The option table, the layout and the text transforms live in game_settings_ini.cpp (testable on their own).
 
 System* g_system{};
 float g_aspect{kOriginalAspect};
@@ -176,6 +111,7 @@ bool g_logged_seen{false};
 float g_last_written{0.0f};
 u32 g_render_w{0}; // 0: keep the game's render size
 u32 g_render_h{0};
+u32 g_out_h{1080}; // height of the set [Display] resolution (1080 with resolution = default)
 std::atomic<u32> g_render_dest{0}; // where main+0xBBCD34 writes the docked size
 bool g_logged_render{false};
 
@@ -195,12 +131,21 @@ std::string Trim(const std::string& s) {
 }
 
 /// Reads [section] key from the ini; empty when absent. *present: the key exists at all.
+/// The FIRST occurrence of a key wins. A later occurrence with a different value is reported once per key
+/// (game_settings: [section] key appears N times ...), because it is silently ignored otherwise.
 std::string ReadValue(const std::string& want_section, const std::string& want_key,
                       bool* present = nullptr) {
     std::ifstream in(IniPath());
     std::string line;
     std::string section;
+    bool found = false;
+    // A key that moved out of [Debug] (layout 2) is found in either section: [Debug] nvn_fsr = [Upscaler] nvn_fsr.
+    const std::string want_canon = Ini::Canonical(want_section, want_key);
+    std::string first;
+    int first_line = 0, line_no = 0, count = 0;
+    std::string differ; // "line N = value" of later occurrences with another value
     while (std::getline(in, line)) {
+        ++line_no;
         line = Trim(line);
         if (line.empty() || line[0] == ';' || line[0] == '#') {
             continue;
@@ -210,50 +155,171 @@ std::string ReadValue(const std::string& want_section, const std::string& want_k
             continue;
         }
         const auto eq = line.find('=');
-        if (eq == std::string::npos || section != want_section) {
+        if (eq == std::string::npos) {
             continue;
         }
-        if (Trim(line.substr(0, eq)) == want_key) {
+        if (Trim(line.substr(0, eq)) == want_key && (section == want_section || Ini::Canonical(section, want_key) == want_canon)) {
             std::string value = Trim(line.substr(eq + 1));
             if (const auto c = value.find(';'); c != std::string::npos) {
                 value = Trim(value.substr(0, c));
             }
-            if (present) {
-                *present = true;
+            ++count;
+            if (!found) {
+                found = true;
+                first = value;
+                first_line = line_no;
+            } else if (value != first) {
+                differ += fmt::format(" line {} = '{}'", line_no, value);
             }
-            return value;
         }
+    }
+    if (found) {
+        if (present) {
+            *present = true;
+        }
+        if (!differ.empty()) {
+            static std::mutex warned_lock;
+            static std::set<std::string> warned;
+            std::scoped_lock lk{warned_lock};
+            if (warned.insert(want_section + "/" + want_key).second) {
+                LOG_WARNING(Core_ARM,
+                            "game settings: [{}] {} appears {} times with different values; the FIRST one wins "
+                            "(line {} = '{}'), ignored:{}",
+                            want_section, want_key, count, first_line, first, differ);
+            }
+        }
+        return first;
     }
     return {};
 }
 
-/// Creates the ini, or appends the options an older one doesn't have yet.
-void WriteMissingOptions() {
+std::string ReadAll(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+/// Writes the whole file through a temporary beside it (a crash mid-write cannot leave half an ini).
+bool WriteAll(const std::filesystem::path& path, const std::string& text) {
+    const auto tmp = std::filesystem::path(path).concat(".tmp");
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out << text;
+        if (!out) {
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
+std::mutex g_ini_write_lock; // EnsureLayout / SetValue: read-modify-write of the file
+
+/// Creates the ini (current layout, defaults); converts an older layout once (backup game_settings.ini.bak, never
+/// overwritten: .bak.1, .bak.2 ... when it exists); adds keys a newer build knows into their own sections.
+/// Caller holds g_ini_write_lock.
+void EnsureLayoutLocked() {
     const auto path = IniPath();
     std::error_code ec;
-    const bool existed = std::filesystem::exists(path, ec);
-    std::string add;
-    std::string section;
-    for (const Option& o : kOptions) {
-        bool present = false;
-        if (existed) {
-            ReadValue(o.section, o.key, &present);
+    if (!std::filesystem::exists(path, ec)) {
+        if (WriteAll(path, Ini::Rebuild("", nullptr))) {
+            LOG_INFO(Core_ARM, "game settings: wrote the defaults to {}", path.string());
         }
-        if (present) {
-            continue;
-        }
-        if (section != o.section) {
-            section = o.section;
-            add += std::string("\n[") + o.section + "]\n";
-        }
-        add += std::string(o.comment) + o.key + " = " + o.value + "\n";
+        return;
     }
-    if (!existed) {
-        std::ofstream(path) << kTemplate << add;
-        LOG_INFO(Core_ARM, "game settings: wrote the defaults to {}", path.string());
-    } else if (!add.empty()) {
-        std::ofstream(path, std::ios::app) << "\n; Added by a newer build:" << add;
-        LOG_INFO(Core_ARM, "game settings: added new options to {}", path.string());
+    const std::string text = ReadAll(path);
+    if (!Ini::IsCurrentLayout(text)) {
+        auto bak = std::filesystem::path(path).concat(".bak");
+        for (int n = 1; std::filesystem::exists(bak, ec) && n < 100; ++n) {
+            bak = std::filesystem::path(path).concat(".bak." + std::to_string(n));
+        }
+        std::filesystem::copy_file(path, bak, std::filesystem::copy_options::none, ec);
+        if (ec) {
+            LOG_WARNING(Core_ARM, "game settings: could not back up {} ({}); the old layout is kept", path.string(),
+                        ec.message());
+            return;
+        }
+        std::vector<std::string> notes;
+        const std::string rebuilt = Ini::Rebuild(text, &notes);
+        if (!WriteAll(path, rebuilt)) {
+            LOG_WARNING(Core_ARM, "game settings: could not rewrite {}; the old layout is kept", path.string());
+            return;
+        }
+        LOG_INFO(Core_ARM, "game settings: converted {} to the current layout (one section each); old file kept as {}",
+                 path.string(), bak.filename().string());
+        for (const auto& n : notes) {
+            LOG_INFO(Core_ARM, "game settings: {}", n);
+        }
+        return;
+    }
+    std::vector<std::string> added;
+    const std::string updated = Ini::AddMissing(text, &added);
+    if (!added.empty() && WriteAll(path, updated)) {
+        std::string list;
+        for (const auto& a : added) {
+            list += (list.empty() ? "" : ", ") + a;
+        }
+        LOG_INFO(Core_ARM, "game settings: added new options to {}: {}", path.string(), list);
+    }
+}
+
+void WriteMissingOptions() {
+    std::scoped_lock lk{g_ini_write_lock};
+    EnsureLayoutLocked();
+}
+
+/// [Graphics] renderer = Emulated | Direct (case-insensitive; also emu/replacement, 0/1, true/false, yes/no, on/off).
+/// Returns true when the key is there; *direct = Direct. Without `renderer` the legacy [Graphics] native_gpu is read
+/// (true = Direct). Anything else counts as Emulated, the original behaviour. *shown: the text as found.
+bool ReadRenderer(bool* direct, std::string* shown = nullptr) {
+    bool present = false;
+    std::string v = ReadValue("Graphics", "renderer", &present);
+    if (!present) {
+        v = ReadValue("Graphics", "native_gpu", &present);
+    }
+    if (shown) {
+        *shown = v;
+    }
+    std::string l = v;
+    for (char& c : l) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    *direct = l == "direct" || l == "replacement" || l == "true" || l == "1" || l == "yes" || l == "on";
+    return present;
+}
+
+/// [Graphics] renderer decides; the older [Debug] keys are only read without it. Warns once at start
+/// when such a key is still in the file and says otherwise (it has no effect then).
+void WarnDeadKeys() {
+    bool on = false;
+    std::string ng;
+    if (!ReadRenderer(&on, &ng)) {
+        return;
+    }
+    const auto truthy = [](const std::string& v) { return v == "true" || v == "1" || v == "yes" || v == "on"; };
+    const auto falsy = [](const std::string& v) { return v == "false" || v == "0" || v == "no" || v == "off"; };
+    struct Dead {
+        const char* key;
+        bool conflicts;
+    };
+    bool p1 = false, p2 = false, p3 = false;
+    const std::string nn = ReadValue("Debug", "native_nvn", &p1);
+    const std::string nv = ReadValue("Debug", "nvn_vulkan", &p2);
+    const std::string sr = ReadValue("Debug", "suyu_render", &p3);
+    const Dead dead[] = {
+        {"native_nvn", p1 && truthy(nn) != on},
+        {"nvn_vulkan", p2 && (nv == "present") != on},
+        {"suyu_render", p3 && !falsy(sr) == on}, // native_gpu = true means suyu does not render
+    };
+    for (const Dead& d : dead) {
+        if (d.conflicts) {
+            LOG_WARNING(Core_ARM, "game settings: [Debug] {} is ignored: [Graphics] renderer = {} decides the renderer "
+                                  "(remove the old key)", d.key, ng);
+        }
     }
 }
 
@@ -319,15 +385,30 @@ bool IsTrue(const std::string& s) {
     return s.empty() || s == "true" || s == "1" || s == "yes" || s == "on";
 }
 
+/// [Display] resolution -> g_out_h / g_render_w / g_render_h. The Vulkan renderer reads them (render scale, split scale)
+/// when it starts, before Start() runs, so they are resolved from the ini on first use as well; Start() repeats it.
+void ResolveDisplayResolution() {
+    u32 res_w = 0, res_h = 0;
+    if (const std::string res = ReadValue("Display", "resolution"); !res.empty() && res != "default") {
+        if (res == "auto") {
+            u32 hz = 0;
+            DesktopMode(&res_w, &res_h, &hz);
+        } else if (!ParseResolution(res, &res_w, &res_h)) {
+            res_w = res_h = 0;
+        }
+    }
+    g_out_h = res_h != 0 ? res_h : kDockedH;
+    // The guest always renders at console size; the internal resolution changes only through the render-scale steps
+    // (EffectiveResolutionStep). g_render_w/h stay 0 (= console size), so the render-size hooks are not installed.
+    g_render_w = g_render_h = 0;
+}
+
 } // namespace
 
 std::atomic<u32> g_aspect_pc{0};
 
 static bool NativeGpuSet(bool* on) {
-    bool present = false;
-    const std::string v = ReadValue("Graphics", "native_gpu", &present);
-    *on = v == "true" || v == "1" || v == "yes" || v == "on";
-    return present;
+    return ReadRenderer(on); // [Graphics] renderer (Direct = true), else the legacy native_gpu
 }
 
 bool FenceThreadSleep() {
@@ -343,6 +424,8 @@ std::string ProbePcs() {
 }
 
 u32 RenderWidth() {
+    static const bool resolved = (ResolveDisplayResolution(), true);
+    (void)resolved;
     return g_render_w;
 }
 
@@ -373,6 +456,331 @@ int NvnVkDebug() {
     return v;
 }
 
+bool NvnUpscalerProbe() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_upscaler_probe");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
+int NvnJitterSpike() {
+    static const int mode = [] {
+        const std::string v = ReadValue("Debug", "nvn_jitter_spike");
+        const int m = v.empty() || v == "off" || v == "false" ? 0 : std::atoi(v.c_str());
+        return m < 0 || m > 2 ? 0 : m;
+    }();
+    return mode;
+}
+
+bool NvnFsr() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
+bool NvnFsrReactive() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_reactive");
+        return !(v == "false" || v == "0" || v == "no" || v == "off"); // default on
+    }();
+    return on;
+}
+
+float NvnFsrSharpness() {
+    static const float s = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_sharpness");
+        if (v.empty()) {
+            return 0.3f;
+        }
+        char* end = nullptr;
+        const float f = std::strtof(v.c_str(), &end);
+        return end == v.c_str() || !std::isfinite(f) ? 0.3f : std::clamp(f, 0.0f, 1.0f);
+    }();
+    return s;
+}
+
+int NvnFsrSnapDraw() {
+    // not cached: the renderer polls it about once a second, so the ini can be edited while the game runs
+    const std::string v = ReadValue("Debug", "nvn_fsr_snapdraw");
+    if (v.empty()) {
+        return 0;
+    }
+    char* end = nullptr;
+    const long n = std::strtol(v.c_str(), &end, 10);
+    return end == v.c_str() || n < 0 || n > 100000 ? 0 : static_cast<int>(n);
+}
+
+bool NvnFsrHudLayer() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_hudlayer");
+        return !(v == "false" || v == "0" || v == "no" || v == "off"); // default on
+    }();
+    return on;
+}
+
+bool NvnFsrMotionMask() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_motionmask");
+        return v == "true" || v == "1" || v == "yes" || v == "on"; // default off (shimmer on distant fine edges)
+    }();
+    return on;
+}
+
+int NvnFsrJitterConv() {
+    static const int c = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_jitter_conv");
+        if (v.empty()) {
+            return 1;
+        }
+        char* end = nullptr;
+        const long n = std::strtol(v.c_str(), &end, 10);
+        return end == v.c_str() || n < 0 || n > 3 ? 1 : static_cast<int>(n);
+    }();
+    return c;
+}
+
+float NvnFsrObjMvNear() {
+    static const float d = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_objmv_near");
+        char* end = nullptr;
+        const float f = v.empty() ? 3000.0f : std::strtof(v.c_str(), &end);
+        return v.empty() || end == v.c_str() || !std::isfinite(f) || f <= 0.0f ? 3000.0f : f;
+    }();
+    return d;
+}
+
+bool NvnFsrObjMv() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_objmv");
+        return !(v == "false" || v == "0" || v == "no" || v == "off"); // default on
+    }();
+    return on;
+}
+
+int NvnFsrObjVel() {
+    static const int m = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_objvel");
+        if (v.empty() || v == "true" || v == "on" || v == "yes") {
+            return 4; // default: every depth-tested colour+depth scene draw
+        }
+        if (v == "false" || v == "off" || v == "no") {
+            return 0;
+        }
+        char* end = nullptr;
+        const long n = std::strtol(v.c_str(), &end, 10);
+        return end == v.c_str() || n < 0 || n > 4 ? 4 : static_cast<int>(n);
+    }();
+    return m;
+}
+
+u32 NvnFsrObjVelMaxVerts() {
+    static const u32 m = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_objvel_maxverts");
+        char* end = nullptr;
+        const long long n = v.empty() ? 0 : std::strtoll(v.c_str(), &end, 10);
+        return v.empty() || end == v.c_str() || n <= 0 ? 4000000u : static_cast<u32>(std::clamp<long long>(n, 10000, 8000000));
+    }();
+    return m;
+}
+
+float NvnFsrObjVelReactive() {
+    static const float r = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_objvel_reactive");
+        char* end = nullptr;
+        const float f = v.empty() ? 0.1f : std::strtof(v.c_str(), &end);
+        return v.empty() || end == v.c_str() || !std::isfinite(f) ? 0.1f : std::clamp(f, 0.0f, 1.0f);
+    }();
+    return r;
+}
+
+float NvnFsrObjVelMaxPx() {
+    static const float d = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_objvel_maxpx");
+        char* end = nullptr;
+        const float f = v.empty() ? 64.0f : std::strtof(v.c_str(), &end);
+        return v.empty() || end == v.c_str() || !std::isfinite(f) || f <= 0.0f ? 64.0f : std::clamp(f, 1.0f, 1024.0f);
+    }();
+    return d;
+}
+
+float NvnFsrReactiveStrength() {
+    static const float r = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_reactive_strength");
+        char* end = nullptr;
+        const float f = v.empty() ? 0.9f : std::strtof(v.c_str(), &end);
+        return v.empty() || end == v.c_str() || !std::isfinite(f) ? 0.9f : std::clamp(f, 0.0f, 1.0f);
+    }();
+    return r;
+}
+
+bool NvnFsrAnimSurf() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_animsurf");
+        return !(v == "false" || v == "0" || v == "no" || v == "off"); // default on
+    }();
+    return on;
+}
+
+float NvnFsrAnimSurfThr() {
+    static const float t = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_animsurf_thr");
+        char* end = nullptr;
+        const float f = v.empty() ? 0.03f : std::strtof(v.c_str(), &end);
+        return v.empty() || end == v.c_str() || !std::isfinite(f) || f <= 0.0f ? 0.03f : std::clamp(f, 0.002f, 1.0f);
+    }();
+    return t;
+}
+
+static bool ReadFlag(const char* key, bool def) {
+    const std::string v = ReadValue("Debug", key);
+    if (v.empty()) {
+        return def;
+    }
+    return v == "true" || v == "1" || v == "yes" || v == "on";
+}
+
+bool NvnFsrSignals() {
+    static const bool on = ReadFlag("nvn_fsr_signals", false);
+    return on;
+}
+
+namespace {
+struct FsrDebugState {
+    bool on;
+    const char* why;
+};
+const FsrDebugState& FsrDebug() {
+    static const FsrDebugState s = [] {
+        // nvn_fsr_debug: true / on / yes or a non-zero number (the older "= 1" spelling); nvn_bench: the same flag test as
+        // the renderer's bench (1 / true / on / yes)
+        const std::string v = ReadValue("Debug", "nvn_fsr_debug");
+        const bool dbg = v == "true" || v == "on" || v == "yes" || (!v.empty() && std::atoi(v.c_str()) != 0);
+        const bool bench = ReadFlag("nvn_bench", false);
+        return FsrDebugState{dbg || bench, dbg && bench ? "nvn_fsr_debug and nvn_bench = 1 are set"
+                                           : dbg        ? "nvn_fsr_debug is set"
+                                           : bench      ? "nvn_bench = 1 is set (the benchmark switches the FSR states)"
+                                                        : "nvn_fsr_debug is off (default) and nvn_bench is off"};
+    }();
+    return s;
+}
+} // namespace
+
+bool NvnFsrDebugHooks() {
+    return FsrDebug().on;
+}
+
+const char* NvnFsrDebugHooksReason() {
+    return FsrDebug().why;
+}
+
+bool NvnFsrAnimSurfBypass() {
+    static const bool on = ReadFlag("nvn_fsr_animsurf_bypass", true);
+    return on;
+}
+
+bool NvnFsrAnimSurfEdgeGate() {
+    static const bool on = ReadFlag("nvn_fsr_animsurf_edge_gate", true);
+    return on;
+}
+
+bool NvnFsrMenu3d() {
+    static const bool on = ReadFlag("nvn_fsr_menu3d", true);
+    return on;
+}
+
+bool NvnFsrMenuSkip() {
+    static const bool on = ReadFlag("nvn_fsr_menuskip", false);
+    return on;
+}
+
+bool NvnFsrObjVelStatic() {
+    static const bool on = ReadFlag("nvn_fsr_objvel_static", true);
+    return on;
+}
+
+u32 NvnFsrStaticFrames() {
+    static const u32 n = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_static_frames");
+        char* end = nullptr;
+        const long long x = v.empty() ? 0 : std::strtoll(v.c_str(), &end, 10);
+        return v.empty() || end == v.c_str() || x <= 0 ? 240u : static_cast<u32>(std::min<long long>(x, 100000));
+    }();
+    return n;
+}
+
+int NvnFsrBackend() {
+    static const int b = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_backend");
+        return v == "4" ? 4 : 3; // anything else (absent, 3, junk) = the FSR 3.1 path
+    }();
+    return b;
+}
+
+bool NvnFsrIndicator() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_fsr_indicator");
+        return v == "true" || v == "1" || v == "yes" || v == "on"; // default off
+    }();
+    return on;
+}
+
+static float ReadHudEdge(const char* key, float def) {
+    const std::string v = ReadValue("Debug", key);
+    char* end = nullptr;
+    const float f = v.empty() ? def : std::strtof(v.c_str(), &end);
+    return v.empty() || end == v.c_str() || !std::isfinite(f) ? def : std::clamp(f, 0.0f, 1.0f);
+}
+
+float NvnFsrHudLo() {
+    return ReadHudEdge("nvn_fsr_hud_lo", 0.08f);
+}
+
+float NvnFsrHudHi() {
+    return ReadHudEdge("nvn_fsr_hud_hi", 0.25f);
+}
+
+bool NvnMvPass() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "nvn_mv_pass");
+        return v == "true" || v == "1" || v == "yes" || v == "on" || NvnFsr();
+    }();
+    return on;
+}
+
+// Jitter on the main camera projection: 0 off, 1/2 = nvn_jitter_spike modes, 3 = nvn_fsr (FSR Halton sequence,
+// applied only while the renderer reports FSR active). nvn_fsr wins over nvn_jitter_spike.
+static int JitMode() {
+    return NvnFsr() ? 3 : NvnJitterSpike();
+}
+
+int NvnMvLag() {
+    static const int lag = [] {
+        const std::string v = ReadValue("Debug", "nvn_mv_lag");
+        const int n = v.empty() ? 1 : std::atoi(v.c_str()); // default 1: the camera record the game's jittered draws use is the one of the previous guest present
+        return std::clamp(n, 0, 3);
+    }();
+    return lag;
+}
+
+bool DescriptorBuffer() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "descriptor_buffer");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
+bool MultiRangeBuffers() {
+    static const bool on = [] {
+        const std::string v = ReadValue("Debug", "multi_range_buffers");
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+
 bool SuyuRender() {
     static const bool on = [] {
         if (bool ng; NativeGpuSet(&ng)) return !ng;
@@ -384,8 +792,9 @@ bool SuyuRender() {
 
 bool PresentNoDrain() {
     static const bool on = [] {
-        const std::string v = ReadValue("Debug", "present_nodrain");
-        return v == "true" || v == "1" || v == "yes" || v == "on";
+        std::string v = ReadValue("Debug", "present_nodrain");
+        for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); // True / TRUE count too
+        return !(v == "false" || v == "0" || v == "no" || v == "off"); // absent = on; false = the old draining present
     }();
     return on;
 }
@@ -447,6 +856,16 @@ bool GpuDiagnosticsEnabled() {
     return enabled;
 }
 
+bool NvnCallSampling() {
+    static const bool enabled = ReadFlag("nvn_call_sampling", false); // empty value counts as unset (off)
+    return enabled;
+}
+
+bool LogRedactPaths() {
+    const std::string v = ReadValue("Debug", "log_redact_paths");
+    return !(v == "false" || v == "0" || v == "no" || v == "off");
+}
+
 bool ProbesEnabled() {
     static const bool enabled = [] {
         const std::string v = ReadValue("Debug", "probes");
@@ -455,59 +874,39 @@ bool ProbesEnabled() {
     return enabled;
 }
 
+namespace {
+std::atomic<u64> g_settings_generation{0}; // SetValue count (SettingsGeneration)
+} // namespace
+
 std::string Value(const std::string& section, const std::string& key) {
     return ReadValue(section, key);
 }
 
 void SetValue(const std::string& want_section, const std::string& want_key,
               const std::string& value) {
-    WriteMissingOptions();
-    std::vector<std::string> lines;
     {
-        std::ifstream in(IniPath());
-        for (std::string line; std::getline(in, line);) {
-            lines.push_back(line);
+        std::scoped_lock lk{g_ini_write_lock};
+        EnsureLayoutLocked();
+        // Replaces the effective line (a moved key is found in its old [Debug] place too) or the "; key = default"
+        // line; else adds it inside the key's own section (no duplicate sections).
+        const std::string text = ReadAll(IniPath());
+        if (!WriteAll(IniPath(), Ini::SetKey(text, want_section, want_key, value))) {
+            LOG_WARNING(Core_ARM, "game settings: could not write [{}] {} = {}", want_section, want_key, value);
         }
     }
-    std::string section;
-    std::ptrdiff_t section_end = -1; // insertion point: after the last line of the section
-    bool done = false;
-    for (std::size_t i = 0; i < lines.size() && !done; ++i) {
-        const std::string t = Trim(lines[i]);
-        if (!t.empty() && t.front() == '[' && t.back() == ']') {
-            section = Trim(t.substr(1, t.size() - 2));
-            continue;
-        }
-        if (section != want_section) {
-            continue;
-        }
-        section_end = static_cast<std::ptrdiff_t>(i) + 1;
-        const auto eq = t.find('=');
-        if (t.empty() || t[0] == ';' || t[0] == '#' || eq == std::string::npos) {
-            continue;
-        }
-        if (Trim(t.substr(0, eq)) == want_key) {
-            lines[i] = want_key + " = " + value;
-            done = true;
-        }
-    }
-    if (!done) {
-        if (section_end < 0) {
-            lines.push_back("");
-            lines.push_back("[" + want_section + "]");
-            section_end = static_cast<std::ptrdiff_t>(lines.size());
-        }
-        lines.insert(lines.begin() + section_end, want_key + " = " + value);
-    }
-    std::ofstream out(IniPath(), std::ios::trunc);
-    for (const auto& line : lines) {
-        out << line << '\n';
-    }
+    g_settings_generation.fetch_add(1, std::memory_order_release); // after the file is written: readers re-read then
+}
+
+u64 SettingsGeneration() {
+    return g_settings_generation.load(std::memory_order_acquire);
 }
 
 std::vector<OptionInfo> Options() {
     std::vector<OptionInfo> out;
-    for (const Option& o : kOptions) {
+    for (const Ini::Row& o : Ini::Rows()) {
+        if (o.kind != Ini::Kind::Menu && o.kind != Ini::Kind::Advanced) {
+            continue; // the game menu lists the user options (Advanced ones only in Advanced mode); the rest is documented in the file
+        }
         std::string comment;
         const std::string_view text{o.comment};
         std::size_t start = 0;
@@ -523,9 +922,197 @@ std::vector<OptionInfo> Options() {
             comment += line;
             start = end + 1;
         }
-        out.push_back({o.section, o.key, o.value, std::move(comment)});
+        out.push_back({o.section, o.key, o.value ? o.value : "", std::move(comment), o.kind == Ini::Kind::Advanced});
     }
     return out;
+}
+
+UpscalerChoice UpscalerChoiceNow() {
+    const std::string on = ReadValue("Upscaler", "nvn_fsr");
+    if (!(on == "true" || on == "1" || on == "yes" || on == "on")) {
+        return UpscalerChoice::Off;
+    }
+    return ReadValue("Upscaler", "nvn_fsr_backend") == "4" ? UpscalerChoice::Fsr4 : UpscalerChoice::Fsr31;
+}
+
+void SetUpscalerChoice(UpscalerChoice choice) {
+    SetValue("Upscaler", "nvn_fsr", choice == UpscalerChoice::Off ? "false" : "true");
+    if (choice != UpscalerChoice::Off) {
+        SetValue("Upscaler", "nvn_fsr_backend", choice == UpscalerChoice::Fsr4 ? "4" : "3");
+    }
+}
+
+const char* FsrQualityName(FsrQuality q) {
+    const int i = static_cast<int>(q);
+    return i >= 0 && i < kFsrQualityCount ? kFsrQualityNames[i] : kFsrQualityNames[0];
+}
+
+FsrQuality FsrQualityNow() {
+    std::string v = ReadValue("Upscaler", "nvn_fsr_quality");
+    std::string k; // lower case, letters only: "Native AA" / native_aa / nativeaa
+    for (const char c : v) {
+        if (std::isalpha(static_cast<unsigned char>(c))) k += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (k == "quality") return FsrQuality::Quality;
+    if (k == "balanced") return FsrQuality::Balanced;
+    if (k == "performance") return FsrQuality::Performance;
+    if (k == "ultraperformance" || k == "ultra") return FsrQuality::UltraPerformance;
+    return FsrQuality::NativeAA; // absent, "native", "nativeaa", junk
+}
+
+bool DirectRendererNow() {
+    bool direct = false;
+    ReadRenderer(&direct);
+    return direct;
+}
+
+bool RenderScaleOverrideNow() {
+    const std::string v = ReadValue("Upscaler", "render_scale_override");
+    return v == "true" || v == "1" || v == "yes" || v == "on";
+}
+
+const char* ResolutionStepName(int step) {
+    return step >= 0 && step < 13 ? kStepName[step] : "?";
+}
+
+bool FsrSplitScaleNow() {
+    const std::string v = ReadValue("Upscaler", "nvn_fsr_split_scale");
+    // default OFF: the owner wants suyu's built-in render scale steps; the custom 1/256 split is opt-in
+    return v == "true" || v == "1" || v == "yes" || v == "on";
+}
+
+namespace {
+/// Render scale a Quality mode asks for (relative to the game's own render height base_h); Ultra Performance = the
+/// lowest step. Shared by the nearest-step path and the split path.
+double GameBaseHeight(); // the console's 1X render height: 1080 docked, 720 handheld
+double ModeTargetScale(FsrQuality q, double out_h, double target_h) {
+    if (q == FsrQuality::UltraPerformance) return kStepFactor[0];
+    double ratio = kFsrQualityRatios[static_cast<int>(q)];
+    if (ratio == kRatioBase1080) ratio = std::min(std::max(out_h / GameBaseHeight(), 1.0), kQualityMaxRatio);
+    // the factor is relative to the targets the engine really creates (target_h), not to the 1X base
+    return (out_h / ratio) / target_h;
+}
+
+/// Nearest Settings::ResolutionSetup step (log distance) to a scale.
+int NearestStep(double target_scale) {
+    int step = 3;
+    double best = 1e30;
+    for (int i = 0; i < 13; ++i) {
+        const double d = std::fabs(std::log(kStepFactor[i] / target_scale));
+        if (d < best - 1e-9) {
+            best = d;
+            step = i;
+        }
+    }
+    return step;
+}
+
+std::atomic<u32> g_win_h{0}; // last window height reported by the frontend (SetWindowSize)
+const char* g_out_src = "console base";
+// Output height: [Display] resolution = WxH if set; else the current window when native_render is on; else the console base.
+double OutputHeight() {
+    u32 w = 0, h = 0;
+    if (const std::string res = ReadValue("Display", "resolution");
+        !res.empty() && res != "default" && res != "auto" && ParseResolution(res, &w, &h)) {
+        g_out_src = "[Display] resolution";
+        return static_cast<double>(h);
+    }
+    if (IsTrue(ReadValue("Graphics", "native_render")) && g_win_h.load() != 0) {
+        g_out_src = "window size";
+        return static_cast<double>(g_win_h.load());
+    }
+    g_out_src = "console base";
+    return GameBaseHeight();
+}
+// the console's own render size = render scale 1X: 1080p docked, 720p handheld, whatever native_render does
+double GameBaseHeight() {
+    return Core::GameSettings::StartHandheld() ? static_cast<double>(kHandheldH) : static_cast<double>(kDockedH);
+}
+// 1X of the render scale is always the console size; native_render and the output size never change it
+double TargetHeight() {
+    return GameBaseHeight();
+}
+} // namespace
+
+bool FsrSplitScale(FsrSplit* out) {
+    FsrSplit s{};
+    const bool on = [&] {
+        if (UpscalerChoiceNow() == UpscalerChoice::Off || !DirectRendererNow()) {
+            s.why = "no upscaler on the Direct renderer";
+            return false;
+        }
+        if (RenderScaleOverrideNow()) {
+            s.why = "render_scale_override is on";
+            return false;
+        }
+        if (!FsrSplitScaleNow()) {
+            s.why = "nvn_fsr_split_scale = false";
+            return false;
+        }
+        const FsrQuality q = FsrQualityNow();
+        if (q == FsrQuality::NativeAA) {
+            s.why = "Native AA (render = output)";
+            return false;
+        }
+        const double out_h = OutputHeight(), base_h = TargetHeight();
+        // The output (present images, HUD layer) must be exactly the game's own render size (1X): images at 1X need no
+        // rescaling in the translated shaders, so the one scale baked into them (the render scale) stays right for
+        // every draw. That is the case with native_render and a resolution set, or the default 1080p.
+        const int out_step = NearestStep(out_h / base_h);
+        if (out_step != 3) {
+            s.why = fmt::format("output {}p is not the game's render height {}p (Native AA would use {}; set native_render = true)",
+                                static_cast<int>(out_h), static_cast<int>(base_h), kStepName[out_step]);
+            return false;
+        }
+        const double target = ModeTargetScale(q, out_h, base_h);
+        // suyu's rescaling form: up_scale >> down_shift, here in 1/256 steps, reduced
+        u32 up = static_cast<u32>(std::clamp(std::lround(target * 256.0), 16l, 256l));
+        u32 shift = 8;
+        while (shift > 0 && (up % 2) == 0) {
+            up /= 2;
+            --shift;
+        }
+        const double scale = static_cast<double>(up) / static_cast<double>(1u << shift);
+        if (scale >= 1.0) {
+            s.why = fmt::format("{}: the mode's scale x{:.3f} is not below the output", FsrQualityName(q), target);
+            return false;
+        }
+        s.render_scale = scale;
+        s.up_scale = up;
+        s.down_shift = shift;
+        s.why = fmt::format("{} (output {}p = game render height): scene x{:.4f} ({} >> {}), output 1X", FsrQualityName(q),
+                            static_cast<int>(out_h), scale, up, shift);
+        return true;
+    }();
+    if (out) *out = std::move(s);
+    return on;
+}
+
+int EffectiveResolutionStep(int saved_step, bool* by_mode, std::string* why) {
+    if (by_mode) *by_mode = false;
+    if (why) why->clear();
+    if (saved_step < 0 || saved_step > 12) saved_step = 3;
+    if (UpscalerChoiceNow() == UpscalerChoice::Off || !DirectRendererNow() || RenderScaleOverrideNow()) {
+        return saved_step;
+    }
+    const FsrQuality q = FsrQualityNow();
+    const double out_h = OutputHeight();
+    const double target_h = TargetHeight();
+    const int step = q == FsrQuality::UltraPerformance ? 0 : NearestStep(ModeTargetScale(q, out_h, target_h));
+    if (by_mode) *by_mode = true;
+    if (why) {
+        const bool hh = StartHandheld();
+        const double base_h = GameBaseHeight();
+        const u32 px = target_h == GameBaseHeight() ? (hh ? kStepHandheldH[step] : kStepDockedH[step])
+                                                    : static_cast<u32>(std::lround(kStepFactor[step] * target_h));
+        *why = fmt::format("{} (1X = {}p); output {}p from {} = {:.2f}X of 1X; {} -> step {} ({}p of the {}p console targets){}",
+                           hh ? "handheld" : "docked", static_cast<int>(base_h), static_cast<int>(out_h), g_out_src,
+                           out_h / base_h, FsrQualityName(q), kStepName[step], px, static_cast<int>(target_h),
+                           step == saved_step ? "" : fmt::format("; saved step was {}", kStepName[saved_step]));
+        // nvn_fsr_split_scale: the Direct renderer uses the split instead of this single step
+        if (FsrSplit sp{}; FsrSplitScale(&sp)) *why += "; split scale: " + sp.why;
+    }
+    return step;
 }
 
 namespace {
@@ -575,6 +1162,11 @@ bool StartHandheld() {
     return v == "handheld" || v == "undocked" || v == "portable";
 }
 
+void SetWindowSize(u32 width, u32 height) {
+    (void)width;
+    g_win_h = height;
+}
+
 void SetDesktopMode(u32 width, u32 height, u32 refresh_hz) {
     g_desk_w = width;
     g_desk_h = height;
@@ -585,6 +1177,7 @@ std::atomic<u32> g_render_create_pc{0};
 std::atomic<u32> g_motion_blur_pc{0};
 std::atomic<u32> g_vp_probe_pc{0};
 std::atomic<u32> g_main_base{0};
+std::atomic<bool> g_probe_on{false};
 namespace {
 // uMotionBlurFilter render function (STATIC-REVIEW-motionblur-velocity.md): r0 = filter, r1 = draw context.
 constexpr u32 kMotionBlurRender = 0x8BCD84;
@@ -599,6 +1192,7 @@ void Start(System& system, const std::map<u64, std::string>& modules) {
     }
     g_system = &system;
     WriteMissingOptions();
+    WarnDeadKeys();
 
     u32 desk_w = 0, desk_h = 0, desk_hz = 0;
     DesktopMode(&desk_w, &desk_h, &desk_hz);
@@ -630,16 +1224,12 @@ void Start(System& system, const std::map<u64, std::string>& modules) {
         }
     }
     bool stretch = false;
+    g_out_h = res_h != 0 ? res_h : kDockedH;
     if (res_w != 0 && res_h != 0) {
         g_aspect = static_cast<float>(res_w) / static_cast<float>(res_h);
         stretch = true; // the view already has the window's exact shape: fill it
-        if (IsTrue(ReadValue("Graphics", "native_render"))) {
-            // Fit within what the engine is known to handle, keeping the shape.
-            const float scale = std::min({1.0f, static_cast<float>(kMaxRenderW) / res_w,
-                                          static_cast<float>(kMaxRenderH) / res_h});
-            g_render_w = static_cast<u32>(res_w * scale) & ~1u;
-            g_render_h = static_cast<u32>(res_h * scale) & ~1u;
-        }
+        // native_render does not resize the guest render (that would stack with the render-scale step);
+        // g_render_w/h stay 0 = console size.
     } else if (const std::string aspect = ReadValue("Display", "aspect"); !aspect.empty()) {
         const float v = ParseAspect(aspect);
         if (v >= 1.0f && v <= 4.0f) {
@@ -674,6 +1264,35 @@ void Start(System& system, const std::map<u64, std::string>& modules) {
         stretch && wide ? Settings::AspectRatio::Stretch
                         : (wide ? OutputAspect(g_aspect) : Settings::AspectRatio::R16_9));
     g_main_base.store(main_base);
+    if (main_base != 0 && JitMode() != 0) {
+        // jitter spike / nvn_fsr: only the render projection is written; the post-hook is shared with the probe
+        RecompHooks::Mark(main_base + kProjection);
+        RecompHooks::Mark(main_base + kProjectionB); // counted only (CPU world-to-screen), never written
+        g_probe_on.store(true);
+        if (NvnFsr()) {
+            LOG_INFO(Core_ARM, "game settings: nvn_fsr on: FSR Halton jitter on the main camera projection while FSR is active");
+        } else {
+            LOG_INFO(Core_ARM, "game settings: nvn_jitter_spike = {} (F4 toggles, F3 amplitude)", NvnJitterSpike());
+        }
+    }
+    if (main_base != 0 && NvnMvPass()) {
+        // motion vector pass: main camera view (look-at 0x1C33C) and unjittered projection (0x1C358), read only
+        RecompHooks::Mark(main_base + kProjection);
+        RecompHooks::Mark(main_base + kLookAtA);
+        g_probe_on.store(true);
+        LOG_INFO(Core_ARM, "game settings: nvn_mv_pass on (camera capture at main+0x1C33C / 0x1C358), lag {}", NvnMvLag());
+    }
+    if (main_base != 0 && NvnUpscalerProbe()) {
+        RecompHooks::Mark(main_base + kProjection);
+        RecompHooks::Mark(main_base + kProjectionB);
+        RecompHooks::Mark(main_base + kLookAtA);
+        RecompHooks::Mark(main_base + kLookAtB);
+        for (const u32 off : kFilterCtors) {
+            RecompHooks::Mark(main_base + off);
+        }
+        g_probe_on.store(true);
+        LOG_INFO(Core_ARM, "game settings: upscaler probe hooks on (camera projection, filter constructors)");
+    }
     if (main_base != 0 && (ProbesEnabled() || g_render_w != 0)) {
         RecompHooks::Mark(main_base + 0xBC1204);
         g_vp_probe_pc.store(main_base + 0xBC1204);
@@ -822,12 +1441,635 @@ void OnHookedEntry(u32 pc, u32* regs) {
     g_far_written[base] = scaled;
 }
 
+// ---- [Debug] nvn_upscaler_probe: camera matrix log and filter constructor hit counters -------------------------
+namespace {
+struct CamPending {
+    u32 pc, obj, out, lr, vtable;
+    float nearv, farv, aspect, fov;
+    bool view; // true: look-at (view matrix) function, false: projection function
+};
+// Camera object fields (same object for the projection and look-at functions): eye +0x40, up +0x50, target +0x60
+// (3 floats each), clip +0x30/+0x34, aspect +0x38, fov +0x3C.
+struct CamState {
+    u32 ptr{};
+    float eye[3]{}, tgt[3]{}, up[3]{};
+    float fov{}, aspect{};
+    u64 stamp{}; // bumped on every update of the main camera
+};
+thread_local std::vector<CamPending> t_cam_stack;
+std::mutex g_cam_lock;
+std::vector<std::string> g_cam_drain; // every call since the last drain (cap 64)
+u64 g_cam_calls[2]{};                 // [0] projection, [1] view
+u64 g_cam_last_log_s[2]{};
+CamState g_main_cam;                  // last camera seen with the main aspect ratio
+CamState g_prev_cam;                  // main camera at the previous present that saw an update
+u64 g_prev_cam_stamp{};
+u64 g_prev_cam_present{};
+u32 g_jump_lines{};
+u32 g_switch_lines{};
+std::atomic<u64> g_filter_hits[std::size(kFilterCtors)];
+std::atomic<u64> g_filter_first_present[std::size(kFilterCtors)];
+std::atomic<u32> g_filter_first_lr[std::size(kFilterCtors)];
+std::atomic<u64> g_probe_frames{0};
+// F5 camera trace
+bool g_f5_down{};
+u32 g_trace_left{};
+u32 g_trace_runs{};
+u64 g_trace_bytes{};
+constexpr u64 kTraceCap = 2u * 1024 * 1024;
+
+std::ofstream& CamLog() {
+    static std::ofstream out(Common::FS::GetSuyuPath(Common::FS::SuyuPath::SuyuDir) /
+                                 "nvn_upscaler_probe_cam.txt",
+                             std::ios::trunc);
+    return out;
+}
+
+std::ofstream& TraceLog() {
+    static std::ofstream out(Common::FS::GetSuyuPath(Common::FS::SuyuPath::SuyuDir) /
+                                 "nvn_upscaler_probe_camtrace.txt",
+                             std::ios::trunc);
+    return out;
+}
+
+u64 NowSeconds() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+float RdF(Core::Memory::Memory& mem, u32 addr) {
+    return std::bit_cast<float>(mem.Read32(addr));
+}
+
+CamState ReadCam(Core::Memory::Memory& mem, u32 obj) {
+    CamState c;
+    c.ptr = obj;
+    if (!mem.IsValidVirtualAddressRange(obj, 0x70)) {
+        return c;
+    }
+    for (u32 i = 0; i < 3; ++i) {
+        c.eye[i] = RdF(mem, obj + 0x40 + i * 4);
+        c.up[i] = RdF(mem, obj + 0x50 + i * 4);
+        c.tgt[i] = RdF(mem, obj + 0x60 + i * 4);
+    }
+    c.aspect = RdF(mem, obj + kAspectField);
+    c.fov = RdF(mem, obj + 0x3C);
+    return c;
+}
+
+std::string CamText(const CamState& c) {
+    return fmt::format("eye {:.5g} {:.5g} {:.5g} target {:.5g} {:.5g} {:.5g} up {:.5g} {:.5g} {:.5g} fov {:.5g} aspect {:.5g}",
+                       c.eye[0], c.eye[1], c.eye[2], c.tgt[0], c.tgt[1], c.tgt[2], c.up[0], c.up[1], c.up[2],
+                       c.fov, c.aspect);
+}
+
+float Dist3(const float* a, const float* b) {
+    const float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+    return std::sqrt(x * x + y * y + z * z);
+}
+} // namespace
+
+// ---- [Debug] nvn_jitter_spike: sub-pixel jitter on the main camera's render projection -----------------------
+namespace {
+std::mutex g_jit_lock;
+bool g_jit_on{};                 // F4
+u32 g_jit_amp_idx{1};            // F3: {0.5, 2, 8} px
+constexpr float kJitAmps[3] = {0.5f, 2.0f, 8.0f};
+u64 g_jit_present{};
+float g_jit_x{}, g_jit_y{};      // current jitter in render pixels (set once per present)
+bool g_jit_f3_down{}, g_jit_f4_down{};
+u32 g_jit_lines{};
+u64 g_jit_skip_aspect{}, g_jit_skip_w2s{}, g_jit_applied{};
+u64 g_jit_last_log_s{};
+u64 g_jit_last_sum_s{};
+bool g_jit_init{};
+// nvn_fsr (JitMode 3): set by the renderer (render thread), read here under g_jit_lock / by the hook
+std::atomic<bool> g_fsr_active{false};
+std::atomic<u32> g_fsr_rw{0}, g_fsr_rh{0}, g_fsr_ow{0}, g_fsr_oh{0};
+u32 g_fsr_phase_idx{}, g_fsr_phase_cnt{};
+
+std::ofstream& JitLog() {
+    static std::ofstream out(Common::FS::GetSuyuPath(Common::FS::SuyuPath::SuyuDir) / "nvn_jitter_spike.txt",
+                             std::ios::trunc);
+    return out;
+}
+
+float Halton(u32 i, u32 b) {
+    float f = 1.0f, r = 0.0f;
+    while (i > 0) {
+        f /= static_cast<float>(b);
+        r += f * static_cast<float>(i % b);
+        i /= b;
+    }
+    return r;
+}
+
+void JitPickPhase() { // g_jit_lock held
+    const float a = kJitAmps[g_jit_amp_idx];
+    if (JitMode() == 3) {
+        // FSR: AMD's sequence (ffxFsr3UpscalerGetJitterPhaseCount / GetJitterOffset): phase count
+        // int(8 * (output_w / render_w)^2), offset = Halton(i + 1, 2|3) - 0.5 in render target pixels. Stored in pixels
+        // of the jitter grid (MvRenderSize, which is the [Display] resolution, not the real render target), so
+        // JitterApply's ndc = 2 * px / grid = 2 * offset / render target.
+        const u32 rw = g_fsr_rw.load(std::memory_order_relaxed), rh = g_fsr_rh.load(std::memory_order_relaxed);
+        const u32 ow = g_fsr_ow.load(std::memory_order_relaxed);
+        const u32 gw = g_render_w != 0 ? g_render_w : kDockedW, gh = g_render_w != 0 ? g_render_h : kDockedH;
+        u32 count = 8;
+        if (rw != 0 && ow != 0) {
+            const float r = static_cast<float>(ow) / static_cast<float>(rw);
+            count = static_cast<u32>(std::max(1, static_cast<int>(8.0f * r * r)));
+        }
+        const u32 i = static_cast<u32>(g_jit_present % count);
+        const float ox = Halton(i + 1, 2) - 0.5f, oy = Halton(i + 1, 3) - 0.5f;
+        g_fsr_phase_idx = i;
+        g_fsr_phase_cnt = count;
+        g_jit_x = rw != 0 ? ox * static_cast<float>(gw) / static_cast<float>(rw) : ox;
+        g_jit_y = rh != 0 ? oy * static_cast<float>(gh) / static_cast<float>(rh) : oy;
+    } else if (NvnJitterSpike() == 1) {
+        g_jit_x = a;
+        g_jit_y = 0.0f;
+    } else {
+        const u32 i = static_cast<u32>(g_jit_present % 8) + 1;
+        g_jit_x = (Halton(i, 2) - 0.5f) * 2.0f * a;
+        g_jit_y = (Halton(i, 3) - 0.5f) * 2.0f * a;
+    }
+}
+
+void JitDescribe(const char* why) { // g_jit_lock held
+    JitLog() << fmt::format("# {} at present {}: jitter {} mode {} amplitude {} px", why, g_jit_present,
+                            g_jit_on ? "ON" : "OFF", JitMode(), kJitAmps[g_jit_amp_idx]);
+    if (JitMode() == 3) {
+        JitLog() << " ; nvn_fsr: FSR Halton(2,3) sequence, +-0.5 render target px, on while FSR is active (Insert)";
+    } else if (NvnJitterSpike() == 1) {
+        JitLog() << fmt::format(" ; applying +{} px in x (m[8] = -ndc_x). If the picture moves RIGHT the sign is "
+                                "as assumed; if it moves LEFT it is inverted",
+                                kJitAmps[g_jit_amp_idx]);
+    }
+    JitLog() << std::endl;
+}
+
+void JitterTick() {
+    std::scoped_lock lk{g_jit_lock};
+    const bool fsr = JitMode() == 3;
+    if (!g_jit_init) {
+        g_jit_init = true;
+        g_jit_on = fsr ? g_fsr_active.load() : NvnJitterSpike() != 0;
+        JitPickPhase();
+        JitLog() << "# render size for NDC: " << (g_render_w != 0 ? g_render_w : kDockedW) << "x"
+                 << (g_render_w != 0 ? g_render_h : kDockedH) << std::endl;
+        JitDescribe("start");
+    }
+    ++g_jit_present;
+    if (fsr) {
+        // nvn_fsr: on/off follows the renderer's FSR state (Insert); F3/F4 belong to the spike mode only
+        const bool on = g_fsr_active.load();
+        if (on != g_jit_on) {
+            g_jit_on = on;
+            JitDescribe(on ? "FSR active" : "FSR inactive");
+        }
+    }
+    const bool f4 = !fsr && Common::HostKeyDown(VK_F4);
+    const bool f3 = !fsr && Common::HostKeyDown(VK_F3);
+    if (f4 && !g_jit_f4_down) {
+        g_jit_on = !g_jit_on;
+        JitDescribe("F4 toggle");
+    }
+    if (f3 && !g_jit_f3_down) {
+        g_jit_amp_idx = (g_jit_amp_idx + 1) % 3;
+        JitDescribe("F3 amplitude");
+    }
+    g_jit_f4_down = f4;
+    g_jit_f3_down = f3;
+    JitPickPhase();
+    // nvn_fsr: the once-a-second nvn_jitter_spike.txt summary is a debug hook (nvn_fsr_debug / nvn_bench); the spike mode keeps it
+    if (fsr && !NvnFsrDebugHooks()) {
+        return;
+    }
+    const u64 now = NowSeconds();
+    if (now != g_jit_last_sum_s) {
+        g_jit_last_sum_s = now;
+        JitLog() << fmt::format("# present {}: applied {} skipped(not main camera) {} skipped(CPU world-to-screen entry 0x1C3A8) {}",
+                                g_jit_present, g_jit_applied, g_jit_skip_aspect, g_jit_skip_w2s)
+                 << std::endl;
+    }
+}
+
+// Post-hook of main+0x1C358 (render projection), after the game wrote the matrix at 'out'.
+// Returns true when a jitter was written; *jx / *jy = the jitter in render pixels (see JitPickPhase).
+bool JitterApply(Core::Memory::Memory& mem, const CamPending& p, bool main_aspect, float* jx, float* jy) {
+    std::scoped_lock lk{g_jit_lock};
+    if (!g_jit_on) {
+        return false;
+    }
+    if (!main_aspect) {
+        ++g_jit_skip_aspect;
+        return false;
+    }
+    if (!mem.IsValidVirtualAddressRange(p.out, 64)) {
+        return false;
+    }
+    *jx = g_jit_x;
+    *jy = g_jit_y;
+    const float w = static_cast<float>(g_render_w != 0 ? g_render_w : kDockedW);
+    const float h = static_cast<float>(g_render_w != 0 ? g_render_h : kDockedH);
+    const float nx = 2.0f * g_jit_x / w;
+    const float ny = 2.0f * g_jit_y / h;
+    const u32 b8 = mem.Read32(p.out + 0x20), b9 = mem.Read32(p.out + 0x24);
+    // w = -z: ndc = ... - m[8] (x), - m[9] (y); so m = -ndc shifts the picture by +ndc
+    const float a8 = std::bit_cast<float>(b8) - nx;
+    const float a9 = std::bit_cast<float>(b9) - ny;
+    mem.Write32(p.out + 0x20, std::bit_cast<u32>(a8));
+    mem.Write32(p.out + 0x24, std::bit_cast<u32>(a9));
+    ++g_jit_applied;
+    if (JitMode() == 3 && !NvnFsrDebugHooks()) {
+        return true; // nvn_fsr without the debug hooks: no per-call jitter log
+    }
+    const u64 now = NowSeconds();
+    if (g_jit_lines < 120 || now != g_jit_last_log_s) {
+        ++g_jit_lines;
+        g_jit_last_log_s = now;
+        JitLog() << fmt::format(
+            "present {} cam {:#x} jitter px ({:.4f}, {:.4f}) ndc ({:.6f}, {:.6f}) m[8] {:.7g} -> {:.7g} m[9] {:.7g} -> {:.7g}",
+            g_jit_present, p.obj, g_jit_x, g_jit_y, nx, ny, std::bit_cast<float>(b8), a8, std::bit_cast<float>(b9), a9)
+                 << std::endl;
+    }
+    return true;
+}
+} // namespace
+
+void FsrSetActive(bool on) {
+    g_fsr_active.store(on);
+}
+
+bool FsrActive() {
+    return g_fsr_active.load();
+}
+
+void FsrSetSizes(u32 render_w, u32 render_h, u32 output_w, u32 output_h) {
+    g_fsr_rw.store(render_w, std::memory_order_relaxed);
+    g_fsr_rh.store(render_h, std::memory_order_relaxed);
+    g_fsr_ow.store(output_w, std::memory_order_relaxed);
+    g_fsr_oh.store(output_h, std::memory_order_relaxed);
+}
+
+void FsrJitterPhase(u32* index, u32* count) {
+    std::scoped_lock lk{g_jit_lock};
+    *index = g_fsr_phase_idx;
+    *count = g_fsr_phase_cnt;
+}
+
+// ---- [Debug] nvn_mv_pass: main camera state per guest present, for the motion vector pass ---------------------
+// Capture (guest threads, in the probe post-hooks; read only):
+//  - look-at main+0x1C33C (r0 = out, r1 = camera): the view matrix of a main-aspect camera, kept per camera pointer.
+//  - projection main+0x1C358 (r0 = out, r1 = camera), main aspect only (same test as the jitter): the matrix as the
+//    game wrote it, read BEFORE JitterApply writes m[8]/m[9], i.e. unjittered. Paired with the last view of the same
+//    camera; the pair is the "pending" record of the current present interval (last one wins; calls are counted).
+// Present (guest thread, nvn_vk Renderer::Present -> MvOnGuestPresent): the pending record gets the index of that
+// present (1-based count of guest presents) and goes into a ring of 32. So a record tagged N holds the camera computed
+// between guest presents N-1 and N. Which present's GPU frame actually uses it is NOT known from the code: the
+// renderer looks up "latest record with tag <= frame - nvn_mv_lag" (lag default 1), and the F2 dump measures the
+// lags 0..3 against the picture.
+namespace {
+constexpr float kMvResetDistance = 100.0f; // world units of eye movement in one record step = a cut (history reset)
+std::mutex g_mv_lock;
+std::atomic<u64> g_mv_present{0};
+MvCam g_mv_pending;                 // camera of the current interval (valid = false until a projection is seen)
+MvCam g_mv_ring[32];                // by present % 32
+MvCam g_mv_last_pushed;             // for the reset test
+u32 g_mv_view_ptr{};                // last main-aspect look-at: camera pointer and matrix
+float g_mv_view[16]{};
+u64 g_mv_view_calls{};
+u64 g_mv_proj_calls{}, g_mv_proj_noview{};
+u32 g_mv_present_thread{};
+
+u32 ThreadTag() {
+    return static_cast<u32>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+// eye = -t * R^T (row-vector view: v_view = v_world * R + t, rows 0-2 of the matrix = R, row 3 = t)
+void EyeFromView(const float* m, float* eye) {
+    for (u32 j = 0; j < 3; ++j) {
+        eye[j] = -(m[12] * m[j * 4 + 0] + m[13] * m[j * 4 + 1] + m[14] * m[j * 4 + 2]);
+    }
+}
+
+void MvCapture(const CamPending& p, const float* m, bool main_aspect, bool jit_applied, float jx, float jy) {
+    if (!main_aspect) {
+        return;
+    }
+    std::scoped_lock lk{g_mv_lock};
+    if (p.view) {
+        g_mv_view_ptr = p.obj;
+        std::copy(m, m + 16, g_mv_view);
+        ++g_mv_view_calls;
+        return;
+    }
+    ++g_mv_proj_calls;
+    if (g_mv_view_ptr != p.obj) {
+        ++g_mv_proj_noview; // no view of this camera seen yet: keep the previous pending record
+        return;
+    }
+    const u32 calls = g_mv_pending.valid ? g_mv_pending.calls + 1 : 1;
+    MvCam& c = g_mv_pending;
+    c = MvCam{};
+    c.ptr = p.obj;
+    std::copy(g_mv_view, g_mv_view + 16, c.view);
+    std::copy(m, m + 16, c.proj);
+    c.jitter_px[0] = jit_applied ? jx : 0.0f;
+    c.jitter_px[1] = jit_applied ? jy : 0.0f;
+    EyeFromView(c.view, c.eye);
+    c.calls = calls;
+    c.thread = ThreadTag();
+    c.valid = true;
+}
+} // namespace
+
+u64 MvOnGuestPresent() {
+    std::scoped_lock lk{g_mv_lock};
+    const u64 idx = g_mv_present.load(std::memory_order_relaxed) + 1;
+    g_mv_present.store(idx, std::memory_order_relaxed);
+    g_mv_present_thread = ThreadTag();
+    if (g_mv_pending.valid) {
+        MvCam c = g_mv_pending;
+        c.present = idx;
+        const MvCam& o = g_mv_last_pushed;
+        c.reset = !o.valid || o.ptr != c.ptr || Dist3(o.eye, c.eye) > kMvResetDistance;
+        g_mv_ring[idx % std::size(g_mv_ring)] = c;
+        g_mv_last_pushed = c;
+        g_mv_pending.valid = false;
+    }
+    return idx;
+}
+
+bool MvCamFor(u64 target, MvCam* out) {
+    std::scoped_lock lk{g_mv_lock};
+    const u64 now = g_mv_present.load(std::memory_order_relaxed);
+    if (target > now && g_mv_pending.valid) {
+        *out = g_mv_pending; // interval still open: the camera of the coming present
+        out->present = now + 1;
+        const MvCam& o = g_mv_last_pushed;
+        out->reset = !o.valid || o.ptr != out->ptr || Dist3(o.eye, out->eye) > kMvResetDistance;
+        return true;
+    }
+    const u64 n = std::size(g_mv_ring);
+    for (u64 i = std::min(target, now); i > 0 && i + n > now; --i) {
+        const MvCam& c = g_mv_ring[i % n];
+        if (c.valid && c.present == i) {
+            *out = c;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string MvCaptureStats() {
+    std::scoped_lock lk{g_mv_lock};
+    return fmt::format("guest presents {} view calls {} projection calls {} (without a view of the same camera {}) "
+                       "present thread {:08x} last camera thread {:08x}",
+                       g_mv_present.load(), g_mv_view_calls, g_mv_proj_calls, g_mv_proj_noview, g_mv_present_thread,
+                       g_mv_last_pushed.thread);
+}
+
+void MvRenderSize(u32* w, u32* h) {
+    RenderWidth();
+    *w = g_render_w != 0 ? g_render_w : kDockedW;
+    *h = g_render_w != 0 ? g_render_h : kDockedH;
+}
+
+void OnProbeDispatch(u32 pc, u32* regs) {
+    const u32 base = g_main_base.load(std::memory_order_relaxed);
+    if (base == 0 || g_system == nullptr) {
+        return;
+    }
+    auto& mem = g_system->ApplicationMemory();
+    if (pc == kProbeReturnPc) {
+        if (t_cam_stack.empty()) {
+            return; // not ours
+        }
+        const CamPending p = t_cam_stack.back();
+        t_cam_stack.pop_back();
+        regs[15] = p.lr; // resume the caller; the dispatcher looks the block up from r15 afterwards
+        float m[16]{};
+        bool ok = mem.IsValidVirtualAddressRange(p.out, 64);
+        for (u32 i = 0; ok && i < 16; ++i) {
+            m[i] = std::bit_cast<float>(mem.Read32(p.out + i * 4));
+        }
+        const bool main_aspect =
+            std::fabs(p.aspect - kOriginalAspect) < 0.01f || std::fabs(p.aspect - g_aspect) < 0.01f;
+        bool jit_applied = false;
+        float jx = 0.0f, jy = 0.0f;
+        if (JitMode() != 0 && !p.view) {
+            if (p.pc == base + kProjection) {
+                // render projection: last write of the matrix, so the jitter is applied after the game's own result
+                jit_applied = JitterApply(mem, p, main_aspect, &jx, &jy);
+            } else {
+                std::scoped_lock jl{g_jit_lock}; // 0x1C3A8: only called by the CPU world-to-screen 0x18A48; left alone
+                ++g_jit_skip_w2s;
+            }
+        }
+        if (NvnMvPass() && ok && (p.pc == base + kLookAtA || p.pc == base + kProjection)) {
+            MvCapture(p, m, main_aspect, jit_applied, jx, jy); // m was read before the jitter write
+        }
+        if (!NvnUpscalerProbe()) {
+            return;
+        }
+        const CamState cs = ReadCam(mem, p.obj);
+        std::scoped_lock lk{g_cam_lock};
+        const u32 k = p.view ? 1 : 0;
+        const u64 n = ++g_cam_calls[k];
+        const u64 now = NowSeconds();
+        const bool main_view = std::fabs(p.aspect - kOriginalAspect) < 0.01f ||
+                               std::fabs(p.aspect - g_aspect) < 0.01f;
+        if (main_view) {
+            const u64 stamp = g_main_cam.stamp + 1;
+            g_main_cam = cs;
+            g_main_cam.stamp = stamp;
+        }
+        std::string line;
+        if (p.view) {
+            line = fmt::format(
+                "view call {} present {} entry main+{:#x} cam {:#x} vtable {:#x} out {:#x} {}{}", n,
+                g_probe_frames.load(), p.pc - base, p.obj, p.vtable, p.out, CamText(cs),
+                main_view ? " main_view" : "");
+        } else {
+            line = fmt::format(
+                "call {} present {} entry main+{:#x} cam {:#x} vtable {:#x} out {:#x} clip+0x30 {} clip+0x34 {} (larger = far) aspect {} fov {}{}",
+                n, g_probe_frames.load(), p.pc - base, p.obj, p.vtable, p.out, p.nearv, p.farv, p.aspect, p.fov,
+                main_view ? " main_view" : "");
+        }
+        if (ok) {
+            for (u32 r = 0; r < 4; ++r) {
+                line += fmt::format("\n  [{}] {:.7g} {:.7g} {:.7g} {:.7g} | {:08x} {:08x} {:08x} {:08x}", r, m[r * 4],
+                                    m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3], std::bit_cast<u32>(m[r * 4]),
+                                    std::bit_cast<u32>(m[r * 4 + 1]), std::bit_cast<u32>(m[r * 4 + 2]),
+                                    std::bit_cast<u32>(m[r * 4 + 3]));
+            }
+        } else {
+            line += " (output unreadable)";
+        }
+        // the view function runs for every world-to-screen call: keep only the first 24 per drain
+        if (g_cam_drain.size() < 64 && (!p.view || g_cam_drain.size() < 24)) {
+            g_cam_drain.push_back(line);
+        }
+        if (n <= 40 || now != g_cam_last_log_s[k]) {
+            if (n > 40) {
+                g_cam_last_log_s[k] = now;
+            }
+            CamLog() << line << std::endl;
+        }
+        return;
+    }
+    // look-at (view matrix): 0x1C33C r0 = out, r1 = camera; 0x1C380 r0 = camera, r1 = out (returns at once if out is 0)
+    // projection: 0x1C358 r0 = out, r1 = camera; 0x1C3A8 r0 = camera, r1 = out
+    const bool is_view = pc == base + kLookAtA || pc == base + kLookAtB;
+    if (is_view || pc == base + kProjection || pc == base + kProjectionB) {
+        const bool for_mv = NvnMvPass() && (pc == base + kLookAtA || pc == base + kProjection);
+        if (!NvnUpscalerProbe() && !for_mv && (is_view || JitMode() == 0)) {
+            return; // jitter spike alone only needs the two projection entries; the mv pass 0x1C33C and 0x1C358
+        }
+        if (t_cam_stack.size() >= 8) {
+            return;
+        }
+        const bool a = pc == base + kLookAtA || pc == base + kProjection; // r0 = out, r1 = camera
+        CamPending p{};
+        p.pc = pc;
+        p.view = is_view;
+        p.obj = a ? regs[1] : regs[0];
+        p.out = a ? regs[0] : regs[1];
+        p.lr = regs[14];
+        if (p.out == 0 || !mem.IsValidVirtualAddressRange(p.obj, 0x40)) {
+            return;
+        }
+        p.vtable = mem.Read32(p.obj);
+        p.nearv = std::bit_cast<float>(mem.Read32(p.obj + kClipA)); // which of the two is far: see the log
+        p.farv = std::bit_cast<float>(mem.Read32(p.obj + kClipB));
+        p.aspect = std::bit_cast<float>(mem.Read32(p.obj + kAspectField));
+        p.fov = std::bit_cast<float>(mem.Read32(p.obj + 0x3C));
+        t_cam_stack.push_back(p);
+        regs[14] = kProbeReturnPc; // post-hook: the callee returns to the dispatcher with the sentinel
+        return;
+    }
+    for (std::size_t i = 0; i < std::size(kFilterCtors); ++i) {
+        if (pc == base + kFilterCtors[i]) {
+            if (g_filter_hits[i].fetch_add(1, std::memory_order_relaxed) == 0) {
+                g_filter_first_present[i].store(g_probe_frames.load(), std::memory_order_relaxed);
+                g_filter_first_lr[i].store(regs[14] - base, std::memory_order_relaxed);
+            }
+            return;
+        }
+    }
+}
+
+std::string CamProbeDrain() {
+    std::scoped_lock lk{g_cam_lock};
+    std::string out;
+    for (const auto& l : g_cam_drain) {
+        out += l;
+        out += '\n';
+    }
+    g_cam_drain.clear();
+    // per-frame state of the main camera (also written when no call happened this frame)
+    out += fmt::format("main camera state at present {} (updates so far {}): cam {:#x} {}\n", g_probe_frames.load(),
+                       g_main_cam.stamp, g_main_cam.ptr, CamText(g_main_cam));
+    return out;
+}
+
+static void ProbeTick() {
+    const u64 present = ++g_probe_frames;
+    const u64 now = NowSeconds();
+    std::scoped_lock lk{g_cam_lock};
+    {
+        const bool down = Common::HostKeyDown(VK_F5);
+        if (down && !g_f5_down && g_trace_left == 0 && g_trace_bytes < kTraceCap) {
+            g_trace_left = 1800;
+            ++g_trace_runs;
+            TraceLog() << fmt::format("# trace {} starts at present {}: frame cam eye(xyz) target(xyz) fov aspect; "
+                                      "'stale' = no camera call since the previous line\n",
+                                      g_trace_runs, present);
+        }
+        g_f5_down = down;
+    }
+    const bool fresh = g_main_cam.stamp != g_prev_cam_stamp;
+    if (fresh && g_main_cam.ptr != 0) {
+        if (g_prev_cam.ptr != 0) {
+            const CamState& o = g_prev_cam;
+            const CamState& c = g_main_cam;
+            if (o.ptr != c.ptr) {
+                if (g_switch_lines < 50) {
+                    ++g_switch_lines;
+                    CamLog() << fmt::format("CAM_PTR_CHANGE present {} (prev update present {}): {:#x} -> {:#x}; new {}\n",
+                                            present, g_prev_cam_present, o.ptr, c.ptr, CamText(c));
+                }
+            } else {
+                const float de = Dist3(o.eye, c.eye);
+                const float dt = Dist3(o.tgt, c.tgt);
+                const float dfov = std::fabs(c.fov - o.fov);
+                const float fov_thr = (c.fov > 0.0f && c.fov < 6.3f) ? 5.0f * 3.14159265f / 180.0f : 5.0f; // radians or degrees
+                if ((de > 5.0f || dt > 5.0f || dfov > fov_thr) && g_jump_lines < 200) {
+                    ++g_jump_lines;
+                    CamLog() << fmt::format(
+                        "CAM_JUMP {} present {} (prev update present {}) cam {:#x} d_eye {:.5g} d_target {:.5g} d_fov {:.5g} "
+                        "old [{}] new [{}]\n",
+                        g_jump_lines, present, g_prev_cam_present, c.ptr, de, dt, dfov, CamText(o), CamText(c));
+                }
+            }
+        }
+        g_prev_cam = g_main_cam;
+        g_prev_cam_present = present;
+    }
+    g_prev_cam_stamp = g_main_cam.stamp;
+    if (g_trace_left != 0) {
+        --g_trace_left;
+        const CamState& c = g_main_cam;
+        const std::string line = fmt::format(
+            "{} {:#x} {:.5g} {:.5g} {:.5g} {:.5g} {:.5g} {:.5g} {:.5g} {:.5g}{}\n", present, c.ptr, c.eye[0], c.eye[1],
+            c.eye[2], c.tgt[0], c.tgt[1], c.tgt[2], c.fov, c.aspect, fresh ? "" : " stale");
+        if (g_trace_bytes + line.size() > kTraceCap) {
+            g_trace_left = 0;
+            TraceLog() << "# size cap reached\n" << std::flush;
+            g_trace_bytes = kTraceCap;
+        } else {
+            TraceLog() << line;
+            g_trace_bytes += line.size();
+            if (g_trace_left == 0) {
+                TraceLog() << "# trace ends\n" << std::flush;
+            }
+        }
+        if (present % 60 == 0) {
+            TraceLog().flush();
+        }
+    }
+    static u64 last = 0;
+    if (now - last < 3) {
+        return;
+    }
+    last = now;
+    std::string line = fmt::format("filter ctor hits at present {} (every 3 s for the whole run; cam jumps {}):", present, g_jump_lines);
+    for (std::size_t i = 0; i < std::size(kFilterCtors); ++i) {
+        line += fmt::format(" main+{:#x}={}", kFilterCtors[i], g_filter_hits[i].load());
+        if (g_filter_hits[i].load() != 0) {
+            line += fmt::format("(first present {} from main+{:#x})", g_filter_first_present[i].load(),
+                                g_filter_first_lr[i].load());
+        }
+    }
+    CamLog() << line << std::endl;
+}
+
 float DisplayRateScale() {
     const float top = g_fps_auto ? g_fps_cap : g_fps.load(std::memory_order_relaxed);
     return top > 60.0f ? top / 60.0f : 1.0f;
 }
 
 void OnFrame() {
+    if (g_probe_on.load(std::memory_order_relaxed)) {
+        if (NvnUpscalerProbe()) {
+            ProbeTick();
+        }
+        if (JitMode() != 0) {
+            JitterTick();
+        }
+    }
     if (!g_active.load(std::memory_order_relaxed)) {
         return;
     }

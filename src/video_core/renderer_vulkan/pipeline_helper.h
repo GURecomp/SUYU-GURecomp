@@ -47,6 +47,96 @@ using Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
     return std::nullopt;
 }
 
+// ---- VK_EXT_descriptor_buffer (port of Eden's path; used only when
+// Device::IsDescriptorBufferEnabled()) ----
+
+[[nodiscard]] inline VkDeviceSize DescriptorSizeForType(const Device& device,
+                                                        VkDescriptorType type) {
+    const auto& props = device.DescriptorBufferProperties();
+    const bool robust = device.IsRobustBufferAccessEnabled();
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        return robust ? props.robustUniformBufferDescriptorSize : props.uniformBufferDescriptorSize;
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        return robust ? props.robustStorageBufferDescriptorSize : props.storageBufferDescriptorSize;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        return props.combinedImageSamplerDescriptorSize;
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        return props.storageImageDescriptorSize;
+    default:
+        // Texel buffers are not used with descriptor buffers (see CanUseDescriptorBuffer).
+        return 0;
+    }
+}
+
+struct DescriptorBufferBinding {
+    VkDescriptorType type;
+    u32 count;
+    VkDeviceSize offset;
+    VkDeviceSize stride;
+};
+
+struct DescriptorBufferLayout {
+    VkDeviceSize size{};
+    boost::container::small_vector<DescriptorBufferBinding, 32> bindings;
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return bindings.empty();
+    }
+};
+
+/// Writes the descriptors of one draw into descriptor buffer memory. The payload is the same one
+/// the descriptor update templates read (one DescriptorUpdateEntry per descriptor, in binding
+/// order); buffer entries are turned into device addresses here.
+inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLayout& layout,
+                                  const DescriptorUpdateEntry* payload, u8* host) {
+    const vk::Device& dev = device.GetLogical();
+    for (const DescriptorBufferBinding& binding : layout.bindings) {
+        for (u32 index = 0; index < binding.count; ++index) {
+            const DescriptorUpdateEntry& entry = *(payload++);
+            VkDescriptorGetInfoEXT get_info{
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+                .pNext = nullptr,
+                .type = binding.type,
+                .data{},
+            };
+            VkDescriptorAddressInfoEXT address_info{
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+                .pNext = nullptr,
+                .address = 0,
+                .range = VK_WHOLE_SIZE,
+                .format = VK_FORMAT_UNDEFINED,
+            };
+            switch (binding.type) {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                if (entry.buffer.buffer != VK_NULL_HANDLE) {
+                    // Null buffers stay address 0 / VK_WHOLE_SIZE (nullDescriptor is required).
+                    address_info.address =
+                        dev.GetBufferDeviceAddress(entry.buffer.buffer) + entry.buffer.offset;
+                    address_info.range = entry.buffer.range;
+                }
+                if (binding.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                    get_info.data.pUniformBuffer = &address_info;
+                } else {
+                    get_info.data.pStorageBuffer = &address_info;
+                }
+                break;
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                get_info.data.pCombinedImageSampler = &entry.image;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                get_info.data.pStorageImage = &entry.image;
+                break;
+            default:
+                continue;
+            }
+            dev.GetDescriptorEXT(get_info, static_cast<size_t>(binding.stride),
+                                 host + binding.offset + index * binding.stride);
+        }
+    }
+}
+
 [[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info) {
     return Shader::NumDescriptors(info.constant_buffer_descriptors) +
            Shader::NumDescriptors(info.storage_buffers_descriptors) +
@@ -65,13 +155,46 @@ public:
                num_descriptors <= device->MaxPushDescriptors();
     }
 
+    /// Descriptor buffers replace pooled descriptor sets only: pipelines that fit in push
+    /// descriptors keep them (the device must support bufferless push descriptors, checked at
+    /// device creation). Texel buffers are not handled on this path.
+    bool CanUseDescriptorBuffer() const noexcept {
+        if (!device->IsDescriptorBufferEnabled() || bindings.empty() || has_texel_buffers) {
+            return false;
+        }
+        return !CanUsePushDescriptor();
+    }
+
+    DescriptorBufferLayout MakeDescriptorBufferLayout(VkDescriptorSetLayout layout) const {
+        DescriptorBufferLayout result;
+        if (!layout) {
+            return result;
+        }
+        const vk::Device& dev = device->GetLogical();
+        result.size = dev.GetDescriptorSetLayoutSizeEXT(layout);
+        result.bindings.reserve(bindings.size());
+        for (const VkDescriptorSetLayoutBinding& entry : bindings) {
+            result.bindings.push_back(DescriptorBufferBinding{
+                .type = entry.descriptorType,
+                .count = entry.descriptorCount,
+                .offset = dev.GetDescriptorSetLayoutBindingOffsetEXT(layout, entry.binding),
+                .stride = DescriptorSizeForType(*device, entry.descriptorType),
+            });
+        }
+        return result;
+    }
+
     // TODO(crueter): utilize layout binding flags
-    vk::DescriptorSetLayout CreateDescriptorSetLayout(bool use_push_descriptor) const {
+    vk::DescriptorSetLayout CreateDescriptorSetLayout(bool use_push_descriptor,
+                                                      bool use_descriptor_buffer = false) const {
         if (bindings.empty()) {
             return nullptr;
         }
-        const VkDescriptorSetLayoutCreateFlags flags =
+        VkDescriptorSetLayoutCreateFlags flags =
             use_push_descriptor ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
+        if (use_descriptor_buffer) {
+            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        }
         return device->GetLogical().CreateDescriptorSetLayout({
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
@@ -142,6 +265,10 @@ private:
     template <typename Descriptors>
     void Add(VkDescriptorType type, VkShaderStageFlags stage, const Descriptors& descriptors) {
         const size_t num{descriptors.size()};
+        if (num > 0 && (type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                        type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)) {
+            has_texel_buffers = true;
+        }
         for (size_t i = 0; i < num; ++i) {
             bindings.push_back({
                 .binding = binding,
@@ -166,6 +293,7 @@ private:
 
     const Device* device{};
     bool is_compute{};
+    bool has_texel_buffers{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
     u32 binding{};

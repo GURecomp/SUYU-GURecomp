@@ -1,0 +1,243 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NVN Vulkan renderer, [Debug] nvn_fsr: put the FSR output and the game's HUD together at output (present) size.
+// Inputs (render size unless noted):
+//  - fsr_tex:  FSR output (output size), the upscaled scene without HUD.
+//  - hud_tex:  the game's finished image WITH HUD (the image its final draw scales to the present image).
+//  - snap_tex: copy of that same image taken after its last full-screen post pass and before the first HUD draw
+//    (post-processed scene, no HUD; nvn_vk.cpp FsrOnDraw picks the point).
+// HUD mask: a render texel is HUD where hud and snap differ (RGB); outside the HUD both are byte-identical copies.
+// That only holds when no full-screen pass runs between the snapshot and the final draw: if one does, the mask covers
+// most of the screen (nvn_fsr.txt logs the coverage with every Numpad6 dump).
+// d = max |hud - snap| per render texel. Strong mask ms = smoothstep(hud_lo, hud_hi, d) (defaults 0.08..0.25); each
+// texel's mask is the 3x3 max of it (one texel of dilation so HUD borders do not halo), and the output pixel takes the
+// bilinear blend of the 2x2 texels around it. Where ms = 1 the output is bilinear(hud) (the game's own upscale).
+// Faint differences (soft gradients the HUD pass draws over the scene) are not replaced: the delta
+// bilinear(hud) - bilinear(snap) is added to the FSR image instead, so they follow FSR's stable picture.
+// Output = mix(clamp(fsr + delta), bilinear(hud), ms).
+// mode: 0 composite, 1 FSR only (no HUD), 2 composite with the strong mask tinted red (faint delta tinted blue),
+// 3 game picture (bilinear hud).
+//
+// flags bit 0 (HUD layer path, [Debug] nvn_fsr_hudlayer): snap_tex is the HUD LAYER instead: the game's HUD draws after
+// the snapshot, redirected into a cleared RGBA8 image with premultiplied accumulation (rgb = premultiplied colour,
+// a = coverage), and hud_tex is H without HUD. Output = layer.rgb + (1 - layer.a) * fsr.rgb, layer sampled bilinear at
+// the output uv (premultiplied filtering = the game's own bilinear upscale of its HUD); alpha 1. Mode 1 = FSR only,
+// mode 2 = composite with the layer alpha tinted red.
+// flags bit 1 (merge, render size): out = layer.rgb + (1 - layer.a) * hud.rgb texel by texel (puts the HUD layer back
+// into H when the layer path is abandoned in a frame); out is then copied into H by the renderer.
+// flags bit 2 (state indicator, [Debug] nvn_fsr_indicator): 6x6 px squares with a 1 px black border in the output's
+// top-left corner, 8 px apart from (2, 2): 1 HUD path (bits 4-5: 1 layer green, 2 diff orange), 2 reactive
+// silhouette mask (bit 6: green on, dark off), 3 jitter convention (bits 8-9: 0 red, 1 yellow, 2 cyan, 3 magenta),
+// 4 view (mode: 0 white, 1 blue, 2 pink, 3 black), 5 motion mask (bit 7: green on, dark off), 6 object motion vectors
+// (bit 10 block matching, bit 11 geometry object vectors: blue block only, white geometry only, cyan both, dark off),
+// 7 animated-surface reactive (bit 12: magenta on), 8 FSR backend that ran (bit 15: green FSR 4, orange FSR 3.1).
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D fsr_tex;
+layout(set = 0, binding = 1) uniform sampler2D hud_tex;
+layout(set = 0, binding = 2) uniform sampler2D snap_tex;
+layout(set = 0, binding = 3) uniform writeonly image2D out_img;
+layout(set = 0, binding = 4) uniform sampler2D in_tex;   // FSR colour input (render size, jittered), linear
+layout(set = 0, binding = 5) uniform sampler2D anim_tex; // animated-surface tiles (r now, b last frame), linear
+// HUD layer multiply transmittance (flags bit 14): HUD draws that scale what is under them (colour factors like
+// DST_COLOR / ONE_MINUS_SRC_ALPHA) also multiply this image (cleared to 1); the scene under the layer is scaled by it
+layout(set = 0, binding = 6) uniform sampler2D tm_tex;
+
+layout(push_constant) uniform PushConstants {
+    uint mode;
+    float hud_lo;
+    float hud_hi;
+    uint flags; // bit 13: animated-surface bypass
+    vec2 shift;  // picture shift (jitter) of this frame's input, render px, +y down
+    float w_now; // bypass weight on tiles flagged this frame
+    float w_next; // ... and on tiles flagged in the previous frame
+} pc;
+
+// Catmull-Rom of t at pos (texel space, texel centres at +0.5), 9 bilinear taps
+vec3 CatmullRom(sampler2D t, vec2 pos) {
+    const vec2 size = vec2(textureSize(t, 0));
+    const vec2 c = pos - 0.5;
+    const vec2 b = floor(c);
+    const vec2 f = c - b;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 o12 = w2 / w12;
+    const vec2 t0 = (b - 1.0 + 0.5) / size, t3 = (b + 2.0 + 0.5) / size, t12 = (b + o12 + 0.5) / size;
+    vec3 r = vec3(0.0);
+    r += textureLod(t, vec2(t0.x, t0.y), 0.0).rgb * w0.x * w0.y;
+    r += textureLod(t, vec2(t12.x, t0.y), 0.0).rgb * w12.x * w0.y;
+    r += textureLod(t, vec2(t3.x, t0.y), 0.0).rgb * w3.x * w0.y;
+    r += textureLod(t, vec2(t0.x, t12.y), 0.0).rgb * w0.x * w12.y;
+    r += textureLod(t, vec2(t12.x, t12.y), 0.0).rgb * w12.x * w12.y;
+    r += textureLod(t, vec2(t3.x, t12.y), 0.0).rgb * w3.x * w12.y;
+    r += textureLod(t, vec2(t0.x, t3.y), 0.0).rgb * w0.x * w3.y;
+    r += textureLod(t, vec2(t12.x, t3.y), 0.0).rgb * w12.x * w3.y;
+    r += textureLod(t, vec2(t3.x, t3.y), 0.0).rgb * w3.x * w3.y;
+    return clamp(r, 0.0, 1.0);
+}
+
+// FSR output at p; on animated-surface tiles (texture / UV flipbook steps FSR cannot follow) mixed with the current
+// frame's input upscaled directly (Catmull-Rom, jitter removed): w_now on tiles flagged this frame, w_next on the
+// frame after, feathered by sampling the tile flags bilinearly.
+vec3 FsrColour(ivec2 p, vec2 uv) {
+    vec3 c = texelFetch(fsr_tex, min(p, textureSize(fsr_tex, 0) - 1), 0).rgb;
+    if ((pc.flags & 8192u) != 0u) {
+        const vec2 rsize = vec2(textureSize(in_tex, 0));
+        const vec2 rpos = uv * rsize;
+        const vec4 t = textureLod(anim_tex, rpos / (8.0 * vec2(textureSize(anim_tex, 0))), 0.0);
+        const float w = max(pc.w_now * t.r, pc.w_next * t.b);
+        if (w > 0.002) {
+            c = mix(c, CatmullRom(in_tex, rpos + pc.shift), w);
+        }
+    }
+    return c;
+}
+
+vec3 IndicatorColour(int i) {
+    const vec3 dark = vec3(0.12);
+    if (i == 0) {
+        const uint path = (pc.flags >> 4) & 3u;
+        return path == 1u ? vec3(0.0, 0.9, 0.0) : path == 2u ? vec3(1.0, 0.55, 0.0) : vec3(0.5);
+    }
+    if (i == 1) {
+        return (pc.flags & 64u) != 0u ? vec3(0.0, 0.9, 0.0) : dark;
+    }
+    if (i == 2) {
+        const uint j = (pc.flags >> 8) & 3u;
+        return j == 0u ? vec3(1.0, 0.0, 0.0) : j == 1u ? vec3(1.0, 1.0, 0.0) : j == 2u ? vec3(0.0, 1.0, 1.0) : vec3(1.0, 0.0, 1.0);
+    }
+    if (i == 3) {
+        return pc.mode == 0u ? vec3(1.0) : pc.mode == 1u ? vec3(0.0, 0.3, 1.0) : pc.mode == 2u ? vec3(1.0, 0.5, 0.7) : vec3(0.0);
+    }
+    if (i == 4) {
+        return (pc.flags & 128u) != 0u ? vec3(0.0, 0.9, 0.0) : dark;
+    }
+    if (i == 7) {
+        return (pc.flags & 32768u) != 0u ? vec3(0.0, 0.9, 0.0) : vec3(1.0, 0.55, 0.0); // 8: FSR backend (green 4, orange 3.1)
+    }
+    if (i == 6) {
+        return (pc.flags & 4096u) != 0u ? vec3(0.9, 0.2, 0.9) : dark; // 7: animated-surface reactive (magenta on)
+    }
+    // 6: object motion: blue = block matching only, white = geometry vectors only, cyan = both, dark = off
+    const bool blk = (pc.flags & 1024u) != 0u, geo = (pc.flags & 2048u) != 0u;
+    return blk && geo ? vec3(0.0, 0.85, 0.85) : geo ? vec3(1.0) : blk ? vec3(0.1, 0.4, 1.0) : dark;
+}
+
+// state indicator squares (flags bit 2): true and c set when p is inside one (border or square)
+bool Indicator(ivec2 p, out vec3 c) {
+    c = vec3(0.0);
+    if ((pc.flags & 4u) == 0u || p.y < 1 || p.y > 8 || p.x < 1 || p.x >= 1 + 8 * 8) {
+        return false;
+    }
+    const int i = (p.x - 1) / 8;
+    const int x = (p.x - 1) - i * 8; // 0 border, 1..6 square, 7 border
+    if (p.y == 1 || p.y == 8 || x == 0 || x == 7) {
+        return true; // black border
+    }
+    c = IndicatorColour(i);
+    return true;
+}
+
+float Raw(ivec2 t, ivec2 rsize) {
+    const ivec2 c = clamp(t, ivec2(0), rsize - 1);
+    const vec3 d = abs(texelFetch(hud_tex, c, 0).rgb - texelFetch(snap_tex, c, 0).rgb);
+    return smoothstep(pc.hud_lo, max(pc.hud_hi, pc.hud_lo + 1e-4), max(d.r, max(d.g, d.b)));
+}
+
+void main() {
+    const ivec2 osize = imageSize(out_img);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= osize.x || p.y >= osize.y) {
+        return;
+    }
+    if ((pc.flags & 2u) != 0u) {
+        const ivec2 c = min(p, textureSize(hud_tex, 0) - 1);
+        const vec4 h = texelFetch(hud_tex, c, 0);
+        // [Upscaler] nvn_fsr_split_scale: the layer / transmittance image are at the output size (larger than H): sampled
+        // bilinearly (premultiplied) at this texel's centre; same size = the texel itself, as before
+        const vec2 muv = (vec2(p) + 0.5) / vec2(osize);
+        const ivec2 ls = textureSize(snap_tex, 0);
+        const vec4 l = ls == osize ? texelFetch(snap_tex, min(p, ls - 1), 0) : textureLod(snap_tex, muv, 0.0);
+        vec3 tm = vec3(1.0);
+        if ((pc.flags & 16384u) != 0u) {
+            const ivec2 ts = textureSize(tm_tex, 0);
+            tm = ts == osize ? texelFetch(tm_tex, min(p, ts - 1), 0).rgb : textureLod(tm_tex, muv, 0.0).rgb;
+        }
+        imageStore(out_img, p, vec4(clamp(l.rgb + (1.0 - l.a) * tm * h.rgb, 0.0, 1.0), h.a));
+        return;
+    }
+    const vec2 uv = (vec2(p) + 0.5) / vec2(osize);
+    if ((pc.flags & 1u) != 0u) {
+        const vec4 l = texture(snap_tex, uv);
+        vec3 c = FsrColour(p, uv);
+        if (pc.mode == 3u) {
+            c = texture(hud_tex, uv).rgb; // not used by the renderer (view 3 takes the old path); defined anyway
+        }
+        if (pc.mode != 1u) {
+            const vec3 tm = (pc.flags & 16384u) != 0u ? texture(tm_tex, uv).rgb : vec3(1.0);
+            c = clamp(l.rgb + (1.0 - l.a) * tm * c, 0.0, 1.0);
+        }
+        if (pc.mode == 2u) {
+            c = mix(c, vec3(1.0, 0.0, 0.0), 0.5 * l.a);
+        }
+        vec3 ic;
+        if (Indicator(p, ic)) {
+            c = ic;
+        }
+        imageStore(out_img, p, vec4(c, 1.0));
+        return;
+    }
+    const ivec2 rsize = textureSize(hud_tex, 0);
+    const vec2 t = uv * vec2(rsize) - 0.5;
+    const ivec2 b = ivec2(floor(t));
+    const vec2 f = t - vec2(b);
+    // raw mask of the 4x4 texels around the bilinear footprint
+    float raw[4][4];
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            raw[y][x] = Raw(b + ivec2(x - 1, y - 1), rsize);
+        }
+    }
+    float m2[2][2];
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            float m = 0.0;
+            for (int dy = 0; dy < 3; ++dy) {
+                for (int dx = 0; dx < 3; ++dx) {
+                    m = max(m, raw[y + dy][x + dx]);
+                }
+            }
+            m2[y][x] = m;
+        }
+    }
+    const float mask = mix(mix(m2[0][0], m2[0][1], f.x), mix(m2[1][0], m2[1][1], f.x), f.y);
+    const vec4 hud = texture(hud_tex, uv);
+    const vec3 delta = hud.rgb - texture(snap_tex, uv).rgb;
+    const vec4 fsr = vec4(FsrColour(p, uv), 1.0);
+    vec4 o;
+    if (pc.mode == 1u) {
+        o = vec4(fsr.rgb, hud.a);
+    } else if (pc.mode == 3u) {
+        o = hud;
+    } else {
+        const vec3 faint = clamp(fsr.rgb + delta, 0.0, 1.0);
+        o = vec4(mix(faint, hud.rgb, mask), hud.a);
+        if (pc.mode == 2u) {
+            const float dm = max(abs(delta.r), max(abs(delta.g), abs(delta.b)));
+            o.rgb = mix(o.rgb, vec3(0.0, 0.0, 1.0), 0.25 * (1.0 - mask) * smoothstep(0.0, 2.0 / 255.0, dm));
+            o.rgb = mix(o.rgb, vec3(1.0, 0.0, 0.0), 0.5 * mask);
+        }
+    }
+    vec3 ic;
+    if (Indicator(p, ic)) {
+        o.rgb = ic;
+    }
+    imageStore(out_img, p, o);
+}

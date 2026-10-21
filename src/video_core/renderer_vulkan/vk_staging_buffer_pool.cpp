@@ -84,6 +84,10 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     if (device.IsExtTransformFeedbackSupported()) {
         stream_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
     }
+    if (device.IsDescriptorBufferEnabled()) {
+        // Mapped uniform buffers come from here; descriptor buffers need their device address.
+        stream_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     stream_buffer = memory_allocator.CreateBuffer(stream_ci, MemoryUsage::Stream);
     if (device.HasDebuggingToolAttached()) {
         stream_buffer.SetObjectNameEXT("Stream Buffer");
@@ -211,6 +215,9 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     };
     if (device.IsExtTransformFeedbackSupported()) {
         buffer_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+    }
+    if (device.IsDescriptorBufferEnabled()) {
+        buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
     if (device.HasDebuggingToolAttached()) {
