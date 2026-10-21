@@ -41,6 +41,9 @@ top of the export:
   optional *Decompress game archives* export setting loads areas faster than an emulator does.
 - **A replacement Vulkan renderer** for the game's NVN graphics, with real render scaling
   (scaled targets, viewports and scissors), checked draw by draw against suyu's GPU emulation.
+- **FSR upscaling**: AMD FSR 3.1 temporal upscaling is built into the replacement renderer, with
+  quality modes and separate render and output scale. On Windows with an AMD GPU, FSR 4 can be
+  used too (see [Upscaling](#upscaling)).
 - **Game menu** (F10, or Minus + Plus on the controller) in its own window: controller choice
   and rebinding, multiplayer, every `game_settings.ini` option, an Advanced tab with suyu's
   settings, folders. The first controller
@@ -113,6 +116,18 @@ One command installs items 2 and 3, for example on Ubuntu:
 `sudo apt install build-essential cmake ninja-build libvulkan1 libssl3 libusb-1.0-0 libbrotli1 zlib1g libpulse0 libasound2`.
 Fedora, Arch and SteamOS commands, and the full steps, are in the
 [Linux guide](docs/a32recomp/INSTALL-LINUX.md). About 25 GB free disk is needed for the export.
+
+## Upscaling
+
+**FSR 3.1** is supported on Windows and Linux. Choose it in the F10 game menu (Upscaler section).
+
+**Linux only gets FSR 3.1.** FSR 4 is available if you run the game through Steam with Proton, but
+that costs FPS because of Proton.
+
+Once FSR 4.1 is available for Vulkan, support for it will be added right away.
+
+**DLSS is not supported yet.** It might work through OptiScaler, but that is untested. Once a
+DLSS-capable card is available for testing, DLSS support will be tested and added.
 
 ## Status
 
