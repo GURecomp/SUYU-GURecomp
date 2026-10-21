@@ -9797,7 +9797,7 @@ private:
         Image* camv = scene ? mv_img.get() : fsr_mv0.get(); // camera motion vectors (zero on still frames)
         FsrEnsureImage(fsr_react, VK_FORMAT_R8_UNORM, rw, rh, kUse, "reactive mask (R8)");
         // TRANSFER_DST: FSR 4's output is copied in (nvn_fsr_backend = 4)
-        FsrEnsureImage(fsr_out, VK_FORMAT_R8G8B8A8_UNORM, ow, oh, kUse | (fsr4_cmd[0] ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u), "FSR output");
+        FsrEnsureImage(fsr_out, VK_FORMAT_R8G8B8A8_UNORM, ow, oh, kUse | (fsr4_cmd[0] ? static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_TRANSFER_DST_BIT) : 0u), "FSR output");
         FsrEnsureImage(fsr_comp, VK_FORMAT_R8G8B8A8_UNORM, ow, oh, kUse, "composite (FSR + HUD)");
         for (u32 i = 0; i < 2; ++i) {
             FsrEnsureImage(fsr_sil[i], VK_FORMAT_R8_UNORM, rw, rh, kUse, "silhouette history (R8)");
@@ -10208,9 +10208,14 @@ private:
             // flags: bit 0 layer path, bit 2 state indicator (not in the frame a Numpad6 dump is taken of), bits 4-5 HUD path
             // (1 layer, 2 diff), bit 6 reactive silhouette, bit 7 motion mask, bits 8-9 jitter convention, bit 10 object vectors
             const bool ind = fsr_indicator && !fsr_dump_req;
+#ifdef SUYU_HAS_FSR4_BRIDGE
+            const bool fsr4_shown = fsr4 && fsr4_ok && fsr4_want && fsr4_ran_last;
+#else
+            const bool fsr4_shown = false; // no FSR 4 bridge in this build
+#endif
             const u32 flags = (layer ? 1u : 0u) | (ind ? 4u : 0u) | ((layer ? 1u : 2u) << 4) | (fsr_reactive ? 64u : 0u) | (fsr_motion ? 128u : 0u) |
                               (static_cast<u32>(fsr_sign & 3) << 8) | (fsr_objmv ? 1024u : 0u) | (objv_on && objv_ok ? 2048u : 0u) | (fsr_anim ? 4096u : 0u) | (bypass ? 8192u : 0u) | (tm ? 16384u : 0u) |
-                              (fsr4 && fsr4_ok && fsr4_want && fsr4_ran_last ? 32768u : 0u);
+                              (fsr4_shown ? 32768u : 0u);
             // bit 15: FSR 4 ran this frame (indicator square 8); bit 13: animated-surface bypass (current input, jitter removed: sampled at + the picture shift)
             const std::array<u32, 8> pc{fsr_view, std::bit_cast<u32>(fsr_hud_lo), std::bit_cast<u32>(fsr_hud_hi), flags,
                                         std::bit_cast<u32>(shift_x), std::bit_cast<u32>(shift_y), std::bit_cast<u32>(0.85f),

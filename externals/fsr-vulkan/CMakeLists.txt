@@ -73,5 +73,10 @@ endif()
 # The AMD host headers (jitter helpers ffxFsr3UpscalerGetJitterPhaseCount/Offset) for consumers that want to
 # cross-check their own jitter sequence against AMD's; not needed for the portable API itself.
 add_library(ffx_vulkan_fsr3_host_headers INTERFACE)
-target_include_directories(ffx_vulkan_fsr3_host_headers INTERFACE "${FFX_1_1_4_ROOT}/include")
+if (MSVC)
+    target_include_directories(ffx_vulkan_fsr3_host_headers INTERFACE "${FFX_1_1_4_ROOT}/include")
+else()
+    # SYSTEM: the AMD headers carry MSVC pragmas and unused statics that suyu's -Werror flags would reject
+    target_include_directories(ffx_vulkan_fsr3_host_headers SYSTEM INTERFACE "${FFX_1_1_4_ROOT}/include")
+endif()
 add_library(ffx-vulkan::fsr3-host-headers ALIAS ffx_vulkan_fsr3_host_headers)
