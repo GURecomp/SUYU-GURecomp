@@ -130,6 +130,9 @@ bool FsrSplitScale(FsrSplit* out);
 /// game_settings.ini [Display] show_fps: the frame rate in the window title.
 bool ShowFps();
 
+/// game_settings.ini [Display] confirm_exit (default true): ask before closing the window.
+bool ConfirmExit();
+
 /// game_settings.ini [Debug] diagnostics: the run reports beyond recomp_report.txt's misses
 /// (profiler, NVN census/trace, timing watch, file monitor). On unless set to false.
 bool DiagnosticsEnabled();
@@ -335,6 +338,11 @@ extern std::atomic<u32> g_motion_blur_pc; // [Debug] motion_blur = probe|force: 
 extern std::atomic<u32> g_vp_probe_pc; // [Debug] probes: viewport setter, after its first call (main+0xBC1204)
 void OnHookedEntry(u32 pc, u32* regs);
 
+/// Diagnostic log only ([PIAPROBE]): MHGU probe request handler path (main+0x1311010..0x131F400).
+extern std::atomic<u32> g_pia_lo;   // first guest address of the hooked range
+extern std::atomic<u32> g_pia_hi;   // its span in bytes (0 = off)
+void OnPiaProbe(u32 pc, u32* regs);
+
 /// [Debug] nvn_upscaler_probe: camera matrix log (pre-hook on main+0x1C358 / 0x1C3A8 projection and 0x1C33C / 0x1C380 view; F5 = 1800-present camera trace to nvn_upscaler_probe_camtrace.txt; CAM_JUMP detector; plus a return-address post-hook;
 /// never writes guest memory except the return address of the hooked call) and filter constructor hit counters.
 extern std::atomic<bool> g_probe_on;
@@ -350,6 +358,9 @@ inline void OnDispatch(u32 pc, u32* regs) {
         pc == g_motion_blur_pc.load(std::memory_order_relaxed) ||
         pc == g_vp_probe_pc.load(std::memory_order_relaxed)) {
         OnHookedEntry(pc, regs);
+    }
+    if (pc - g_pia_lo.load(std::memory_order_relaxed) < g_pia_hi.load(std::memory_order_relaxed)) {
+        OnPiaProbe(pc, regs);
     }
     if (g_probe_on.load(std::memory_order_relaxed)) {
         OnProbeDispatch(pc, regs);

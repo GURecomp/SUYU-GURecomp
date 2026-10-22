@@ -269,17 +269,46 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
             const auto& screen = render_window.GetFramebufferLayout().screen;
             s32 x0 = static_cast<s32>(screen.left), y0 = static_cast<s32>(screen.top);
             s32 w = static_cast<s32>(screen.GetWidth()), h = static_cast<s32>(screen.GetHeight());
+            const s32 pl = x0, pt_ = y0, pw_ = w, ph_ = h;
+            bool rescaled = false;
             if (w <= 0 || h <= 0 || x0 + w > static_cast<s32>(dw) || y0 + h > static_cast<s32>(dh)) {
+                rescaled = true;
                 const f64 scale = std::min(static_cast<f64>(dw) / sw, static_cast<f64>(dh) / sh);
                 w = std::max<s32>(1, static_cast<s32>(sw * scale)), h = std::max<s32>(1, static_cast<s32>(sh * scale));
                 x0 = (static_cast<s32>(dw) - w) / 2, y0 = (static_cast<s32>(dh) - h) / 2;
+            }
+            // Handheld: the game draws its 1280x720 picture into the top-left of the 1920x1080-based texture; blit only that
+            // sub-rect (720/1080 of the source in both axes). Docked: whole texture.
+            s32 cw = static_cast<s32>(sw), ch = static_cast<s32>(sh);
+            if (Core::GameSettings::StartHandheld()) {
+                cw = std::clamp<s32>(static_cast<s32>(static_cast<u64>(sw) * 720 / 1080), 1, static_cast<s32>(sw));
+                ch = std::clamp<s32>(static_cast<s32>(static_cast<u64>(sh) * 720 / 1080), 1, static_cast<s32>(sh));
+            }
+            {
+                const auto& lay = render_window.GetFramebufferLayout();
+                static s32 l_cw, l_ch;
+                static unsigned l_sw, l_sh, l_dw, l_dh, l_lw, l_lh;
+                static s32 l_x, l_y, l_w, l_h, l_pl, l_pt, l_pw, l_ph;
+                static bool l_r, first = true;
+                if (first || l_cw != cw || l_ch != ch || l_sw != sw || l_sh != sh || l_dw != dw || l_dh != dh || l_x != x0 || l_y != y0 || l_w != w ||
+                    l_h != h || l_lw != lay.width || l_lh != lay.height || l_r != rescaled || l_pl != pl || l_pt != pt_ ||
+                    l_pw != pw_ || l_ph != ph_) {
+                    first = false;
+                    l_cw = cw, l_ch = ch;
+                    l_sw = sw, l_sh = sh, l_dw = dw, l_dh = dh, l_x = x0, l_y = y0, l_w = w, l_h = h;
+                    l_lw = lay.width, l_lh = lay.height, l_r = rescaled, l_pl = pl, l_pt = pt_, l_pw = pw_, l_ph = ph_;
+                    LOG_INFO(Render_Vulkan,
+                             "probe-size: composite src {}x{} dst {}x{} blit rect x0={} y0={} w={} h={} layout.screen "
+                             "l={} t={} {}x{} window layout {}x{} rescaled={} src rect 0,0 {}x{}",
+                             sw, sh, dw, dh, x0, y0, w, h, pl, pt_, pw_, ph_, lay.width, lay.height, rescaled, cw, ch);
+                }
             }
             scheduler.Record([=](vk::CommandBuffer cmdbuf) {
                 const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
                                              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, before);
                 const VkImageBlit blit{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                                       {{0, 0, 0}, {static_cast<s32>(sw), static_cast<s32>(sh), 1}},
+                                       {{0, 0, 0}, {cw, ch, 1}},
                                        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                        {{x0, y0, 0}, {x0 + w, y0 + h, 1}}};
                 cmdbuf.BlitImage(src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, blit, VK_FILTER_LINEAR);

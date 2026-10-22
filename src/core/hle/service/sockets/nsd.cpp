@@ -68,11 +68,17 @@ static std::string ResolveImpl(const std::string& fqdn_in) {
     // For now we just return the string as-is, which is good enough when not
     // connecting to real Nintendo servers.
     LOG_WARNING(Service, "(STUBBED) called, fqdn_in={}", fqdn_in);
-    return fqdn_in;
+    // [NEXPROBE] real NSD substitutes "%" with the environment tag (idea from citron-nextendo)
+    std::string out = fqdn_in;
+    for (size_t pos = out.find('%'); pos != std::string::npos; pos = out.find('%', pos + 3)) {
+        out.replace(pos, 1, "lp1");
+    }
+    return out;
 }
 
 static Result ResolveCommon(const std::string& fqdn_in, std::array<char, 0x100>& fqdn_out) {
     const auto res = ResolveImpl(fqdn_in);
+    LOG_INFO(Service, "[NEXPROBE] nsd resolve in='{}' out='{}'", fqdn_in, res);
     if (res.size() >= fqdn_out.size()) {
         return ResultOverflow;
     }

@@ -2029,6 +2029,19 @@ private:
         } else {
             ScaledSize(w, h, img->pw, img->ph);
         }
+        if (w >= 1280 && h >= 720) {
+            static int probe_n = 0;
+            static u32 l_w, l_h, l_pw, l_ph;
+            static bool l_wo, l_depth;
+            static double l_f;
+            const double fct = RenderScaleFactor();
+            if (probe_n < 20 && (l_w != w || l_h != h || l_pw != img->pw || l_ph != img->ph || l_wo != want_out || l_depth != depth || l_f != fct)) {
+                ++probe_n;
+                l_w = w, l_h = h, l_pw = img->pw, l_ph = img->ph, l_wo = want_out, l_depth = depth, l_f = fct;
+                LOG_INFO(Render_Vulkan, "probe-size: rt alloc key {:x} {}x{} depth={} -> pw={} ph={} factor={} want_out={} split_on={}", key, w, h,
+                         depth, img->pw, img->ph, fct, want_out, split_on);
+            }
+        }
         img->cpu = key;
         img->bytes = mem.Read32(tex + 80);
         img->render_target = true;
@@ -6041,6 +6054,8 @@ private:
                 pres_w = src.width;
                 pres_h = src.height;
             }
+            LOG_INFO(Render_Vulkan, "probe-size: present images {}x{} (src {}x{} pw/ph {}x{} split_on={})", pres_w, pres_h, src.width, src.height,
+                     src.pw, src.ph, split_on);
             for (auto& im : pres_img) {
                 im = allocator.CreateImage({
                     .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -9762,6 +9777,15 @@ private:
         const u32 rh = scene ? (d.ph ? d.ph : d.height) : (fsr_snap->ph ? fsr_snap->ph : fsr_snap->height);
         const u32 ow = pt->pw ? pt->pw : pt->width, oh = pt->ph ? pt->ph : pt->height;
         const u32 sw = src->pw ? src->pw : src->width, sh = src->ph ? src->ph : src->height;
+        {
+            static u32 l[10];
+            const u32 probe_cur[10] = {pt->width, pt->height, pt->pw, pt->ph, rw, rh, ow, oh, sw, sh};
+            if (std::memcmp(l, probe_cur, sizeof(l)) != 0) {
+                std::memcpy(l, probe_cur, sizeof(l));
+                LOG_INFO(Render_Vulkan, "probe-size: FsrDispatch pt {}x{} pw/ph {}x{} rw/rh {}x{} ow/oh {}x{} hud src {}x{}", probe_cur[0], probe_cur[1], probe_cur[2],
+                         probe_cur[3], rw, rh, ow, oh, sw, sh);
+            }
+        }
         Core::GameSettings::FsrSetSizes(rw, rh, ow, oh);
         if (sw != rw || sh != rh || fsr_snap->width != rw || fsr_snap->height != rh || (scene && (mv_img->width != rw || mv_img->height != rh)) ||
             ow < rw || oh < rh) {

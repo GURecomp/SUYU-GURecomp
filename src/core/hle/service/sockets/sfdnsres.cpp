@@ -10,6 +10,7 @@
 
 #include "common/string_util.h"
 #include "common/swap.h"
+#include "core/arm/recomp/game_settings.h"
 #include "core/core.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/sockets/sfdnsres.h"
@@ -111,15 +112,43 @@ static bool IsBlockedHost(const std::string& host) {
 /// reaches by pointing its DNS at them - work by answering for those same
 /// hostnames instead. Setting a replacement host turns the block into a
 /// redirect; leaving it empty keeps the previous refuse-everything behaviour.
+static bool EndsWith(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// [NEXPROBE] with a replacement host set, every Nintendo-ish name is redirected.
+static bool IsNexProbeHost(const std::string& host) {
+    return EndsWith(host, ".srv.nintendo.net") || EndsWith(host, ".nintendo.net") ||
+           host.find("nncs") != std::string::npos;
+}
+
 static std::optional<std::string> ReplacementHostFor(const std::string& host) {
-    if (!IsBlockedHost(host)) {
-        return std::nullopt;
-    }
-    const auto& replacement = Settings::values.network_replacement_host.GetValue();
+    // [Multiplayer] online_server_host (game menu) wins over network_replacement_host.
+    std::string replacement = Core::GameSettings::Value("Multiplayer", "online_server_host");
     if (replacement.empty()) {
-        return std::nullopt;
+        replacement = Settings::values.network_replacement_host.GetValue();
     }
-    return replacement;
+    if (!replacement.empty() && (IsBlockedHost(host) || IsNexProbeHost(host))) {
+        // The game's datagram reader drops Pia datagrams whose source IP equals the nncs1/nncs2
+        // NAT-check server IPs. With a loopback replacement everything would be 127.0.0.1 (peers
+        // included), so give nncs1/nncs2 their own loopback aliases (the server answers from them).
+        if (replacement.rfind("127.", 0) == 0) {
+            if (host.find("nncs1") != std::string::npos) {
+                LOG_INFO(Service, "[NEXPROBE] resolve {} -> 127.0.0.2 (redirected, nncs1 alias)", host);
+                return std::string("127.0.0.2");
+            }
+            if (host.find("nncs2") != std::string::npos) {
+                LOG_INFO(Service, "[NEXPROBE] resolve {} -> 127.0.0.3 (redirected, nncs2 alias)", host);
+                return std::string("127.0.0.3");
+            }
+        }
+        LOG_INFO(Service, "[NEXPROBE] resolve {} -> {} (redirected)", host, replacement);
+        return replacement;
+    }
+    LOG_INFO(Service, "[NEXPROBE] resolve {} -> {}", host,
+             IsBlockedHost(host) ? "blocked (EAI_AGAIN)" : "not redirected");
+    return std::nullopt;
 }
 
 static NetDbError GetAddrInfoErrorToNetDbError(GetAddrInfoError result) {

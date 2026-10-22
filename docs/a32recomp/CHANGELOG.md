@@ -1,3 +1,22 @@
+## 0.10.0-test
+
+Date: 2026-10-22
+
+### Added
+- Experimental online play against a self-hosted NEX server such as [MHGU-NEX](https://github.com/GURecomp/MHGU-NEX): the game's login, matchmaking and NAT checks reach the server you name in **Online Server IP** (`online_server_host` in `game_settings.ini`, or the F10 menu). Nintendo's servers are never contacted.
+- Network services the online path needs: SSL `Peek`, real host sockets for non-LAN TCP and UDP while online, UDP sockets rebound to the port the game asks for, `friend` DeclareOpenOnlinePlaySession / DeclareCloseOnlinePlaySession.
+- Diagnostics for the game's peer-to-peer receive path (`[Debug] pia_probe`, `nexprobe.txt`), off with diagnostics off.
+- Mod host: a guest call into code that has no recompiled block (Thumb, code a mod loaded itself) now runs on the emulator's JIT instead of failing. Forge PC 0.7 uses this.
+
+### Changed
+- Game menu (F10): Multiplayer is split into **Local** (suyu rooms, Ryujinx LDN, public rooms) and **Online** (Online Server IP).
+- Network: protocol 0 maps to the host default, poll result asserts are no longer fatal.
+- Closing the game window (X or Alt+F4) asks "Are you sure you want to exit?" first; `[Display] confirm_exit = false` turns it off.
+
+### Fixed
+- Handheld mode: only the 720p/1080p content part of the present texture is blitted, so the picture is no longer shrunk or offset.
+- Log redaction example names and the scrub script help use neutral text.
+
 ## 0.9.0-test
 
 Date: 2026-10-21

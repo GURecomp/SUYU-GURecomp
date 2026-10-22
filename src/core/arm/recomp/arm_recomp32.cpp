@@ -1025,9 +1025,44 @@ struct ArmRecomp32::Impl {
         bridge.hook_bits = RecompHooks::Bits();
     }
 
+    /// CallGuest: runs the JIT instruction by instruction from ctx until the pc is on a block
+    /// again or at MODHOST_CALL_RETURN_PC. False (ctx holds the state reached) on a system call
+    /// or after kCallJitSteps instructions.
+    bool StepCallOnJit() {
+        constexpr u32 kCallJitSteps = 2'000'000;
+        if (!self->EnterFallback()) {
+            return false;
+        }
+        in_fallback = false; // a mod call never leaves the JIT armed for the game's own run
+        ctx.halted = 0;
+        Kernel::Svc::ThreadContext tctx{};
+        self->GetContext(tctx);
+        fallback->SetContext(tctx);
+        fallback->SetTpidrroEl0(ctx.tpidruro);
+        HaltReason hr = HaltReason::StepThread;
+        for (u32 n = 0; n < kCallJitSteps && hr == HaltReason::StepThread; ++n) {
+            hr = n == 0 ? fallback->StepThread(nullptr) : fallback->StepInstruction();
+            fallback->GetContext(tctx);
+            if (hr != HaltReason::StepThread) {
+                break;
+            }
+            const bool thumb = (tctx.pstate & 0x20) != 0;
+            if (static_cast<u32>(tctx.pc) == MODHOST_CALL_RETURN_PC ||
+                (!thumb && lookup(static_cast<u32>(tctx.pc)))) {
+                break;
+            }
+            if (n + 1 == kCallJitSteps) {
+                hr = HaltReason::BreakLoop; // runaway
+            }
+        }
+        self->SetContext(tctx);
+        return hr == HaltReason::StepThread;
+    }
+
     /// Runs a guest function to its return for the mod loader, on this core and guest thread.
-    /// Only blocks run: a system call, an untranslated instruction or a missing block fails
-    /// the call (the registers are restored; memory it wrote stays written). Hooks don't fire.
+    /// Recompiled blocks run natively; code without blocks (a module the mod loaded, an
+    /// untranslated instruction) runs on the JIT. A system call or a runaway call fails the
+    /// call (the registers are restored; memory it wrote stays written). Hooks don't fire.
     bool CallGuest(u32 function, const u32* args, u32 count, const float* fargs, u32 fcount,
                    u32* out_r, double* out_d0) {
         constexpr u32 kMaxDepth = 4;
@@ -1062,18 +1097,26 @@ struct ArmRecomp32::Impl {
                 ok = true;
                 break;
             }
-            if (ctx.thumb) {
-                break;
+            RecompBlockFn block{};
+            if (!ctx.thumb) {
+                auto& cached = lookup_cache[(pc >> 2) & (kLookupCache - 1)];
+                block = cached.pc == pc ? cached.fn : lookup(pc);
+                if (block) {
+                    cached = {pc, block};
+                    bridge.chain_budget = chain_budget;
+                    block(&ctx);
+                    if (ctx.halted == 0 && ctx.pending_svc == kNoPendingSvc) {
+                        continue;
+                    }
+                    if (ctx.pending_svc != kNoPendingSvc) {
+                        break;
+                    }
+                    // untranslated instruction: ctx.r[15] is at it, the JIT runs it below
+                }
             }
-            auto& cached = lookup_cache[(pc >> 2) & (kLookupCache - 1)];
-            RecompBlockFn block = cached.pc == pc ? cached.fn : lookup(pc);
-            if (!block) {
-                break;
-            }
-            cached = {pc, block};
-            bridge.chain_budget = chain_budget;
-            block(&ctx);
-            if (ctx.halted != 0 || ctx.pending_svc != kNoPendingSvc) {
+            // No block (code without a recompiled image, Thumb) or an untranslated instruction:
+            // single-step the JIT until the pc is back on a block or the call returns.
+            if (!StepCallOnJit()) {
                 break;
             }
         }
@@ -1102,6 +1145,7 @@ struct ArmRecomp32::Impl {
     System& system;
     RecompLookupFn lookup{};
     ModHost::GuestCaller mod_caller{this, &Impl::CallGuestThunk};
+    ArmRecomp32* self{};
     u32 call_depth{0};
     A32ContextView ctx{};
     A32HostMemView bridge{};
@@ -1135,6 +1179,7 @@ ArmRecomp32::ArmRecomp32(System& system, bool uses_wall_clock, RecompLookupFn lo
                          Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
                          std::size_t core_index)
     : ArmInterface{uses_wall_clock}, impl{std::make_unique<Impl>(system, lookup)} {
+    impl->self = this;
     impl->owner_process = process;
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;

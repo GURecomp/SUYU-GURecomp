@@ -126,6 +126,8 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
+    LOG_INFO(Render_Vulkan, "probe-size: PresentManager blit_supported {} (swapchain view format {})",
+             blit_supported, static_cast<int>(swapchain.GetImageViewFormat()));
     SetImageCount();
 
     auto& dld = device.GetLogical();
@@ -446,6 +448,19 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT, {},
                            {}, {}, pre_barriers);
 
+    {
+        static bool p_first = true, p_blit = false;
+        static u32 p_fw, p_fh, p_ew, p_eh;
+        if (p_first || p_blit != blit_supported || p_fw != frame->width || p_fh != frame->height ||
+            p_ew != extent.width || p_eh != extent.height) {
+            p_first = false;
+            p_blit = blit_supported;
+            p_fw = frame->width, p_fh = frame->height, p_ew = extent.width, p_eh = extent.height;
+            LOG_INFO(Render_Vulkan,
+                     "probe-size: present frame {}x{} swapchain extent {}x{} path {} (blit_supported {})",
+                     p_fw, p_fh, p_ew, p_eh, blit_supported ? "blit" : "copy", blit_supported);
+        }
+    }
     if (blit_supported) {
         cmdbuf.BlitImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

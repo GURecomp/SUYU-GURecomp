@@ -1127,7 +1127,25 @@ bool ShowFps() {
     return g_show_fps.load() == 1;
 }
 
+namespace {
+std::atomic<int> g_confirm_exit{-1}; // -1: not read yet
+bool IsFalseWord(const std::string& v) {
+    return v == "false" || v == "0" || v == "no" || v == "off";
+}
+} // namespace
+
+bool ConfirmExit() {
+    if (g_confirm_exit.load() < 0) {
+        g_confirm_exit = IsFalseWord(ReadValue("Display", "confirm_exit")) ? 0 : 1;
+    }
+    return g_confirm_exit.load() == 1;
+}
+
 bool ApplyLive(const std::string& section, const std::string& key, const std::string& value) {
+    if (section == "Display" && key == "confirm_exit") {
+        g_confirm_exit = IsFalseWord(value) ? 0 : 1;
+        return true;
+    }
     if (section == "Display" && key == "show_fps") {
         g_show_fps = (value == "true" || value == "1" || value == "yes" || value == "on") ? 1 : 0;
         return true;
@@ -1176,6 +1194,23 @@ std::atomic<u32> g_render_default_pc{0};
 std::atomic<u32> g_render_create_pc{0};
 std::atomic<u32> g_motion_blur_pc{0};
 std::atomic<u32> g_vp_probe_pc{0};
+std::atomic<u32> g_pia_lo{0};
+std::atomic<u32> g_pia_hi{0};
+namespace {
+// main offsets of the probe request handler path (see OnPiaProbe)
+constexpr u32 kPiaPcs[] = {0x1311010, 0x1313EE8, 0x1313F50, 0x13141C0, 0x13141D8, 0x1314264, 0x1314278,
+                           0x1314290, 0x1314298, 0x13142A4, 0x13142E4, 0x13153FC, 0x1315B48, 0x131F32C,
+                           // receive path (datagram reader, buffer validator, decrypt, receive loop, message iterator)
+                           0x131C450, 0x131C4B8, 0x131C4D8, 0x131C5A8, 0x13AA5EC, 0x13AA614, 0x13AA658, 0x13AA668,
+                           0x13AA698, 0x13AA69C, 0x13EDD58, 0x13EDDE8, 0x139DDA0, 0x139DDA8, 0x139DDC0, 0x139DDD8,
+                           0x139DDE0, 0x139DE20, 0x139DE4C, 0x139DF40, 0x139DEB8, 0x139E6E8, 0x139E6F4, 0x139E71C,
+                           0x139E730, 0x139E76C, 0x139E79C, 0x139E7B8, 0x139E7C8, 0x139E7D0, 0x139E7DC, 0x139E7EC,
+                           0x139E800, 0x139E814};
+// main offsets of Pia singletons read by the receive path probes
+constexpr u32 kPiaStnMgr = 0x2145A64, kPiaStnMask = 0x2145A34, kPiaProtoList = 0x2145A48, kPiaFlag60 = 0x2145A60,
+              kPiaLocalAddr = 0x2144224;
+constexpr u32 kPiaGlobal = 0x2144190; // main offset: pointer whose +0x6d byte is the enable flag
+} // namespace
 std::atomic<u32> g_main_base{0};
 std::atomic<bool> g_probe_on{false};
 namespace {
@@ -1296,6 +1331,19 @@ void Start(System& system, const std::map<u64, std::string>& modules) {
     if (main_base != 0 && (ProbesEnabled() || g_render_w != 0)) {
         RecompHooks::Mark(main_base + 0xBC1204);
         g_vp_probe_pc.store(main_base + 0xBC1204);
+    }
+    if (main_base != 0 && ReadValue("Debug", "pia_probe") != "off") {
+        for (const u32 off : kPiaPcs) {
+            RecompHooks::Mark(main_base + off);
+        }
+        u32 pia_min = ~0u, pia_max = 0;
+        for (const u32 off : kPiaPcs) {
+            pia_min = std::min(pia_min, off);
+            pia_max = std::max(pia_max, off);
+        }
+        g_pia_lo.store(main_base + pia_min);
+        g_pia_hi.store(pia_max - pia_min + 4);
+        LOG_INFO(Core_ARM, "[PIAPROBE] hooks on (main {:#x}); [Debug] pia_probe = off disables", main_base);
     }
     if (main_base != 0) {
         if (const std::string mb = ReadValue("Debug", "motion_blur"); mb == "probe" || mb == "force") {
@@ -1439,6 +1487,228 @@ void OnHookedEntry(u32 pc, u32* regs) {
     const float scaled = far_now * g_draw_distance;
     mem.Write32(base + far_off, std::bit_cast<u32>(scaled));
     g_far_written[base] = scaled;
+}
+
+namespace {
+// Receive-path part of the [PIAPROBE] text (reader 0x131C3E0, buffer validator 0x13AA5EC, decrypt 0x13EDD58,
+// receive loop 0x139DCE4, message iterator 0x139E5F8). Reads only.
+std::string PiaRecvExtra(u32 off, const u32* regs, u32 base, Core::Memory::Memory& mem) {
+    const auto hex = [&](u32 p, u32 len) {
+        std::string s;
+        if (!mem.IsValidVirtualAddressRange(p, len)) {
+            return std::string{"<invalid>"};
+        }
+        for (u32 i = 0; i < len; ++i) {
+            s += fmt::format("{:02x}", mem.Read8(p + i));
+        }
+        return s;
+    };
+    const auto rd32 = [&](u32 p) -> u32 { return mem.IsValidVirtualAddressRange(p, 4) ? mem.Read32(p) : 0xDEADDEADu; };
+    const auto rd8 = [&](u32 p) -> u32 { return mem.IsValidVirtualAddress(p) ? mem.Read8(p) : 0xFFu; };
+    const u32 sp = regs[13];
+    const u32 mgr = rd32(base + kPiaStnMgr);
+    const auto stations = [&]() {
+        const u32 cnt = rd32(mgr + 0x38);
+        std::string s = fmt::format(" mgr={:#x} stationCount={}", mgr, cnt);
+        for (u32 i = 0; i < cnt && i < 6; ++i) {
+            const u32 stn = rd32(mgr + 0x3c + 4 * i);
+            s += fmt::format(" [stn {:#x} addr={} idx={:#x} state={:#x}]", stn, hex(stn + 4, 0x14), rd32(stn + 0x10),
+                             rd32(stn + 0x20));
+        }
+        return s;
+    };
+    switch (off) {
+    case 0x131C450: // reader: recvfrom returned a datagram
+        return fmt::format(" DATAGRAM READ buf={:#x} data16={} size[+0x5d0]={:#x} srcaddr[+0x5ec]={}", regs[6],
+                           hex(regs[6] + 0x10, 16), rd32(regs[6] + 0x5d0), hex(regs[6] + 0x5ec, 0x14));
+    case 0x131C4B8: // reader: source address passed the validity check, now compared with own addresses
+        return fmt::format(" src32={:#x} src20={} ownA={:#x} ownB={:#x} (dropped if src32 equals either)", rd32(sp + 0xb0),
+                           hex(sp + 0xb0, 0x14), rd32(base + kPiaLocalAddr), rd32(base + kPiaLocalAddr + 8));
+    case 0x131C4D8:
+        return " reader: src is not an own address -> datagram ACCEPTED by reader";
+    case 0x131C5A8:
+        return fmt::format(" reader: DROP EXIT (status 0x2c09: src is own address or invalid) src32={:#x}", rd32(sp + 0xb0));
+    case 0x13AA5EC: // buffer validator (vtable +0x34): r0 = transport, r1 = buffer
+        return fmt::format(" VALIDATE buf={:#x} ver/sender/seq16={} size={:#x} srcaddr={} this[0x29c]={:#x} mode[0x288]={:#x}",
+                           regs[1], hex(regs[1] + 8, 4), rd32(regs[1] + 0x5d0), hex(regs[1] + 0x5ec, 0x14),
+                           rd32(regs[0] + 0x29c), rd32(regs[0] + 0x288));
+    case 0x13AA614: // station looked up by source address
+        if (regs[0] == 0) {
+            return " validate: sender address NOT in station table (validator accepts) " + stations();
+        }
+        return fmt::format(" validate: station={:#x} idx={:#x} state={:#x} keymode[+0x51]={:#x} addr={}", regs[0],
+                           rd32(regs[0] + 0x10), rd32(regs[0] + 0x20), rd8(regs[0] + 0x51), hex(regs[0] + 4, 0x14));
+    case 0x13AA658:
+        return fmt::format(" validate: seq/window check 0x13B3054 r0={:#x} (1 = ok, else REJECT)", regs[0]);
+    case 0x13AA668:
+        return fmt::format(" validate: thisStn={:#x} mgr[+0x148]={:#x}", rd32(regs[6] + 0x29c), rd32(regs[7] + 0x148));
+    case 0x13AA698:
+        return " validate: accept path (returns size)";
+    case 0x13AA69C:
+        return fmt::format(" validate returns r0={:#x} (0 = REJECT)", regs[0]);
+    case 0x13EDD58: // decrypt: r0 = out code, r1 = buffer, r2 = key struct
+        return fmt::format(" DECRYPT magic={:#x} ver={} size={:#x} keymode={:#x}", rd32(regs[1] + 4), rd8(regs[1] + 8),
+                           rd32(regs[1] + 0x5d0), rd32(regs[2]));
+    case 0x13EDDE8:
+        return fmt::format(" decrypt exit code={:#x} (0 ok; 0x2c03 bad magic/ver/size/align; 0xc0b key mode)", regs[0]);
+    case 0x139DDA0:
+        return fmt::format(" recvloop: validate returned {:#x} buf={:#x} idx={}", regs[0], regs[6], regs[5]);
+    case 0x139DDA8:
+        return fmt::format(" recvloop: DROP buffer (magic/ver/size bad or validate<=0xb) r0={:#x} buf={:#x}", regs[0],
+                           regs[6]);
+    case 0x139DDC0:
+        return fmt::format(" recvloop: decrypt result={:#x} buf[+8]={}", rd32(sp + 0xc), rd8(regs[6] + 8));
+    case 0x139DDD8:
+        return fmt::format(" recvloop: DROP buffer (decrypt failed) buf={:#x}", regs[6]);
+    case 0x139DDE0:
+        return fmt::format(" recvloop: size ok {:#x}{}", regs[0], regs[0] == 0xc ? " (header only)" : "");
+    case 0x139DE20: // first message of the buffer parsed; r10 = transport
+        return fmt::format(" parsed: err={:#x} ptr={:#x} flags={:#x} stn={:#x} word0={:#x} f2={:#x} type={:#x} "
+                           "this[0x254]={:#x} stnmask[0x2a0]={:#x} local[0x29c]={:#x}",
+                           rd32(regs[10] + 0x21c), rd32(regs[10] + 0x220), rd8(regs[10] + 0x228), rd8(regs[10] + 0x229),
+                           rd32(regs[10] + 0x22c), rd32(regs[10] + 0x230), rd32(regs[10] + 0x234),
+                           rd8(regs[10] + 0x254), rd32(regs[10] + 0x2a0), rd32(regs[10] + 0x29c));
+    case 0x139DE4C:
+        return fmt::format(
+            " recvloop: message validator [+0x38] r0={:#x} mode={:#x} sb={:#x} (mode0: sb&r0&1; else (sb|r0)&1)", regs[0],
+            regs[11], regs[9]);
+    case 0x139DF40:
+        return fmt::format(" recvloop: MESSAGE REJECTED by validator -> buffer dropped buf={:#x}", regs[6]);
+    case 0x139DEB8:
+        return fmt::format(" recvloop: buffer valid flag [+0x5f8] <= {:#x} buf={:#x}", regs[9], regs[6]);
+    case 0x139E6E8:
+        return fmt::format(" iter: buffer={:#x} flag5f8={} idx={:#x} off={:#x}", regs[1], rd8(regs[1] + 0x5f8),
+                           rd32(regs[4] + 0x26c), rd32(regs[4] + 0x270));
+    case 0x139E6F4:
+        return fmt::format(" iter: parsed ptr={:#x} type={:#x} flags={:#x} filter={:#x}/{:#x}", rd32(regs[4] + 0x220),
+                           rd32(regs[4] + 0x234), rd8(regs[4] + 0x228), rd32(regs[4] + 0x268), rd32(regs[4] + 0x264));
+    case 0x139E71C:
+        return fmt::format(" iter: protocol 0x400 message matched filter type={:#x} flags={:#x} stationMgr={:#x}", regs[8],
+                           rd8(regs[4] + 0x228), mgr);
+    case 0x139E730:
+        if (regs[0] == 0) {
+            return " iter: sender address NOT in station table; src=" + hex(regs[10], 0x14) + stations();
+        }
+        return fmt::format(" iter: station={:#x} idx={:#x} state={:#x}", regs[0], rd32(regs[0] + 0x10),
+                           rd32(regs[0] + 0x20));
+    case 0x139E76C:
+        return fmt::format(" iter: [0x2145a60]!=0 path, 0x13A6D94 result [sp+0x14]={:#x} (0 = SKIP)", rd32(sp + 0x14));
+    case 0x139E79C:
+        return " iter: unknown-sender branch";
+    case 0x139E7B8: {
+        const u32 maskp = rd32(base + kPiaStnMask);
+        return fmt::format(" iter: station-active-mask check mask={:#x} stnIdx={:#x}", rd32(maskp),
+                           rd32(regs[7] + 0x10));
+    }
+    case 0x139E7C8:
+        return fmt::format(" iter: station-active-mask result r0={:#x} (nonzero = deliver)", regs[0]);
+    case 0x139E7D0:
+        return fmt::format(" iter: fallback (flags&4 delivers) flags={:#x}", rd8(regs[4] + 0x228));
+    case 0x139E7DC: {
+        const u32 lst = rd32(base + kPiaProtoList);
+        std::string l;
+        const u32 cnt = rd32(lst + 0x40);
+        for (u32 i = 0; i < cnt && i < 32; ++i) {
+            l += fmt::format("{:x} ", mem.IsValidVirtualAddressRange(lst + 2 * i, 2) ? mem.Read16(lst + 2 * i) : 0xFFFF);
+        }
+        return fmt::format(" iter: protocol allow-list n={} [{}] looking for {:#x}", cnt, l, regs[8] >> 16);
+    }
+    case 0x139E7EC:
+        return fmt::format(" iter: allow-list check r0={:#x} (nonzero = message SKIPPED)", regs[0]);
+    case 0x139E800:
+        return " iter: reached accept filter";
+    case 0x139E814:
+        return fmt::format(" iter: accept filter [+0x3c] r0={:#x} (1 = delivered to the consumer)", regs[0]);
+    default:
+        return {};
+    }
+}
+} // namespace
+
+// Diagnostic logging only: reads guest registers/memory, writes nothing.
+void OnPiaProbe(u32 pc, u32* regs) {
+    const u32 base = g_main_base.load();
+    if (base == 0) {
+        return;
+    }
+    const u32 off = pc - base;
+    bool ours = false;
+    for (const u32 k : kPiaPcs) {
+        ours = ours || k == off;
+    }
+    if (!ours) {
+        return;
+    }
+    static std::mutex m;
+    static std::unordered_map<u32, u32> hits;
+    static int window = 0;   // lines the per-frame receive-path hooks may still log (opened by a datagram read)
+    static u32 datagrams = 0;
+    std::scoped_lock lk{m};
+    // classes: reader (always), per-frame receive path (only inside the window after a datagram read),
+    // message iterator decision points (only for protocol 0x400 messages)
+    const bool is_msg = off >= 0x139E71C && off <= 0x139E814;
+    const bool is_frame = off == 0x13AA5EC || off == 0x13AA614 || off == 0x13AA658 || off == 0x13AA668 ||
+                          off == 0x13AA698 || off == 0x13AA69C || off == 0x13EDD58 || off == 0x13EDDE8 ||
+                          (off >= 0x139DDA0 && off <= 0x139DF40) || off == 0x139E6E8 || off == 0x139E6F4;
+    if (is_msg && (regs[8] >> 16) != 0x400) {
+        return;
+    }
+    if (is_frame) {
+        if (window <= 0) {
+            return;
+        }
+        --window;
+    }
+    if (off == 0x131C450) {
+        if (++datagrams > 40) {
+            return;
+        }
+        window = 120;
+    }
+    const u32 n = ++hits[off];
+    if (n > 200 && n % 50 != 0) {
+        return;
+    }
+    auto& mem = g_system->ApplicationMemory();
+    const auto hex = [&](u32 p, u32 len) {
+        std::string s;
+        if (!mem.IsValidVirtualAddressRange(p, len)) {
+            return std::string{"<invalid>"};
+        }
+        for (u32 i = 0; i < len; ++i) {
+            s += fmt::format("{:02x}", mem.Read8(p + i));
+        }
+        return s;
+    };
+    const auto rd32 = [&](u32 p) -> u32 { return mem.IsValidVirtualAddressRange(p, 4) ? mem.Read32(p) : 0xDEADDEADu; };
+    std::string extra;
+    switch (off) {
+    case 0x13141C0: {
+        const u32 g = rd32(base + kPiaGlobal);
+        const u32 flag = mem.IsValidVirtualAddress(g + 0x6d) ? mem.Read8(g + 0x6d) : 0xFFu;
+        extra = fmt::format(" localRVCID[this+0x18]={:#x} global={:#x} enable[+0x6d]={:#x} r1[0x40]={} r2[0x40]={}",
+                            rd32(regs[0] + 0x18), g, flag, hex(regs[1], 0x40), hex(regs[2], 0x40));
+        break;
+    }
+    case 0x131F32C:
+        extra = fmt::format(" probe+8[6]={} probe+0x1c={:#x} probe[0x20]={} hdr_byte={:#x}", hex(regs[1] + 8, 6),
+                            rd32(regs[1] + 0x1c), hex(regs[1], 0x20), regs[2] & 0xFF);
+        break;
+    case 0x1314290:
+        extra = " (return of 0x131F32C lookup: r0 = result)";
+        break;
+    case 0x1314264:
+        extra = " (after 0x130CB64 address-valid check: r0 = result)";
+        break;
+    case 0x13142E4:
+        extra = " (common exit of 0x13141C0)";
+        break;
+    default:
+        extra = PiaRecvExtra(off, regs, base, mem);
+        break;
+    }
+    LOG_INFO(Core_ARM, "[PIAPROBE] main+{:#x} n={} r0={:#x} r1={:#x} r2={:#x} r3={:#x} sp={:#x} lr={:#x}{}", off, n,
+             regs[0], regs[1], regs[2], regs[3], regs[13], regs[14], extra);
 }
 
 // ---- [Debug] nvn_upscaler_probe: camera matrix log and filter constructor hit counters -------------------------

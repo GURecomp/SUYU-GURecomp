@@ -40,7 +40,7 @@ public:
             {10421, nullptr, "EnsureBlockedUserListAvailable"},
             {10500, nullptr, "GetProfileList"},
             {10501, nullptr, "GetProfileListV2"}, // 18.0.0+
-            {10600, nullptr, "DeclareOpenOnlinePlaySession"},
+            {10600, &IFriendService::DeclareOpenOnlinePlaySession, "DeclareOpenOnlinePlaySession"},
             {10601, &IFriendService::DeclareCloseOnlinePlaySession, "DeclareCloseOnlinePlaySession"},
             {10610, &IFriendService::UpdateUserPresence, "UpdateUserPresence"},
             {10700, &IFriendService::GetPlayHistoryRegistrationKey, "GetPlayHistoryRegistrationKey"},
@@ -243,9 +243,17 @@ private:
         rb.Push(true);
     }
 
+    void DeclareOpenOnlinePlaySession(HLERequestContext& ctx) {
+        LOG_INFO(Service_Friend, "[NEXPROBE] friend DeclareOpenOnlinePlaySession");
+        open_online_play = true;
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
     void DeclareCloseOnlinePlaySession(HLERequestContext& ctx) {
         // Stub used by Splatoon 2
         LOG_WARNING(Service_Friend, "(STUBBED) called");
+        open_online_play = false;
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -370,6 +378,7 @@ private:
     KernelHelpers::ServiceContext service_context;
 
     Kernel::KEvent* completion_event;
+    bool open_online_play{};
 };
 
 class INotificationService final : public ServiceFramework<INotificationService> {

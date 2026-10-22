@@ -53,6 +53,9 @@ std::vector<Row> MakeRows() {
          "; off/false = no lock (can tear); relaxed = on, late frames at once. Needs a restart. Default on.\n", K::Menu, nullptr},
         {"Display", "show_fps", "false",
          "; true = frame rate in the window title (the F10 menu always shows it). Default false.\n", K::Menu, nullptr},
+        {"Display", "confirm_exit", "true",
+         "; true = ask \"Are you sure you want to exit?\" when the window is closed (X or Alt+F4). Default true.\n",
+         K::Doc, nullptr},
         {"Display", "console_mode", "docked",
          "; docked = 1920x1080 render (TV); handheld = 1280x720 (lighter on weak PCs). Default docked.\n", K::Menu, nullptr},
         {"Display", "rtss_overlay", "false",
@@ -165,6 +168,11 @@ std::vector<Row> MakeRows() {
          K::Menu, nullptr},
         {"Multiplayer", "backend", "room",
          "; room = a suyu room (the settings above); ryuldn = a RyuLdn master server (play with Ryujinx players). Read at start.\n",
+         K::Menu, nullptr},
+        {"Multiplayer", "online_server_host", "",
+         "; Online server (NEX): IPv4 address or host name every Nintendo online name resolves to; empty = off (then\n"
+         "; network_replacement_host applies). Ports are fixed by the game. Independent of the LAN / RyuLDN settings.\n"
+         "; Read when the game connects (set it before booting).\n",
          K::Menu, nullptr},
         {"Multiplayer", "ryuldn_host", "ldn.ryujinx.app",
          "; ryuldn: the main server (host name or IP); ldn.ryujinx.app = Ryujinx's public server (empty = the same).\n",

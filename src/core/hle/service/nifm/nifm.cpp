@@ -385,7 +385,7 @@ public:
 
 private:
     void Submit(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_NIFM, "(STUBBED) called");
+        LOG_INFO(Service_NIFM, "[NEXPROBE] nifm IRequest::Submit (SubmitNetworkRequest)");
 
         if (state == RequestState::NotSubmitted) {
             UpdateState(RequestState::OnHold);
@@ -976,7 +976,7 @@ void IGeneralService::IsEthernetCommunicationEnabled(HLERequestContext& ctx) {
 }
 
 void IGeneralService::IsAnyInternetRequestAccepted(HLERequestContext& ctx) {
-    LOG_ERROR(Service_NIFM, "(STUBBED) called");
+    LOG_INFO(Service_NIFM, "[NEXPROBE] nifm IsAnyInternetRequestAccepted");
 
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);

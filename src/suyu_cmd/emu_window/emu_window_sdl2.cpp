@@ -730,9 +730,31 @@ bool EmuWindow_SDL2::IsShown() const {
     return is_shown;
 }
 
+static u32 g_probe_last_event = 0;
+
 void EmuWindow_SDL2::OnResize() {
     int width, height;
     SDL_GetWindowSizeInPixels(render_window, &width, &height);
+    {
+        int lw = 0, lh = 0;
+        SDL_GetWindowSize(render_window, &lw, &lh);
+        const float scale = SDL_GetWindowDisplayScale(render_window);
+        const float density = SDL_GetWindowPixelDensity(render_window);
+        static bool first = true;
+        static u32 p_ev;
+        static int p_lw, p_lh, p_pw, p_ph;
+        static float p_scale, p_density;
+        if (first || p_ev != g_probe_last_event || p_lw != lw || p_lh != lh || p_pw != width ||
+            p_ph != height || p_scale != scale || p_density != density) {
+            first = false;
+            p_ev = g_probe_last_event, p_lw = lw, p_lh = lh, p_pw = width, p_ph = height;
+            p_scale = scale, p_density = density;
+            LOG_INFO(Frontend,
+                     "probe-size: OnResize event {:#x} window size {}x{} pixels {}x{} display scale {} "
+                     "pixel density {}",
+                     p_ev, lw, lh, width, height, scale, density);
+        }
+    }
     // A minimized window reports 0x0. Feeding that through as a layout makes
     // the renderer build a zero-extent swapchain, which the driver never
     // presents from - the window comes back blank and the main loop stops
@@ -891,12 +913,47 @@ void EmuWindow_SDL2::WaitEvent() {
     PeriodicWork();
 }
 
+bool EmuWindow_SDL2::ConfirmClose() {
+    if (confirm_open) {
+        return false; // a box is already up: swallow
+    }
+    if (!is_open || system.IsShuttingDown() || !Core::GameSettings::ConfirmExit()) {
+        return true; // already closing / off
+    }
+    confirm_open = true;
+    static const SDL_MessageBoxButtonData buttons[] = {
+        {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No"},
+        {0, 1, "Yes"},
+    };
+    SDL_MessageBoxData data{};
+    data.flags = SDL_MESSAGEBOX_WARNING;
+    data.window = render_window;
+    data.title = "Exit";
+    data.message = "Are you sure you want to exit?\n(Any unsaved changes will be lost)";
+    data.numbuttons = static_cast<int>(sizeof(buttons) / sizeof(buttons[0]));
+    data.buttons = buttons;
+    int choice = 1;
+    if (!SDL_ShowMessageBox(&data, &choice)) {
+        LOG_WARNING(Frontend, "Exit confirmation unavailable ({}); exiting", SDL_GetError());
+        choice = 1;
+    }
+    confirm_open = false;
+    if (choice != 1) {
+        // One click can queue both a close request and a quit event: drop the twin.
+        SDL_FlushEvent(SDL_EVENT_QUIT);
+        SDL_FlushEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED);
+        return false;
+    }
+    return true;
+}
+
 void EmuWindow_SDL2::HandleEvent(const SDL_Event& event) {
     // The menu first (its key, its window's events), then a mod's menu (input it consumed
     // doesn't reach the game; 0 matches no case), then the game's software keyboard: while
     // it wants text, typing goes to it.
     const bool consumed_by_mods = GameMenu::HandleEvent(event) || ForwardToMods(event) ||
                                   SdlKeyboard::HandleEvent(event);
+    g_probe_last_event = consumed_by_mods ? 0u : static_cast<u32>(event.type);
     switch (consumed_by_mods ? 0u : event.type) {
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
     case SDL_EVENT_WINDOW_RESIZED:
@@ -917,7 +974,9 @@ void EmuWindow_SDL2::HandleEvent(const SDL_Event& event) {
         OnResize();
         break;
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-        is_open = false;
+        if (ConfirmClose()) {
+            is_open = false;
+        }
         break;
     case SDL_EVENT_KEY_DOWN:
         if (event.key.scancode == SDL_SCANCODE_F11 ||
@@ -958,7 +1017,9 @@ void EmuWindow_SDL2::HandleEvent(const SDL_Event& event) {
         OnFingerUp();
         break;
     case SDL_EVENT_QUIT:
-        is_open = false;
+        if (ConfirmClose()) {
+            is_open = false;
+        }
         break;
     case SDL_EVENT_JOYSTICK_ADDED:
         // A controller connected (also each one present at start): Player 1 takes it when

@@ -121,7 +121,9 @@ typedef struct ModHostApi {
     /* calls a guest function on the current game thread. Only from on_dispatch or
      * on_game_start: returns false when called from any other thread. Integer args in r0-r3
      * then the stack, float args in s0-s15. out_r[0..1] = r0, r1; out_d0 = d0 (s0 = its low
-     * half). Hooks don't fire inside. Returns false if it could not complete (registers are
+     * half). Hooks don't fire inside. Code without a recompiled block (or an
+     * untranslated instruction) runs on the JIT, so a call may enter code a mod loaded into
+     * guest memory. Returns false on a system call, a runaway call or no JIT (registers are
      * restored). */
     bool (*call)(uint32_t function, const uint32_t* args, uint32_t count, const float* fargs,
                  uint32_t fcount, uint32_t out_r[2], double* out_d0);

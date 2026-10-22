@@ -373,8 +373,24 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     // Request the size again to reduce the possibility of a TOCTOU race condition.
     const auto updated_capabilities = physical_device.GetSurfaceCapabilitiesKHR(VkSurfaceKHR(surface));
     swapchain_ci.imageExtent = ChooseSwapExtent(updated_capabilities, width, height);
+    {
+        static bool s_first = true;
+        static u32 s_rw, s_rh, s_cw, s_ch, s_ew, s_eh;
+        const auto& ce = updated_capabilities.currentExtent;
+        if (s_first || s_rw != width || s_rh != height || s_cw != ce.width || s_ch != ce.height ||
+            s_ew != swapchain_ci.imageExtent.width || s_eh != swapchain_ci.imageExtent.height) {
+            s_first = false;
+            s_rw = width, s_rh = height, s_cw = ce.width, s_ch = ce.height;
+            s_ew = swapchain_ci.imageExtent.width, s_eh = swapchain_ci.imageExtent.height;
+            LOG_INFO(Render_Vulkan,
+                     "probe-size: swapchain requested {}x{} currentExtent {}x{} chosen {}x{} min {}x{} max {}x{}",
+                     width, height, ce.width, ce.height, s_ew, s_eh, updated_capabilities.minImageExtent.width,
+                     updated_capabilities.minImageExtent.height, updated_capabilities.maxImageExtent.width,
+                     updated_capabilities.maxImageExtent.height);
+        }
+    }
     // Don't add code within this and the swapchain creation.
-    swapchain = device.GetLogical().CreateSwapchainKHR(swapchain_ci);
+    swapchain =device.GetLogical().CreateSwapchainKHR(swapchain_ci);
 
     extent = swapchain_ci.imageExtent;
 

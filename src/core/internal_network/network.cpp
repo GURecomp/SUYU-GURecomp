@@ -598,6 +598,9 @@ int TranslateTypeToNative(Type type) {
     NETWORK_PROTOCOL_TRANSLATE_ELEM(SCTP)
 #endif
 [[nodiscard]] Protocol TranslateProtocolFromNative(u32 protocol) {
+    if (protocol == 0) {
+        return Protocol::IP; // default protocol for the socket type
+    }
     switch (protocol) {
 #define NETWORK_PROTOCOL_TRANSLATE_ELEM(x) case IPPROTO_##x: return Protocol::x;
     NETWORK_PROTOCOL_TRANSLATE_LIST
@@ -608,6 +611,9 @@ int TranslateTypeToNative(Type type) {
     }
 }
 [[nodiscard]] u32 TranslateProtocolToNative(Protocol protocol) {
+    if (protocol == Protocol::IP) {
+        return 0; // host picks default for socket type
+    }
     switch (protocol) {
 #define NETWORK_PROTOCOL_TRANSLATE_ELEM(x) case Protocol::x: return IPPROTO_##x;
     NETWORK_PROTOCOL_TRANSLATE_LIST
@@ -783,8 +789,9 @@ std::pair<s32, Errno> Poll(std::vector<PollFD>& pollfds, s32 timeout) {
     const int result =
         WSAPoll(host_pollfds.data(), static_cast<ULONG>(host_pollfds.size()), timeout);
     if (result == 0) {
-        ASSERT(std::all_of(host_pollfds.begin(), host_pollfds.end(),
-                           [](WSAPOLLFD fd) { return fd.revents == 0; }));
+        for (size_t i = 0; i < num; ++i) {
+            pollfds[i].revents = PollEvents{};
+        }
         return {0, Errno::SUCCESS};
     }
 
@@ -838,6 +845,18 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int option, T value) {
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
     if (fd != INVALID_SOCKET) {
+#ifdef _WIN32
+        // Windows reports an ICMP port-unreachable for an earlier sendto as WSAECONNRESET on the
+        // next recvfrom of an unconnected UDP socket. Horizon does not, and games treat ECONNRESET
+        // on a UDP socket as fatal, so turn that behaviour off.
+        if (type == Type::DGRAM) {
+            constexpr DWORD SIO_UDP_CONNRESET_ = 0x9800000C; // _WSAIOW(IOC_VENDOR, 12)
+            BOOL report = FALSE;
+            DWORD bytes = 0;
+            WSAIoctl(fd, SIO_UDP_CONNRESET_, &report, sizeof(report), nullptr, 0, &bytes, nullptr,
+                     nullptr);
+        }
+#endif
         return Errno::SUCCESS;
     }
 

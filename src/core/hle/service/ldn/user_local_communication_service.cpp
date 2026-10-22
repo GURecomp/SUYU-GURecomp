@@ -117,7 +117,7 @@ Result IUserLocalCommunicationService::GetState(Out<State> out_state) {
 
 Result IUserLocalCommunicationService::GetNetworkInfo(
     OutLargeData<NetworkInfo, BufferAttr_HipcPointer> out_network_info) {
-    LOG_INFO(Service_LDN, "called");
+    LOG_DEBUG(Service_LDN, "called");
 
     R_RETURN(network->GetNetworkInfo(*out_network_info));
 }

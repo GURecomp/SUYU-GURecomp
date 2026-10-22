@@ -41,6 +41,11 @@ public:
     virtual Result DoHandshake() = 0;
     virtual Result Read(size_t* out_size, std::span<u8> data) = 0;
     virtual Result Write(size_t* out_size, std::span<const u8> data) = 0;
+    // Like Read but does not consume data. Backends without peek support report an error.
+    virtual Result Peek(size_t* out_size, std::span<u8> data) {
+        *out_size = 0;
+        return ResultInternalError;
+    }
     virtual Result GetServerCerts(std::vector<std::vector<u8>>* out_certs) = 0;
 };
 

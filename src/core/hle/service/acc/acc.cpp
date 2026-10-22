@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <string>
+#include <string_view>
 
 #include "common/common_types.h"
 #include "common/fs/file.h"
@@ -37,6 +40,48 @@ namespace Service::Account {
 
 // Thumbnails are hard coded to be at least this size
 constexpr std::size_t THUMBNAIL_SIZE = 0x24000;
+
+// [NEXPROBE] Plausible dummy NSA id_token (JWT-shaped ASCII) for network service accounts.
+static std::string Base64Url(std::string_view in) {
+    static constexpr char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const u32 v = (u8(in[i]) << 16) | (u8(in[i + 1]) << 8) | u8(in[i + 2]);
+        out += {tbl[v >> 18], tbl[(v >> 12) & 63], tbl[(v >> 6) & 63], tbl[v & 63]};
+    }
+    if (i + 1 == in.size()) {
+        const u32 v = u8(in[i]) << 16;
+        out += {tbl[v >> 18], tbl[(v >> 12) & 63]};
+    } else if (i + 2 == in.size()) {
+        const u32 v = (u8(in[i]) << 16) | (u8(in[i + 1]) << 8);
+        out += {tbl[v >> 18], tbl[(v >> 12) & 63], tbl[(v >> 6) & 63]};
+    }
+    return out;
+}
+
+static std::string MakeDummyIdToken() {
+    const std::string header = Base64Url(R"({"typ":"JWT","alg":"RS256","kid":"dummy"})");
+    const std::string payload = Base64Url(
+        R"({"iss":"https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com","sub":"0123456789abcdef","aud":"0123456789abcdef","exp":4102444800,"iat":1700000000,"jti":"00000000-0000-0000-0000-000000000000"})");
+    std::string sig_raw(256, 'A');
+    for (size_t i = 0; i < sig_raw.size(); ++i) {
+        sig_raw[i] = static_cast<char>(0x41 + (i * 7) % 26);
+    }
+    return header + "." + payload + "." + Base64Url(sig_raw);
+}
+
+/// Writes the dummy token (zero padded) to write buffer 0 and returns its true length.
+static u32 WriteDummyIdToken(HLERequestContext& ctx) {
+    const std::string token = MakeDummyIdToken();
+    const size_t buf_size = ctx.CanWriteBuffer() ? ctx.GetWriteBufferSize() : 0x100;
+    std::vector<u8> data(std::max<size_t>(buf_size, 1), 0);
+    const size_t n = std::min(token.size(), data.size() - 1);
+    std::memcpy(data.data(), token.data(), n);
+    (void)ctx.WriteBuffer(data);
+    return static_cast<u32>(n);
+}
 
 static std::filesystem::path GetImagePath(const Common::UUID& uuid) {
     return Common::FS::GetSuyuPath(Common::FS::SuyuPath::NANDDir) /
@@ -123,7 +168,7 @@ private:
     }
 
     Result GetAccountId(Out<u64> out_account_id) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc SystemService GetAccountId");
         *out_account_id = account_id.Hash();
         R_SUCCEED();
     }
@@ -506,16 +551,11 @@ protected:
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
-
-        std::vector<u8> token_data(0x100);
-        std::fill(token_data.begin(), token_data.end(), u8(0));
-
-        (void)ctx.WriteBuffer(token_data);
-
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc IProfileCommon::LoadIdTokenCache");
+        const u32 len = WriteDummyIdToken(ctx);
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.Push(static_cast<u32>(token_data.size()));
+        rb.Push(len);
     }
 
     void GetNintendoAccountUserResourceCacheForApplication(HLERequestContext& ctx) {
@@ -665,11 +705,11 @@ public:
     ~EnsureTokenIdCacheAsyncInterface() = default;
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
-
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc LoadIdTokenCacheDeprecated");
+        const u32 len = WriteDummyIdToken(ctx);
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.Push(0);
+        rb.Push(len);
     }
 
 protected:
@@ -711,13 +751,13 @@ public:
 
 private:
     void CheckAvailability(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_ACC, "(STUBBED) called");
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc CheckAvailability (IsNetworkServiceAccountAvailable)");
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetAccountId(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_ACC, "called");
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc GetAccountId (GetNetworkServiceAccountId)");
 
         IPC::ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
@@ -725,7 +765,7 @@ private:
     }
 
     void EnsureIdTokenCacheAsync(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc EnsureIdTokenCacheAsync");
 
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
@@ -733,22 +773,17 @@ private:
     }
 
     void LoadIdTokenCacheDeprecated(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc LoadIdTokenCacheDeprecated (IManagerForApplication)");
 
         ensure_token_id->LoadIdTokenCache(ctx);
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
-
-        std::vector<u8> token_data(0x100);
-        std::fill(token_data.begin(), token_data.end(), u8(0));
-
-        ctx.WriteBuffer(token_data);
-
+        LOG_INFO(Service_ACC, "[NEXPROBE] acc LoadIdTokenCache");
+        const u32 len = WriteDummyIdToken(ctx);
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.Push(static_cast<u32>(token_data.size()));
+        rb.Push(len);
     }
 
     void GetNintendoAccountUserResourceCacheForApplication(HLERequestContext& ctx) {

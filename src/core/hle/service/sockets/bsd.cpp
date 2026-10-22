@@ -5,13 +5,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <cstdio>
+#include <string>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include <fmt/ranges.h>
 
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/socket_types.h"
 #include "core/core.h"
@@ -48,6 +52,45 @@ void CensusCall(s32 fd, const char* what, std::optional<Network::SockAddrIn> add
     if (Network::LdnCensus::Enabled()) {
         Network::LdnCensus::OnCall(fd, what, addr ? &*addr : nullptr);
     }
+}
+
+/// [NEXPROBE] unbuffered, flushed side file so the destination survives a crash.
+void NexProbeFileWrite(const std::string& line) {
+    const auto path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "nexprobe.txt";
+    if (FILE* f = std::fopen(path.string().c_str(), "ab")) {
+        std::fwrite(line.data(), 1, line.size(), f);
+        std::fflush(f);
+        std::fclose(f);
+    }
+}
+
+/// [NEXPROBE] UDP trace, consecutive identical lines are collapsed into a repeat count.
+void NexProbeUdp(const std::string& line) {
+    static std::mutex mtx;
+    static std::string last;
+    static u64 repeats = 0;
+    std::scoped_lock lk{mtx};
+    if (line == last) {
+        ++repeats;
+        return;
+    }
+    if (repeats > 0) {
+        NexProbeFileWrite(fmt::format("[NEXPROBE] udp (previous line repeated {} more times)\n",
+                                      repeats));
+    }
+    repeats = 0;
+    last = line;
+    NexProbeFileWrite("[NEXPROBE] udp " + line + "\n");
+}
+
+/// [NEXPROBE] hex of the first 16 bytes.
+std::string NexProbeHex(const std::vector<u8>& data, s32 n) {
+    std::string out;
+    const size_t cnt = (std::min)(static_cast<size_t>((std::max)(n, 0)), (std::min)(data.size(), size_t{16}));
+    for (size_t i = 0; i < cnt; ++i) {
+        out += fmt::format("{:02x}", data[i]);
+    }
+    return out;
 }
 
 template <typename T>
@@ -243,9 +286,21 @@ void BSD::Connect(HLERequestContext& ctx) {
 
     LOG_DEBUG(Service, "called. fd={} addrlen={}", fd, ctx.GetReadBufferSize());
 
+    // Copy now: the work may run deferred, so never keep a span into the request/guest buffer.
+    std::vector<u8> addr_copy = ctx.ReadBufferCopy();
+    {
+        const auto a = GetValue<SockAddrIn>(addr_copy);
+        NexProbeFileWrite(fmt::format("Connect fd={} addrbuf={} family={} {}.{}.{}.{}:{}\n", fd,
+                                      addr_copy.size(), static_cast<u32>(a.family), a.ip[0],
+                                      a.ip[1], a.ip[2], a.ip[3], a.portno));
+        LOG_WARNING(Service, "[NEXPROBE] Connect fd={} addrbuf={} family={} {}.{}.{}.{}:{}", fd,
+                    addr_copy.size(), static_cast<u32>(a.family), a.ip[0], a.ip[1], a.ip[2],
+                    a.ip[3], a.portno);
+    }
+
     ExecuteWork(ctx, ConnectWork{
                          .fd = fd,
-                         .addr = ctx.ReadBuffer(),
+                         .addr = std::move(addr_copy),
                      });
 }
 
@@ -401,7 +456,7 @@ void BSD::Send(HLERequestContext& ctx) {
     ExecuteWork(ctx, SendWork{
                          .fd = fd,
                          .flags = flags,
-                         .message = ctx.ReadBuffer(),
+                         .message = ctx.ReadBufferCopy(),
                      });
 }
 
@@ -416,8 +471,8 @@ void BSD::SendTo(HLERequestContext& ctx) {
     ExecuteWork(ctx, SendToWork{
                          .fd = fd,
                          .flags = flags,
-                         .message = ctx.ReadBuffer(0),
-                         .addr = ctx.ReadBuffer(1),
+                         .message = ctx.ReadBufferCopy(0),
+                         .addr = ctx.ReadBufferCopy(1),
                      });
 }
 
@@ -430,7 +485,7 @@ void BSD::Write(HLERequestContext& ctx) {
     ExecuteWork(ctx, SendWork{
                          .fd = fd,
                          .flags = 0,
-                         .message = ctx.ReadBuffer(),
+                         .message = ctx.ReadBufferCopy(),
                      });
 }
 
@@ -532,10 +587,14 @@ std::pair<s32, Errno> BSD::SocketImpl(Domain domain, Type type, Protocol protoco
     const bool proxy = Network::GetLdnBackend()->IsConnected();
     if (proxy) {
         descriptor.socket = std::make_shared<Network::ProxySocket>();
+        descriptor.is_proxy = true;
     } else {
         descriptor.socket = std::make_shared<Network::Socket>();
     }
 
+    descriptor.host_domain = Translate(domain);
+    descriptor.host_type = Translate(type);
+    descriptor.host_protocol = Translate(protocol);
     descriptor.socket->Initialize(Translate(domain), Translate(type), Translate(protocol));
     descriptor.is_connection_based = IsConnectionBased(type);
     Network::LdnCensus::OnSocket(fd, static_cast<u32>(domain), static_cast<u32>(type),
@@ -580,7 +639,7 @@ std::pair<s32, Errno> BSD::PollImpl(std::vector<u8>& write_buffer, std::span<con
     }
 
     for (PollFD& pollfd : fds) {
-        ASSERT(False(pollfd.revents));
+        pollfd.revents = PollEvents{}; // output-only; ignore stale guest value
 
         if (pollfd.fd > static_cast<s32>(MAX_FD) || pollfd.fd < 0) {
             LOG_ERROR(Service, "File descriptor handle={} is invalid", pollfd.fd);
@@ -638,6 +697,7 @@ std::pair<s32, Errno> BSD::AcceptImpl(s32 fd, std::vector<u8>& write_buffer) {
     FileDescriptor& new_descriptor = *file_descriptors[new_fd];
     new_descriptor.socket = std::move(result.socket);
     new_descriptor.is_connection_based = descriptor.is_connection_based;
+    new_descriptor.is_proxy = descriptor.is_proxy;
 
     const SockAddrIn guest_addr_in = Translate(result.sockaddr_in);
     PutValue(write_buffer, guest_addr_in);
@@ -649,7 +709,9 @@ Errno BSD::BindImpl(s32 fd, std::span<const u8> addr) {
     if (!IsFileDescriptorValid(fd)) {
         return Errno::BADF;
     }
-    ASSERT(addr.size() >= 16);
+    if (addr.size() < 16) {
+        return Errno::INVAL;
+    }
     if (!file_descriptors[fd]->socket) {
         LOG_WARNING(Service, "Uninitialized socket");
         return Errno::BADF;
@@ -658,7 +720,75 @@ Errno BSD::BindImpl(s32 fd, std::span<const u8> addr) {
     auto addr_in = GetValue<SockAddrIn>(addr);
     CensusCall(fd, "bind", Translate(addr_in));
 
-    return Translate(file_descriptors[fd]->socket->Bind(Translate(addr_in)));
+    const Network::SockAddrIn host_addr = Translate(addr_in);
+    const Errno bind_result = Translate(file_descriptors[fd]->socket->Bind(host_addr));
+    if (bind_result == Errno::SUCCESS) {
+        file_descriptors[fd]->bound_addr = host_addr;
+        file_descriptors[fd]->requested_bind_addr = host_addr;
+    }
+    if (!file_descriptors[fd]->is_connection_based) {
+        NexProbeUdp(fmt::format("bind fd={} {}.{}.{}.{}:{} proxy={} -> errno {}", fd, addr_in.ip[0],
+                                addr_in.ip[1], addr_in.ip[2], addr_in.ip[3], addr_in.portno,
+                                file_descriptors[fd]->is_proxy, static_cast<s32>(bind_result)));
+    }
+    return bind_result;
+}
+
+void BSD::MaybeSwapProxyToHost(s32 fd, const Network::SockAddrIn& dest) {
+    FileDescriptor& d = *file_descriptors[fd];
+    if (!d.is_proxy) { // no dynamic_cast: build uses /GR- (no RTTI)
+        return;
+    }
+    const auto& ip = dest.ip;
+    const bool virtual_lan = ip[0] == 10 || (ip[0] == 192 && ip[1] == 168) ||
+                             (ip[0] == 169 && ip[1] == 254) ||
+                             (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31);
+    if (virtual_lan) {
+        return;
+    }
+    LOG_INFO(Service, "[NEXPROBE] fd={} proxy->real host {} socket for non-LAN {}.{}.{}.{}:{}", fd,
+             d.is_connection_based ? "tcp" : "udp", ip[0], ip[1], ip[2], ip[3], dest.portno);
+    auto real = std::make_shared<Network::Socket>();
+    real->Initialize(d.host_domain, d.host_type, d.host_protocol);
+    if ((d.flags & Network::FLAG_O_NONBLOCK) != 0) {
+        real->SetNonBlock(true);
+    }
+    std::string bind_msg = "none";
+    bool fallback = false;
+    if (d.requested_bind_addr) {
+        Network::SockAddrIn want = *d.requested_bind_addr;
+        Network::Errno e = real->Bind(want);
+        if (e != Network::Errno::SUCCESS && want.portno != 0) {
+            LOG_WARNING(Service, "[NEXPROBE] swap fd={} requested port {} busy, falling back to 0",
+                        fd, want.portno);
+            fallback = true;
+            // a failed bind may leave the socket unusable; use a fresh one
+            real = std::make_shared<Network::Socket>();
+            real->Initialize(d.host_domain, d.host_type, d.host_protocol);
+            if ((d.flags & Network::FLAG_O_NONBLOCK) != 0) {
+                real->SetNonBlock(true);
+            }
+            want.portno = 0;
+            e = real->Bind(want);
+        }
+        bind_msg = fmt::format("port {} errno {}", d.requested_bind_addr->portno, static_cast<s32>(e));
+    }
+    NexProbeFileWrite(fmt::format("[NEXPROBE] swap fd={} proxy->host {} dest={}.{}.{}.{}:{} rebind={}\n",
+                                  fd, d.is_connection_based ? "tcp" : "udp", ip[0], ip[1], ip[2],
+                                  ip[3], dest.portno, bind_msg));
+    {
+        const auto [la, le] = real->GetSockName();
+        NexProbeFileWrite(fmt::format(
+            "[NEXPROBE] swap fd={} requested_port={} real_port={} fallback={}\n", fd,
+            d.requested_bind_addr ? static_cast<s32>(d.requested_bind_addr->portno) : -1,
+            la.portno, fallback ? "yes" : "no"));
+        NexProbeFileWrite(fmt::format(
+            "[NEXPROBE] swap fd={} local socket {}.{}.{}.{}:{} (getsockname errno {}, bound_rec={})\n",
+            fd, la.ip[0], la.ip[1], la.ip[2], la.ip[3], la.portno, static_cast<s32>(le),
+            d.bound_addr ? static_cast<s32>(d.bound_addr->portno) : -1));
+    }
+    d.socket = std::move(real);
+    d.is_proxy = false;
 }
 
 Errno BSD::ConnectImpl(s32 fd, std::span<const u8> addr) {
@@ -666,7 +796,10 @@ Errno BSD::ConnectImpl(s32 fd, std::span<const u8> addr) {
         return Errno::BADF;
     }
 
-    ASSERT(addr.size() >= 16);
+    if (addr.size() < 16) {
+        LOG_ERROR(Service, "[NEXPROBE] connect fd={} bad addr size {}", fd, addr.size());
+        return Errno::INVAL;
+    }
     if (!file_descriptors[fd]->socket) {
         LOG_WARNING(Service, "Uninitialized socket");
         return Errno::BADF;
@@ -674,6 +807,14 @@ Errno BSD::ConnectImpl(s32 fd, std::span<const u8> addr) {
 
     auto addr_in = GetValue<SockAddrIn>(addr);
     CensusCall(fd, "connect", Translate(addr_in));
+    LOG_INFO(Service, "[NEXPROBE] connect fd={} {}.{}.{}.{}:{} proto={}", fd, addr_in.ip[0],
+             addr_in.ip[1], addr_in.ip[2], addr_in.ip[3], addr_in.portno,
+             file_descriptors[fd]->is_connection_based ? "stream/tcp" : "dgram/udp");
+
+    // [NEXPROBE] While in a room every socket is a ProxySocket whose Connect is a stub. A TCP
+    // connect to a non-LAN / loopback address is real internet traffic (e.g. NEX replacement
+    // host), so swap in a real host socket for it.
+    MaybeSwapProxyToHost(fd, Translate(addr_in));
 
     const Errno result = Translate(file_descriptors[fd]->socket->Connect(Translate(addr_in)));
 
@@ -896,6 +1037,12 @@ std::pair<s32, Errno> BSD::RecvImpl(s32 fd, u32 flags, std::vector<u8>& message)
         descriptor.socket->SetNonBlock(false);
     }
 
+    if (!descriptor.is_connection_based) {
+        NexProbeUdp(fmt::format("recv RESULT fd={} ret={} errno={} proxy={} data={}", fd, ret,
+                                static_cast<s32>(bsd_errno), descriptor.is_proxy,
+                                NexProbeHex(message, ret)));
+    }
+
     return {ret, bsd_errno};
 }
 
@@ -931,6 +1078,18 @@ std::pair<s32, Errno> BSD::RecvFromImpl(s32 fd, u32 flags, std::vector<u8>& mess
     // Restore original state
     if ((descriptor.flags & FLAG_O_NONBLOCK) == 0) {
         descriptor.socket->SetNonBlock(false);
+    }
+
+    if (p_addr_in) {
+        if (ret >= 0) {
+            NexProbeUdp(fmt::format("recvfrom RESULT fd={} ret={} src={}.{}.{}.{}:{} proxy={} data={}",
+                                    fd, ret, addr_in.ip[0], addr_in.ip[1], addr_in.ip[2],
+                                    addr_in.ip[3], addr_in.portno, descriptor.is_proxy,
+                                    NexProbeHex(message, ret)));
+        } else {
+            NexProbeUdp(fmt::format("recvfrom RESULT fd={} ret={} errno={} proxy={}", fd, ret,
+                                    static_cast<s32>(bsd_errno), descriptor.is_proxy));
+        }
     }
 
     if (p_addr_in) {
@@ -975,10 +1134,28 @@ std::pair<s32, Errno> BSD::SendToImpl(s32 fd, u32 flags, std::span<const u8> mes
         auto guest_addr_in = GetValue<SockAddrIn>(addr);
         addr_in = Translate(guest_addr_in);
         p_addr_in = &addr_in;
+        LOG_INFO(Service, "[NEXPROBE] connect sendto fd={} {}.{}.{}.{}:{} len={} proto={}", fd,
+                 guest_addr_in.ip[0], guest_addr_in.ip[1], guest_addr_in.ip[2],
+                 guest_addr_in.ip[3], guest_addr_in.portno, message.size(),
+                 file_descriptors[fd]->is_connection_based ? "stream/tcp" : "dgram/udp");
     }
 
     CensusCall(fd, "sendto");
-    return Translate(file_descriptors[fd]->socket->SendTo(flags, message, p_addr_in));
+    if (p_addr_in && !file_descriptors[fd]->is_connection_based) {
+        MaybeSwapProxyToHost(fd, *p_addr_in);
+    }
+    const auto result = Translate(file_descriptors[fd]->socket->SendTo(flags, message, p_addr_in));
+    if (p_addr_in && !file_descriptors[fd]->is_connection_based) {
+        std::string hex;
+        for (size_t i = 0; i < (std::min)(message.size(), size_t{512}); ++i) {
+            hex += fmt::format("{:02x}", message[i]);
+        }
+        NexProbeUdp(fmt::format("sendto fd={} {}.{}.{}.{}:{} len={} proxy={} -> {} errno {} data={}",
+                                fd, addr_in.ip[0], addr_in.ip[1], addr_in.ip[2], addr_in.ip[3],
+                                addr_in.portno, message.size(), file_descriptors[fd]->is_proxy,
+                                result.first, static_cast<s32>(result.second), hex));
+    }
+    return result;
 }
 
 Errno BSD::CloseImpl(s32 fd) {

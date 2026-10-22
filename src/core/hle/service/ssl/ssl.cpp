@@ -4,6 +4,14 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <variant>
+
+#include <fmt/format.h>
+
+#include "common/fs/path_util.h"
 #include "common/string_util.h"
 
 #include "core/core.h"
@@ -21,6 +29,54 @@
 #include "core/internal_network/sockets.h"
 
 namespace Service::SSL {
+
+namespace {
+/// [NEXPROBE] flushed side file so the trace survives a crash.
+void NexProbeFileWrite(const std::string& line) {
+    const auto path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "nexprobe.txt";
+    if (FILE* f = std::fopen(path.string().c_str(), "ab")) {
+        std::fwrite(line.data(), 1, line.size(), f);
+        std::fflush(f);
+        std::fclose(f);
+    }
+}
+
+/// Logs a line, collapsing consecutive identical lines (per call site key) into a repeat count.
+class RepeatLimiter {
+public:
+    void Log(const void* conn, const std::string& line) {
+        std::scoped_lock lk{mtx};
+        if (conn == last_conn && line == last_line) {
+            ++repeats;
+            return;
+        }
+        FlushLocked();
+        last_conn = conn;
+        last_line = line;
+        NexProbeFileWrite(fmt::format("[NEXPROBE] ssl conn={} {}\n", conn, line));
+    }
+    void Flush() {
+        std::scoped_lock lk{mtx};
+        FlushLocked();
+    }
+
+private:
+    void FlushLocked() {
+        if (repeats > 0) {
+            NexProbeFileWrite(fmt::format("[NEXPROBE] ssl conn={} (previous line repeated {} more times)\n",
+                                          last_conn, repeats));
+        }
+        repeats = 0;
+        last_line.clear();
+        last_conn = nullptr;
+    }
+    std::mutex mtx;
+    const void* last_conn = nullptr;
+    std::string last_line;
+    u64 repeats = 0;
+};
+RepeatLimiter g_probe;
+} // namespace
 
 // This is nn::ssl::sf::CertificateFormat
 enum class CertificateFormat : u32 {
@@ -88,7 +144,7 @@ public:
             {10, &ISslConnection::Read, "Read"},
             {11, &ISslConnection::Write, "Write"},
             {12, &ISslConnection::Pending, "Pending"},
-            {13, nullptr, "Peek"},
+            {13, &ISslConnection::Peek, "Peek"},
             {14, nullptr, "Poll"},
             {15, nullptr, "GetVerifyCertError"},
             {16, nullptr, "GetNeededServerCertBufferSize"},
@@ -122,6 +178,9 @@ public:
     }
 
     ~ISslConnection() {
+        g_probe.Log(this, fmt::format("Close fd_to_close={} do_not_close_socket={}",
+                                      fd_to_close.value_or(-1), do_not_close_socket));
+        g_probe.Flush();
         shared_data->connection_count--;
         if (fd_to_close.has_value()) {
             const s32 fd = *fd_to_close;
@@ -161,13 +220,17 @@ private:
         ASSERT_OR_EXECUTE(bsd, { return ResultInternalError; });
 
         auto const res_v = bsd->DuplicateSocketImpl(fd);
+        g_probe.Log(this, fmt::format("SetSocketDescriptor fd={} dup_ok={} do_not_close={}", fd,
+                                      std::holds_alternative<s32>(res_v), do_not_close_socket));
         if (auto *res = std::get_if<s32>(&res_v)) {
             const s32 duplicated_fd = *res;
+            // Upstream semantics: with DoNotCloseSocket the guest keeps its own fd and we close
+            // the duplicate on destruction; otherwise the guest receives the duplicate.
             if (do_not_close_socket) {
-                *out_fd = duplicated_fd;
-            } else {
                 *out_fd = -1;
                 fd_to_close = duplicated_fd;
+            } else {
+                *out_fd = duplicated_fd;
             }
             std::optional<std::shared_ptr<Network::SocketBase>> sock = bsd->GetSocket(duplicated_fd);
             if (!sock.has_value()) {
@@ -175,6 +238,12 @@ private:
                 return ResultInvalidSocket;
             }
             socket = std::move(*sock);
+            {
+                const auto [peer, perr] = socket->GetPeerName();
+                g_probe.Log(this, fmt::format("socket dup_fd={} peer={}.{}.{}.{}:{} (errno {})",
+                                              duplicated_fd, peer.ip[0], peer.ip[1], peer.ip[2],
+                                              peer.ip[3], peer.portno, static_cast<s32>(perr)));
+            }
             backend->SetSocket(socket);
             return ResultSuccess;
         }
@@ -219,6 +288,8 @@ private:
         ASSERT_OR_EXECUTE(!did_handshake && socket, { return ResultNoSocket; });
         Result res = backend->DoHandshake();
         did_handshake = res.IsSuccess();
+        g_probe.Log(this, fmt::format("DoHandshake -> 0x{:X} ({})", res.raw,
+                                      did_handshake ? "ok" : "not done"));
         return res;
     }
 
@@ -257,7 +328,10 @@ private:
     Result ReadImpl(std::vector<u8>* out_data) {
         ASSERT_OR_EXECUTE(did_handshake, { return ResultInternalError; });
         size_t actual_size{};
+        const size_t req = out_data->size();
         Result res = backend->Read(&actual_size, *out_data);
+        g_probe.Log(this, fmt::format("Read req={} -> 0x{:X} got={}", req, res.raw,
+                                      res == ResultSuccess ? actual_size : 0));
         if (res != ResultSuccess) {
             return res;
         }
@@ -267,7 +341,24 @@ private:
 
     Result WriteImpl(size_t* out_size, std::span<const u8> data) {
         ASSERT_OR_EXECUTE(did_handshake, { return ResultInternalError; });
-        return backend->Write(out_size, data);
+        const Result res = backend->Write(out_size, data);
+        g_probe.Log(this, fmt::format("Write req={} -> 0x{:X} wrote={}", data.size(), res.raw,
+                                      res == ResultSuccess ? *out_size : 0));
+        return res;
+    }
+
+    Result PeekImpl(std::vector<u8>* out_data) {
+        ASSERT_OR_EXECUTE(did_handshake, { return ResultInternalError; });
+        size_t actual_size{};
+        const size_t req = out_data->size();
+        const Result res = backend->Peek(&actual_size, *out_data);
+        g_probe.Log(this, fmt::format("Peek req={} -> 0x{:X} got={}", req, res.raw,
+                                      res == ResultSuccess ? actual_size : 0));
+        if (res != ResultSuccess) {
+            return res;
+        }
+        out_data->resize(actual_size);
+        return res;
     }
 
     Result PendingImpl(s32* out_pending) {
@@ -288,6 +379,7 @@ private:
 
     void SetHostName(HLERequestContext& ctx) {
         const std::string hostname = Common::StringFromBuffer(ctx.ReadBuffer());
+        g_probe.Log(this, fmt::format("SetHostName '{}'", hostname));
         const Result res = SetHostNameImpl(hostname);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(res);
@@ -370,6 +462,21 @@ private:
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(res);
         rb.Push(static_cast<u32>(write_size));
+    }
+
+    void Peek(HLERequestContext& ctx) {
+        std::vector<u8> output_bytes(ctx.GetWriteBufferSize());
+        const Result res = PeekImpl(&output_bytes);
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(res);
+        if (res == ResultSuccess) {
+            rb.Push(static_cast<u32>(output_bytes.size()));
+            if (!output_bytes.empty()) {
+                ctx.WriteBuffer(output_bytes);
+            }
+        } else {
+            rb.Push(static_cast<u32>(0));
+        }
     }
 
     void Pending(HLERequestContext& ctx) {

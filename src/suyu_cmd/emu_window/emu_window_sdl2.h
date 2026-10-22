@@ -90,6 +90,11 @@ protected:
     /// F11 / Alt+Enter: leave fullscreen, or enter it as Fullscreen() does.
     void ToggleFullscreen();
 
+    /// Window close request: true = exit (no prompt when disabled, already closing or the box
+    /// can't be shown), false = the user chose to keep playing.
+    bool ConfirmClose();
+    bool confirm_open = false;
+
     /// Called when a configuration change affects the minimal size of the window
     void OnMinimalClientAreaChangeRequest(std::pair<u32, u32> minimal_size) override;
 

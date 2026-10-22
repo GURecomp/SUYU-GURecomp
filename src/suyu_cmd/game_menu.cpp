@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -113,6 +114,7 @@ int g_port{24872};
 int g_max_players{4};
 int g_startup{}; // 0 off, 1 host, 2 join
 bool g_reconnect{true};
+char g_online_server[96]{};
 std::string g_mp_message;
 // Addresses stay hidden until clicked (streams, screenshots); hidden again each time the menu
 // opens.
@@ -712,7 +714,8 @@ void DrawPublicRooms() {
 
 void DrawRoom();
 
-void DrawMultiplayer() {
+// "Local Multiplayer" tab: suyu rooms, Ryujinx LDN and the public room list.
+void DrawLocalMultiplayer() {
     // The switch: which network carries local play (applies at once). Both = automatic.
     static std::string mode_message;
     using LdnMode = Multiplayer::LdnMode;
@@ -735,16 +738,6 @@ void DrawMultiplayer() {
         ImGui::TextColored(kRed, "Couldn't switch: %s", mode_message.c_str());
     }
 
-    // One name for both networks: suyu rooms and Ryujinx lobbies (Public rooms lists).
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
-    ImGui::InputText("Name", g_nick, sizeof(g_nick));
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        Multiplayer::Save(FieldsToConfig());
-    }
-    HelpMarker("Shown to other players in suyu rooms and Ryujinx lobbies (Public rooms). "
-               "4-20 characters: letters, digits, space, . _ -. Applies to the next room or "
-               "lobby you host or join.");
-
     const std::string bridge = Multiplayer::BridgeStatusText();
     if (!bridge.empty()) {
         ImGui::TextColored(kGrey, "%s", bridge.c_str());
@@ -761,6 +754,57 @@ void DrawMultiplayer() {
         }
         if (ImGui::BeginTabItem("Public rooms")) {
             DrawPublicRooms();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+// "Online Multiplayer" tab: your online (NEX) server, separate from the local networks.
+void DrawOnlineMultiplayer() {
+    static bool online_loaded = false;
+    if (!online_loaded) {
+        online_loaded = true;
+        const std::string v = GS::Value("Multiplayer", "online_server_host");
+        std::snprintf(g_online_server, sizeof(g_online_server), "%s", v.c_str());
+    }
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+    ImGui::InputTextWithHint("Online Server IP", "IP or host (empty = off)", g_online_server,
+                             sizeof(g_online_server));
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        std::string v = g_online_server;
+        v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c); }),
+                v.end());
+        if (const auto colon = v.find(':'); colon != std::string::npos) {
+            v.resize(colon); // ports are fixed by the game
+        }
+        std::snprintf(g_online_server, sizeof(g_online_server), "%s", v.c_str());
+        GS::SetValue("Multiplayer", "online_server_host", v);
+    }
+    HelpMarker("Your online (NEX) server: an IPv4 address or host name. host:port keeps only the "
+               "host (ports are fixed by the game). Empty = off. Applies the next time the game "
+               "connects; set it before booting. Separate from Local Multiplayer.");
+    ImGui::TextColored(kGrey, "Online server: %s", g_online_server[0] ? g_online_server : "(off)");
+}
+
+void DrawMultiplayer() {
+    // One name for every network: online server, suyu rooms and Ryujinx lobbies.
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+    ImGui::InputText("Name", g_nick, sizeof(g_nick));
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        Multiplayer::Save(FieldsToConfig());
+    }
+    HelpMarker("Shown to other players online, in suyu rooms and in Ryujinx lobbies (Public "
+               "rooms). 4-20 characters: letters, digits, space, . _ -. Applies to the next room "
+               "or lobby you host or join.");
+
+    if (ImGui::BeginTabBar("mpmain")) {
+        if (ImGui::BeginTabItem("Local Multiplayer")) {
+            DrawLocalMultiplayer();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Online Multiplayer")) {
+            DrawOnlineMultiplayer();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();

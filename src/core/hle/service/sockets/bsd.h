@@ -6,6 +6,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 #include <variant>
@@ -48,6 +49,13 @@ private:
         std::shared_ptr<Network::SocketBase> socket;
         s32 flags = 0;
         bool is_connection_based = false;
+        bool is_proxy = false; // set when socket is a ProxySocket (RTTI is disabled)
+        // [NEXPROBE] creation params so a proxy socket can be swapped for a host socket
+        Network::Domain host_domain{};
+        Network::Type host_type{};
+        Network::Protocol host_protocol{};
+        std::optional<Network::SockAddrIn> bound_addr; // last Bind, replayed on proxy->host swap
+        std::optional<Network::SockAddrIn> requested_bind_addr; // game-requested bind (host order)
     };
 
     struct PollWork {
@@ -77,7 +85,7 @@ private:
         void Response(HLERequestContext& ctx);
 
         s32 fd;
-        std::span<const u8> addr;
+        std::vector<u8> addr;
         Errno bsd_errno{};
     };
 
@@ -110,7 +118,7 @@ private:
 
         s32 fd;
         u32 flags;
-        std::span<const u8> message;
+        std::vector<u8> message;
         s32 ret{};
         Errno bsd_errno{};
     };
@@ -121,8 +129,8 @@ private:
 
         s32 fd;
         u32 flags;
-        std::span<const u8> message;
-        std::span<const u8> addr;
+        std::vector<u8> message;
+        std::vector<u8> addr;
         s32 ret{};
         Errno bsd_errno{};
     };
@@ -160,6 +168,8 @@ private:
                                    s32 nfds, s32 timeout);
     std::pair<s32, Errno> AcceptImpl(s32 fd, std::vector<u8>& write_buffer);
     Errno BindImpl(s32 fd, std::span<const u8> addr);
+    /// [NEXPROBE] swaps a ProxySocket for a real host socket when dest is not in the LDN subnet.
+    void MaybeSwapProxyToHost(s32 fd, const Network::SockAddrIn& dest);
     Errno ConnectImpl(s32 fd, std::span<const u8> addr);
     Errno GetPeerNameImpl(s32 fd, std::vector<u8>& write_buffer);
     Errno GetSockNameImpl(s32 fd, std::vector<u8>& write_buffer);
