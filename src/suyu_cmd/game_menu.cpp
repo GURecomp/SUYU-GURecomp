@@ -145,16 +145,16 @@ constexpr ButtonRow kButtonRows[] = {
     {Settings::NativeButton::R, "R"},
     {Settings::NativeButton::ZL, "ZL"},
     {Settings::NativeButton::ZR, "ZR"},
-    {Settings::NativeButton::Plus, "Plus (+)"},
-    {Settings::NativeButton::Minus, "Minus (-)"},
-    {Settings::NativeButton::DUp, "D-pad up"},
-    {Settings::NativeButton::DDown, "D-pad down"},
-    {Settings::NativeButton::DLeft, "D-pad left"},
-    {Settings::NativeButton::DRight, "D-pad right"},
-    {Settings::NativeButton::LStick, "Left stick press"},
-    {Settings::NativeButton::RStick, "Right stick press"},
-    {Settings::NativeButton::Home, "Home"},
-    {Settings::NativeButton::Screenshot, "Capture"},
+    {Settings::NativeButton::Plus, "加号 (+)"},
+    {Settings::NativeButton::Minus, "减号 (-)"},
+    {Settings::NativeButton::DUp, "十字键上"},
+    {Settings::NativeButton::DDown, "十字键下"},
+    {Settings::NativeButton::DLeft, "十字键左"},
+    {Settings::NativeButton::DRight, "十字键右"},
+    {Settings::NativeButton::LStick, "左摇杆按下"},
+    {Settings::NativeButton::RStick, "右摇杆按下"},
+    {Settings::NativeButton::Home, "主页"},
+    {Settings::NativeButton::Screenshot, "截图"},
 };
 
 void UpdateGate() {
@@ -162,7 +162,7 @@ void UpdateGate() {
 }
 
 void ReadMenuSettings() {
-    std::string key = GS::Value("Menu", "key");
+    std::string key = GS::Value("菜单", "key");
     if (key.empty()) {
         key = "F10";
     }
@@ -173,11 +173,11 @@ void ReadMenuSettings() {
         g_key = SDL_GetScancodeFromName(key.c_str());
         g_key_name = g_key == SDL_SCANCODE_UNKNOWN ? std::string{} : key;
         if (g_key == SDL_SCANCODE_UNKNOWN) {
-            LOG_WARNING(Frontend, "game menu: unknown key name '{}' in [Menu] key", key);
+            LOG_WARNING(Frontend, "游戏菜单：[Menu] 键中有未知按键名“{}”", key);
         }
     }
 
-    std::string combo = GS::Value("Menu", "pad_combo");
+    std::string combo = GS::Value("菜单", "pad_combo");
     if (combo.empty()) {
         combo = "back+start";
     }
@@ -191,7 +191,7 @@ void ReadMenuSettings() {
                 start, plus == std::string::npos ? std::string::npos : plus - start);
             const SDL_GamepadButton b = SDL_GetGamepadButtonFromString(name.c_str());
             if (b == SDL_GAMEPAD_BUTTON_INVALID) {
-                LOG_WARNING(Frontend, "game menu: unknown button '{}' in [Menu] pad_combo", name);
+                LOG_WARNING(Frontend, "游戏菜单：[Menu] pad_combo 中有未知按钮“{}”", name);
                 g_combo.clear();
                 break;
             }
@@ -260,7 +260,7 @@ void OpenPath(const std::filesystem::path& p) {
         }
     }
     if (!SDL_OpenURL(url.c_str())) {
-        LOG_WARNING(Frontend, "game menu: couldn't open {}: {}", url, SDL_GetError());
+        LOG_WARNING(Frontend, "游戏菜单：无法打开 {}：{}", url, SDL_GetError());
     }
 }
 
@@ -321,33 +321,33 @@ void PollCapture() {
         Notify(fmt::format("{} = {}", label, Controls::BindingText(analog, index)));
     } else if (now - g_capture.started > kCaptureTimeout) {
         EndCapture();
-        Notify("Nothing pressed - unchanged");
+        Notify("未按下任何按键 - 保持不变");
     }
 }
 
 void DrawControls() {
-    ImGui::Text("Player 1 uses:");
+    ImGui::Text("玩家 1 使用：");
     ImGui::SameLine();
     ImGui::TextColored(kGreen, "%s", Controls::PlayerOneText().c_str());
-    ImGui::TextColored(kGrey, "Set: %s", Controls::SetByText().c_str());
-    HelpMarker("A controller you plug in is used automatically as long as you haven't chosen "
-               "your controls yourself. Anything you change here counts as your choice and is "
-               "never replaced; 'Back to automatic' undoes that.");
+    ImGui::TextColored(kGrey, "设置：%s", Controls::SetByText().c_str());
+    HelpMarker("只要您还没有自行选择"
+               "控制方式。您在此处的任何更改都算作您的选择，并且"
+               "绝不会被替换；“恢复自动”可撤销该操作。");
 
-    SectionTitle("Controller");
+    SectionTitle("控制器");
     const auto devices = Controls::Devices();
     if (devices.empty()) {
-        ImGui::TextColored(kYellow, "No controller connected.");
-        ImGui::TextWrapped("Plug one in: it's picked up automatically unless you chose your "
-                           "controls yourself (then pick it here).");
+        ImGui::TextColored(kYellow, "未连接控制器。");
+        ImGui::TextWrapped("插入一个控制器：它会自动被识别，除非您已自行选择"
+                           "控制方式（此时请在此处选择）。");
     } else {
         g_device_pick = std::clamp(g_device_pick, 0, static_cast<int>(devices.size()) - 1);
         const std::string current =
-            devices[static_cast<std::size_t>(g_device_pick)].Get("display", "Controller");
+            devices[static_cast<std::size_t>(g_device_pick)].Get("display", "控制器");
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
         if (ImGui::BeginCombo("##device", current.c_str())) {
             for (std::size_t i = 0; i < devices.size(); ++i) {
-                const std::string name = devices[i].Get("display", "Controller");
+                const std::string name = devices[i].Get("display", "控制器");
                 const bool selected = static_cast<int>(i) == g_device_pick;
                 if (ImGui::Selectable(fmt::format("{}##{}", name, i).c_str(), selected)) {
                     g_device_pick = static_cast<int>(i);
@@ -356,35 +356,35 @@ void DrawControls() {
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Use this controller")) {
+        if (ImGui::Button("使用此控制器")) {
             Controls::UseDevice(devices[static_cast<std::size_t>(g_device_pick)], "player");
-            Notify("Player 1: " + current);
+            Notify("玩家 1：" + current);
         }
     }
-    if (ImGui::Button("Use keyboard (default keys)")) {
+    if (ImGui::Button("使用键盘（默认按键）")) {
         Controls::UseDefaultKeyboard("player");
-        Notify("Player 1: keyboard");
+        Notify("玩家 1：键盘");
     }
     ImGui::SameLine();
-    if (ImGui::Button("Back to automatic")) {
+    if (ImGui::Button("恢复自动")) {
         Controls::ResetToAutomatic();
-        Notify("Controls: automatic (" + Controls::PlayerOneText() + ")");
+        Notify("控制：自动（" + Controls::PlayerOneText() + ")");
     }
-    HelpMarker("Default keys, and the first connected controller is used now and whenever "
-               "one is plugged in.");
+    HelpMarker("默认按键，现在会使用第一个连接的控制器，并且每当"
+               "插入一个控制器时都会使用它。");
 
-    SectionTitle("Buttons");
-    if (ImGui::Button("Swap A and B")) {
+    SectionTitle("按键");
+    if (ImGui::Button("交换 A 和 B")) {
         Controls::SwapButtons(Settings::NativeButton::A, Settings::NativeButton::B);
-        Notify("Swapped A and B");
+        Notify("已交换 A 和 B");
     }
     ImGui::SameLine();
-    if (ImGui::Button("Swap X and Y")) {
+    if (ImGui::Button("交换 X 和 Y")) {
         Controls::SwapButtons(Settings::NativeButton::X, Settings::NativeButton::Y);
-        Notify("Swapped X and Y");
+        Notify("已交换 X 和 Y");
     }
-    HelpMarker("The game uses Nintendo's layout: A is the right face button. Swap if you want "
-               "the bottom button to confirm, as on Xbox/PlayStation pads.");
+    HelpMarker("游戏采用任天堂布局：A 是右侧面键。如果您希望"
+               "下方按键用于确认（如 Xbox/PlayStation 手柄），请交换。");
 
     const float table_height = ImGui::GetContentRegionAvail().y;
     if (ImGui::BeginTable("binds", 3,
@@ -392,9 +392,9 @@ void DrawControls() {
                               ImGuiTableFlags_BordersInnerH,
                           ImVec2(0.0f, table_height))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Switch input", ImGuiTableColumnFlags_WidthFixed,
+        ImGui::TableSetupColumn("切换输入", ImGuiTableColumnFlags_WidthFixed,
                                 ImGui::GetFontSize() * 9.0f);
-        ImGui::TableSetupColumn("Bound to");
+        ImGui::TableSetupColumn("绑定到");
         ImGui::TableSetupColumn("##actions", ImGuiTableColumnFlags_WidthFixed,
                                 ImGui::GetFontSize() * 8.0f);
         ImGui::TableHeadersRow();
@@ -406,17 +406,17 @@ void DrawControls() {
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(Controls::BindingText(analog, index).c_str());
             ImGui::TableNextColumn();
-            if (ImGui::SmallButton("Change")) {
+            if (ImGui::SmallButton("更改")) {
                 StartCapture(analog, index, label);
             }
             ImGui::SameLine();
-            if (ImGui::SmallButton("Clear")) {
+            if (ImGui::SmallButton("清除")) {
                 Controls::SetBinding(analog, index, {});
             }
             ImGui::PopID();
         };
-        row(true, Settings::NativeAnalog::LStick, "Left stick");
-        row(true, Settings::NativeAnalog::RStick, "Right stick");
+        row(true, Settings::NativeAnalog::LStick, "左摇杆");
+        row(true, Settings::NativeAnalog::RStick, "右摇杆");
         for (const auto& b : kButtonRows) {
             row(false, static_cast<std::size_t>(b.index), b.label);
         }
@@ -424,11 +424,11 @@ void DrawControls() {
     }
 
     if (g_capture.active) {
-        ImGui::OpenPopup("Press an input");
+        ImGui::OpenPopup("请按下一个输入");
     }
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("Press an input", nullptr,
+    if (ImGui::BeginPopupModal("请按下一个输入", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
         if (!g_capture.active) {
             ImGui::CloseCurrentPopup();
@@ -436,11 +436,11 @@ void DrawControls() {
             ImGui::Text("%s", g_capture.label.c_str());
             ImGui::Spacing();
             ImGui::TextUnformatted(g_capture.analog
-                                       ? "Move the stick you want for this, all the way once."
-                                       : "Press the button or key you want for this.");
+                                       ? "将想要用于此操作的摇杆推到底一次。"
+                                       : "按下您想用于此操作的按钮或按键。");
             const auto left = std::chrono::duration_cast<std::chrono::seconds>(
                 kCaptureTimeout - (Clock::now() - g_capture.started));
-            ImGui::TextColored(kGrey, "Esc cancels (%lld s left)",
+            ImGui::TextColored(kGrey, "按 Esc 取消（剩余 %lld 秒）",
                                static_cast<long long>(std::max<std::int64_t>(0, left.count())));
         }
         ImGui::EndPopup();
@@ -452,7 +452,7 @@ void DrawControls() {
 void DoJoin() {
     Multiplayer::Config c = FieldsToConfig();
     if (!Multiplayer::ParseInvite(g_invite, &c)) {
-        MpMessage("Enter the host's invite or address first (e.g. 26.12.34.56:24872).", true);
+        MpMessage("请先输入主持人的邀请码或地址（例如 26.12.34.56:24872）。", true);
         return;
     }
     std::string error;
@@ -460,11 +460,11 @@ void DoJoin() {
         Multiplayer::Save(c);
         CopyTo(g_pass, c.password);
         g_port = c.port;
-        MpMessage(g_show_join_address ? fmt::format("Joining {}:{} ...", c.address, c.port)
-                                      : std::string("Joining ..."),
+        MpMessage(g_show_join_address ? fmt::format("正在加入 {}:{}……", c.address, c.port)
+                                      : std::string("正在加入……"),
                   false);
     } else {
-        MpMessage("Couldn't join: " + error, true);
+        MpMessage("无法加入：" + error, true);
     }
 }
 
@@ -472,20 +472,20 @@ void DoJoin() {
 void DrawRyuLdn() {
     static bool show_server = false;
     const std::string status = Multiplayer::RyuLdnStatusText();
-    const bool ok = status.find("in a lobby") != std::string::npos;
-    const bool bad = status.find("no server") != std::string::npos ||
-                     status.find("not connected (") != std::string::npos;
+    const bool ok = status.find("在大厅中") != std::string::npos;
+    const bool bad = status.find("无服务器") != std::string::npos ||
+                     status.find("未连接（") != std::string::npos;
     ImGui::TextColored(ok ? kGreen : (bad ? kRed : kGrey), "%s", status.c_str());
     if (const std::string server = Multiplayer::RyuLdnServer(); !server.empty()) {
-        ImGui::TextColored(kGrey, "Server: %s", show_server ? server.c_str() : "(hidden)");
+        ImGui::TextColored(kGrey, "服务器：%s", show_server ? server.c_str() : "(hidden)");
         ImGui::SameLine();
-        if (ImGui::SmallButton(show_server ? "Hide##ryusrv" : "Show##ryusrv")) {
+        if (ImGui::SmallButton(show_server ? "隐藏##ryusrv" : "显示##ryusrv")) {
             show_server = !show_server;
         }
     }
     ImGui::TextWrapped(
-        "Lobbies are found and joined in the game itself (local wireless play), together with "
-        "Ryujinx players on the same server; the Public rooms tab lists them.");
+        "大厅可在游戏内查找并加入（本地无线游玩），并与"
+        "同一服务器上的 Ryujinx 玩家一起；公共房间标签页会列出这些大厅。");
 
     // Where the lobbies live: Ryujinx's public server, this PC, or a friend's PC.
     using Mode = Multiplayer::RyuLdnServerChoice::Mode;
@@ -503,30 +503,30 @@ void DrawRyuLdn() {
             choice_message = done;
             choice_bad = false;
         } else {
-            choice_message = "Couldn't switch: " + error;
+            choice_message = "无法切换：" + error;
             choice_bad = true;
         }
     };
 
-    SectionTitle("Server");
-    if (ImGui::RadioButton("Ryujinx public server", choice.mode == Mode::Public) &&
+    SectionTitle("服务器");
+    if (ImGui::RadioButton("Ryujinx 公共服务器", choice.mode == Mode::Public) &&
         choice.mode != Mode::Public) {
-        choose({Mode::Public, {}}, "Using Ryujinx's public server.");
+        choose({Mode::Public, {}}, "正在使用 Ryujinx 的公共服务器。");
     }
-    HelpMarker("ldn.ryujinx.app: everyone's public lobbies, no setup.");
-    if (ImGui::RadioButton("Host for friends (Radmin VPN)", choice.mode == Mode::Host) &&
+    HelpMarker("ldn.ryujinx.app：所有人的公共大厅，无需设置。");
+    if (ImGui::RadioButton("为好友主持（Radmin VPN）", choice.mode == Mode::Host) &&
         choice.mode != Mode::Host) {
-        choose({Mode::Host, {}}, "Your server is running; friends join your address.");
+        choose({Mode::Host, {}}, "您的服务器正在运行；好友可通过您的地址加入。");
     }
-    HelpMarker("This game runs the lobby server; friends connect to your address (Radmin VPN or "
-               "home network). Works without the public server. Windows may ask to allow the "
-               "game on the network: allow it.");
-    if (ImGui::RadioButton("Join a friend's server", choice.mode == Mode::Friend) &&
+    HelpMarker("本游戏会运行大厅服务器；好友可连接到您的地址（Radmin VPN 或"
+               "家庭网络）。无需公共服务器即可运行。Windows 可能会询问是否允许"
+               "游戏访问网络：请允许。");
+    if (ImGui::RadioButton("加入好友的服务器", choice.mode == Mode::Friend) &&
         choice.mode != Mode::Friend) {
         if (friend_address[0] != '\0') {
-            choose({Mode::Friend, friend_address}, "Using your friend's server.");
+            choose({Mode::Friend, friend_address}, "正在使用好友的服务器。");
         } else {
-            choice_message = "Enter your friend's address below, then press Use.";
+            choice_message = "在下方输入好友的地址，然后按“使用”。";
             choice_bad = false;
         }
     }
@@ -534,24 +534,24 @@ void DrawRyuLdn() {
     if (choice.mode == Mode::Host) {
         const auto own = Multiplayer::GetOwnServerStatus();
         if (own.running) {
-            ImGui::TextColored(kGreen, "Your server: %zu connected, %zu lobbies (port %u)",
+            ImGui::TextColored(kGreen, "您的服务器：%zu 个已连接，%zu 个大厅（端口 %u）",
                                own.connections, own.lobbies, own.port);
         } else {
-            ImGui::TextColored(kRed, "Your server isn't running%s%s", own.error.empty() ? "" : ": ",
+            ImGui::TextColored(kRed, "您的服务器未运行%s%s", own.error.empty() ? "" : ": ",
                                own.error.c_str());
         }
-        ImGui::TextUnformatted("Give friends one of these addresses:");
+        ImGui::TextUnformatted("将以下地址之一提供给好友：");
         const auto addresses = Multiplayer::LocalAddresses();
         for (std::size_t i = 0; i < addresses.size(); ++i) {
             const auto& a = addresses[i];
             ImGui::PushID(static_cast<int>(i) + 7000);
-            if (ImGui::SmallButton("Copy")) {
+            if (ImGui::SmallButton("复制")) {
                 ImGui::SetClipboardText(a.ip.c_str());
-                Notify("Address copied to the clipboard");
+                Notify("地址已复制到剪贴板");
             }
             ImGui::SameLine();
             const bool shown = g_shown_addresses.contains(i + 7000);
-            if (ImGui::SmallButton(shown ? a.ip.c_str() : "show address")) {
+            if (ImGui::SmallButton(shown ? a.ip.c_str() : "显示地址")) {
                 if (shown) {
                     g_shown_addresses.erase(i + 7000);
                 } else {
@@ -562,31 +562,31 @@ void DrawRyuLdn() {
             ImGui::TextUnformatted(a.label.c_str());
             ImGui::PopID();
         }
-        ImGui::TextWrapped("Friends with this game: Join a friend's server, paste the address. "
-                           "Ryujinx friends: Multiplayer mode RyuLDN with your address as the "
-                           "LDN server. Then host or search in the game's local play.");
+        ImGui::TextWrapped("使用本游戏的好友：加入好友的服务器，粘贴地址。"
+                           "Ryujinx 好友：多人模式 RyuLDN，以你的地址作为 "
+                           "LDN 服务器。然后在游戏的本地联机中主持或搜索。");
     }
 
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
     const bool enter = ImGui::InputTextWithHint(
-        "##friendsrv", "friend's address, e.g. 26.12.34.56", friend_address,
+        "##friendsrv", "好友地址，例如 26.12.34.56", friend_address,
         sizeof(friend_address),
         ImGuiInputTextFlags_EnterReturnsTrue |
             (show_friend ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password));
     ImGui::SameLine();
-    if (ImGui::Button(show_friend ? "Hide##fs" : "Show##fs")) {
+    if (ImGui::Button(show_friend ? "隐藏##fs" : "显示##fs")) {
         show_friend = !show_friend;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Paste##fs")) {
+    if (ImGui::Button("粘贴##fs")) {
         if (char* clip = SDL_GetClipboardText()) {
             CopyTo(friend_address, clip);
             SDL_free(clip);
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Use##fs") || enter) {
-        choose({Mode::Friend, friend_address}, "Using your friend's server.");
+    if (ImGui::Button("使用##fs") || enter) {
+        choose({Mode::Friend, friend_address}, "正在使用好友的服务器。");
     }
     if (!choice_message.empty()) {
         ImGui::TextColored(choice_bad ? kRed : kGrey, "%s", choice_message.c_str());
@@ -607,25 +607,25 @@ void DrawPublicRooms() {
     }
 
     if (!Multiplayer::UsingRyuLdn()) {
-        ImGui::TextColored(kYellow, "Local play is set to suyu rooms only (ini backend = room).");
+        ImGui::TextColored(kYellow, "本地联机已设为仅使用 suyu 房间（ini backend = room）。");
     }
-    if (ImGui::Button("Refresh")) {
+    if (ImGui::Button("刷新")) {
         Multiplayer::RefreshPublicRooms();
     }
     ImGui::SameLine();
     if (list.refreshing) {
-        ImGui::TextColored(kGrey, "Looking for lobbies...");
+        ImGui::TextColored(kGrey, "正在查找大厅……");
     } else if (list.refreshed) {
         const auto age = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - list.last_refresh);
         ImGui::TextColored(kGrey, "%zu lobbies%s  -  updated %lld s ago", list.rooms.size(),
-                           list.private_passphrase ? " (your passphrase)" : "",
+                           list.private_passphrase ? "（你的密码）" : "",
                            static_cast<long long>(age.count()));
     }
-    HelpMarker("Lobbies of this game that you (and Ryujinx players) can join: open local play "
-               "in the game and search, as on a Switch. Hosting a lobby in the game puts it "
-               "here for everyone. With a passphrase set, only lobbies with the same passphrase "
-               "show up.");
+    HelpMarker("你（以及 Ryujinx 玩家）可加入的本游戏大厅：打开本地联机"
+               "并在游戏中搜索，如同在 Switch 上。在游戏中主持大厅会将其"
+               "显示给所有人。设置密码后，只有相同密码的大厅"
+               "才会显示。");
     for (const auto& error : list.errors) {
         ImGui::TextColored(kRed, "%s", error.c_str());
     }
@@ -636,10 +636,10 @@ void DrawPublicRooms() {
                               ImGuiTableFlags_BordersInnerH,
                           ImVec2(0.0f, rows_height))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Host");
-        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthFixed,
+        ImGui::TableSetupColumn("主持");
+        ImGui::TableSetupColumn("玩家", ImGuiTableColumnFlags_WidthFixed,
                                 ImGui::GetFontSize() * 5.0f);
-        ImGui::TableSetupColumn("Server", ImGuiTableColumnFlags_WidthFixed,
+        ImGui::TableSetupColumn("服务器", ImGuiTableColumnFlags_WidthFixed,
                                 ImGui::GetFontSize() * 6.0f);
         ImGui::TableHeadersRow();
         for (const auto& room : list.rooms) {
@@ -661,52 +661,52 @@ void DrawPublicRooms() {
         ImGui::EndTable();
     }
     if (list.refreshed && list.rooms.empty() && list.errors.empty()) {
-        ImGui::TextColored(kGrey, "No open lobbies right now.");
+        ImGui::TextColored(kGrey, "当前没有开放的大厅。");
     }
 
-    SectionTitle("Servers");
-    ImGui::BulletText("This PC - your lobbies are hosted here while you host");
-    ImGui::BulletText("Ryujinx (%s) - public lobbies", Multiplayer::DefaultRyuLdnHost);
-    HelpMarker("Hosting opens a room for suyu players and a server for Ryujinx players on this "
-               "PC; the game's local-play search also lists Ryujinx's public lobbies and those "
-               "of the friend whose room you joined. game_settings.ini ryuldn_public = off "
-               "leaves the public server out.");
+    SectionTitle("服务器");
+    ImGui::BulletText("本机 - 你主持时，大厅会在此托管");
+    ImGui::BulletText("Ryujinx（%s） - 公共大厅", Multiplayer::DefaultRyuLdnHost);
+    HelpMarker("主持会为 suyu 玩家开启房间，并在此 PC 上"
+               "为 Ryujinx 玩家开启服务器；游戏内搜索也列出 Ryujinx 公共大厅及"
+               "你所加入房间的好友的大厅。game_settings.ini ryuldn_public = off "
+               "会排除公共服务器。");
     const auto extra = Multiplayer::ExtraRyuLdnServers();
     for (std::size_t i = 0; i < extra.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
-        ImGui::BulletText("Server %zu: %s", i + 2,
+        ImGui::BulletText("服务器 %zu：%s", i + 2,
                           show_servers ? extra[i].c_str() : "(hidden)");
         ImGui::SameLine();
         if (ImGui::SmallButton("x")) {
             Multiplayer::RemoveExtraRyuLdnServer(extra[i]);
-            server_message = "Removed.";
+            server_message = "已移除。";
         }
         ImGui::PopID();
     }
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
     const bool enter = ImGui::InputTextWithHint(
-        "##newserver", "another server, host or host:port", new_server, sizeof(new_server),
+        "##newserver", "其他服务器、主机或主机:端口", new_server, sizeof(new_server),
         ImGuiInputTextFlags_EnterReturnsTrue |
             (show_servers ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password));
     ImGui::SameLine();
-    if (ImGui::Button("Add") || enter) {
+    if (ImGui::Button("添加") || enter) {
         std::string error;
         if (Multiplayer::AddExtraRyuLdnServer(new_server, &error)) {
             new_server[0] = '\0';
             server_message = error.empty()
-                                 ? "Added: its lobbies show up here and in the game's search."
-                                 : "Added; " + error;
+                                 ? "已添加：其大厅会显示在此处及游戏搜索中。"
+                                 : "已添加；" + error;
             Multiplayer::RefreshPublicRooms();
         } else {
-            server_message = "Couldn't add: " + error;
+            server_message = "无法添加：" + error;
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button(show_servers ? "Hide##srv" : "Show##srv")) {
+    if (ImGui::Button(show_servers ? "隐藏##srv" : "显示##srv")) {
         show_servers = !show_servers;
     }
-    HelpMarker("More RyuLdn servers (for example one your group runs): their lobbies are listed "
-               "and joinable too, next to the Ryujinx server's.");
+    HelpMarker("更多 RyuLdn 服务器（例如你团队运行的）：它们的大厅会"
+               "列出并可加入，与 Ryujinx 服务器并列。");
     if (!server_message.empty()) {
         ImGui::TextColored(kGrey, "%s", server_message.c_str());
     }
@@ -714,13 +714,13 @@ void DrawPublicRooms() {
 
 void DrawRoom();
 
-// "Local Multiplayer" tab: suyu rooms, Ryujinx LDN and the public room list.
+// "本地多人游戏" tab: suyu rooms, Ryujinx LDN and the public room list.
 void DrawLocalMultiplayer() {
     // The switch: which network carries local play (applies at once). Both = automatic.
     static std::string mode_message;
     using LdnMode = Multiplayer::LdnMode;
     const LdnMode mode = Multiplayer::CurrentLdnMode();
-    ImGui::TextUnformatted("Play over:");
+    ImGui::TextUnformatted("连接方式：");
     const auto pick = [&](const char* label, LdnMode value) {
         ImGui::SameLine();
         if (ImGui::RadioButton(label, mode == value) && mode != value) {
@@ -728,14 +728,14 @@ void DrawLocalMultiplayer() {
             mode_message = Multiplayer::SetLdnMode(value, &error) ? std::string{} : error;
         }
     };
-    pick("Suyu room", LdnMode::Room);
+    pick("Suyu 房间", LdnMode::Room);
     pick("Ryujinx LDN", LdnMode::RyuLdn);
-    pick("Both (automatic)", LdnMode::Auto);
-    HelpMarker("Both (the default): hosting opens a room and a server by itself, joining picks "
-               "whatever the lobby needs. Suyu room / Ryujinx LDN force one side only. Applies at "
-               "once (leave a lobby first).");
+    pick("两者（自动）", LdnMode::Auto);
+    HelpMarker("两者（默认）：主持会自动开启房间和服务器，加入时会"
+               "按大厅需求选择。Suyu 房间 / Ryujinx LDN 仅用一侧。立即"
+               "生效（请先离开大厅）。");
     if (!mode_message.empty()) {
-        ImGui::TextColored(kRed, "Couldn't switch: %s", mode_message.c_str());
+        ImGui::TextColored(kRed, "无法切换：%s", mode_message.c_str());
     }
 
     const std::string bridge = Multiplayer::BridgeStatusText();
@@ -744,7 +744,7 @@ void DrawLocalMultiplayer() {
     }
 
     if (ImGui::BeginTabBar("mptabs")) {
-        if (mode != LdnMode::RyuLdn && ImGui::BeginTabItem("Join Room")) {
+        if (mode != LdnMode::RyuLdn && ImGui::BeginTabItem("加入房间")) {
             DrawRoom();
             ImGui::EndTabItem();
         }
@@ -752,7 +752,7 @@ void DrawLocalMultiplayer() {
             DrawRyuLdn();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Public rooms")) {
+        if (ImGui::BeginTabItem("公共房间")) {
             DrawPublicRooms();
             ImGui::EndTabItem();
         }
@@ -760,16 +760,16 @@ void DrawLocalMultiplayer() {
     }
 }
 
-// "Online Multiplayer" tab: your online (NEX) server, separate from the local networks.
+// "在线多人游戏" tab: your online (NEX) server, separate from the local networks.
 void DrawOnlineMultiplayer() {
     static bool online_loaded = false;
     if (!online_loaded) {
         online_loaded = true;
-        const std::string v = GS::Value("Multiplayer", "online_server_host");
+        const std::string v = GS::Value("多人游戏", "online_server_host");
         std::snprintf(g_online_server, sizeof(g_online_server), "%s", v.c_str());
     }
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
-    ImGui::InputTextWithHint("Online Server IP", "IP or host (empty = off)", g_online_server,
+    ImGui::InputTextWithHint("在线服务器 IP", "IP 或主机（留空 = 关闭）", g_online_server,
                              sizeof(g_online_server));
     if (ImGui::IsItemDeactivatedAfterEdit()) {
         std::string v = g_online_server;
@@ -779,31 +779,31 @@ void DrawOnlineMultiplayer() {
             v.resize(colon); // ports are fixed by the game
         }
         std::snprintf(g_online_server, sizeof(g_online_server), "%s", v.c_str());
-        GS::SetValue("Multiplayer", "online_server_host", v);
+        GS::SetValue("多人游戏", "online_server_host", v);
     }
-    HelpMarker("Your online (NEX) server: an IPv4 address or host name. host:port keeps only the "
-               "host (ports are fixed by the game). Empty = off. Applies the next time the game "
-               "connects; set it before booting. Separate from Local Multiplayer.");
-    ImGui::TextColored(kGrey, "Online server: %s", g_online_server[0] ? g_online_server : "(off)");
+    HelpMarker("你的在线（NEX）服务器：IPv4 地址或主机名。host:port 只保留"
+               "主机（端口由游戏固定）。留空 = 关闭。下次游戏"
+               "连接时生效；请在启动前设置。与本地多人游戏分开。");
+    ImGui::TextColored(kGrey, "在线服务器：%s", g_online_server[0] ? g_online_server : "(off)");
 }
 
 void DrawMultiplayer() {
     // One name for every network: online server, suyu rooms and Ryujinx lobbies.
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
-    ImGui::InputText("Name", g_nick, sizeof(g_nick));
+    ImGui::InputText("名称", g_nick, sizeof(g_nick));
     if (ImGui::IsItemDeactivatedAfterEdit()) {
         Multiplayer::Save(FieldsToConfig());
     }
-    HelpMarker("Shown to other players online, in suyu rooms and in Ryujinx lobbies (Public "
-               "rooms). 4-20 characters: letters, digits, space, . _ -. Applies to the next room "
-               "or lobby you host or join.");
+    HelpMarker("会在线显示给其他玩家，在 suyu 房间和 Ryujinx 大厅（公共"
+               "房间）中。4-20 个字符：字母、数字、空格、. _ -。应用到下次"
+               "你主持或加入的房间或大厅。");
 
     if (ImGui::BeginTabBar("mpmain")) {
-        if (ImGui::BeginTabItem("Local Multiplayer")) {
+        if (ImGui::BeginTabItem("本地多人游戏")) {
             DrawLocalMultiplayer();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Online Multiplayer")) {
+        if (ImGui::BeginTabItem("在线多人游戏")) {
             DrawOnlineMultiplayer();
             ImGui::EndTabItem();
         }
@@ -816,27 +816,27 @@ void DrawRoom() {
     using Phase = Multiplayer::Status::Phase;
     switch (st.phase) {
     case Phase::Offline:
-        ImGui::TextColored(kGrey, "Offline");
+        ImGui::TextColored(kGrey, "离线");
         break;
     case Phase::Connecting:
-        ImGui::TextColored(kYellow, "Connecting...");
+        ImGui::TextColored(kYellow, "连接中……");
         break;
     case Phase::Reconnecting:
-        ImGui::TextColored(kYellow, "Connection lost - reconnecting (try %d)",
+        ImGui::TextColored(kYellow, "连接断开 - 正在重连（第 %d 次尝试）",
                            st.reconnect_attempt);
         break;
     case Phase::Hosting:
     case Phase::Joined:
         ImGui::TextColored(kGreen, "%s '%s'  -  %zu/%u players  -  you are %s",
-                           st.phase == Phase::Hosting ? "Hosting" : "Joined", st.room.c_str(),
+                           st.phase == Phase::Hosting ? "主持中" : "已加入", st.room.c_str(),
                            st.members.size(), st.slots, st.nickname.c_str());
         break;
     }
     if (st.phase != Phase::Offline) {
         ImGui::SameLine();
-        if (ImGui::Button(st.phase == Phase::Hosting ? "Close room" : "Leave")) {
+        if (ImGui::Button(st.phase == Phase::Hosting ? "关闭房间" : "离开")) {
             Multiplayer::Leave();
-            MpMessage("Left the room.", false);
+            MpMessage("已离开房间。", false);
         }
     }
     for (std::size_t i = 0; i < st.members.size(); ++i) {
@@ -844,52 +844,52 @@ void DrawRoom() {
         if (st.phase == Phase::Hosting && i < st.names.size() && st.names[i] != st.nickname) {
             ImGui::SameLine();
             ImGui::PushID(static_cast<int>(i));
-            if (ImGui::SmallButton("Kick")) {
+            if (ImGui::SmallButton("踢出")) {
                 Multiplayer::Kick(st.names[i]);
-                MpMessage(fmt::format("Kicked {}.", st.names[i]), false);
+                MpMessage(fmt::format("已踢出 {}。", st.names[i]), false);
             }
             ImGui::PopID();
         }
     }
     if (!st.last_error.empty()) {
-        ImGui::TextColored(kRed, "Last problem: %s", st.last_error.c_str());
+        ImGui::TextColored(kRed, "上次问题：%s", st.last_error.c_str());
     }
     if (!g_mp_message.empty()) {
         ImGui::TextColored(g_mp_message_bad ? kRed : kGrey, "%s", g_mp_message.c_str());
     }
 
-    SectionTitle("Join a friend");
+    SectionTitle("加入好友");
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
     const bool enter = ImGui::InputTextWithHint(
-        "##invite", "invite or address, e.g. 26.12.34.56", g_invite, sizeof(g_invite),
+        "##invite", "邀请码或地址，例如 26.12.34.56", g_invite, sizeof(g_invite),
         ImGuiInputTextFlags_EnterReturnsTrue |
             (g_show_join_address ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password));
     ImGui::SameLine();
-    if (ImGui::Button(g_show_join_address ? "Hide" : "Show")) {
+    if (ImGui::Button(g_show_join_address ? "隐藏" : "显示")) {
         g_show_join_address = !g_show_join_address;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Paste")) {
+    if (ImGui::Button("粘贴")) {
         if (char* clip = SDL_GetClipboardText()) {
             CopyTo(g_invite, clip);
             SDL_free(clip);
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Join") || enter) {
+    if (ImGui::Button("加入") || enter) {
         DoJoin();
     }
-    HelpMarker("Paste the invite your friend copied in their menu (address:port, plus #password "
-               "if the room has one), or type their Radmin VPN address. One address covers both "
-               "worlds: you join their room and see the lobbies on their server too. Then open "
-               "the game's local play and join their lobby.");
+    HelpMarker("粘贴好友从其菜单复制的邀请码（地址:端口，若房间有密码则"
+               "加上 #password），或输入 Radmin VPN 地址。一个地址覆盖两种"
+               "场景：你加入他们的房间，也能看到其服务器上的大厅。然后打开"
+               "游戏的本地联机并加入他们的大厅。");
     const auto recent = Multiplayer::RecentHosts();
     if (!recent.empty()) {
-        ImGui::TextColored(kGrey, "Joined before:");
+        ImGui::TextColored(kGrey, "之前加入过：");
         for (std::size_t i = 0; i < recent.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
             const std::string name =
-                g_show_join_address ? recent[i] : fmt::format("Host {}", i + 1);
+                g_show_join_address ? recent[i] : fmt::format("主持 {}", i + 1);
             if (ImGui::Button(name.c_str())) {
                 CopyTo(g_invite, recent[i]);
                 DoJoin();
@@ -905,35 +905,35 @@ void DrawRoom() {
         }
     }
 
-    SectionTitle("Hosting");
+    SectionTitle("主持中");
     ImGui::TextWrapped(
-        "Nothing to press: when you host in the game's local play, this PC opens the room and the "
-        "server by itself, and suyu and Ryujinx friends join the same lobby. These are the "
-        "room's options:");
+        "无需操作：当你在游戏的本地联机中主持时，本机会自动开启房间和"
+        "服务器，suyu 和 Ryujinx 好友会加入同一大厅。这些是"
+        "房间选项：");
     const float field = ImGui::GetFontSize() * 9.0f;
     ImGui::SetNextItemWidth(field);
-    ImGui::InputText("Room name", g_room, sizeof(g_room));
+    ImGui::InputText("房间名称", g_room, sizeof(g_room));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(field);
-    ImGui::InputText("Password", g_pass, sizeof(g_pass), ImGuiInputTextFlags_Password);
+    ImGui::InputText("密码", g_pass, sizeof(g_pass), ImGuiInputTextFlags_Password);
     ImGui::SetNextItemWidth(field);
-    ImGui::SliderInt("Players", &g_max_players, 2, 8);
+    ImGui::SliderInt("玩家", &g_max_players, 2, 8);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(field);
-    ImGui::InputInt("Port", &g_port, 0, 0);
+    ImGui::InputInt("端口", &g_port, 0, 0);
     if (ImGui::IsItemDeactivatedAfterEdit()) {
         Multiplayer::Save(FieldsToConfig());
     }
     const auto own = Multiplayer::GetOwnServerStatus();
     if (own.running) {
-        ImGui::TextColored(kGreen, "Hosting: %zu connected to your server, %zu lobbies (port %u)",
+        ImGui::TextColored(kGreen, "主持中：%zu 个连接，%zu 个大厅（端口 %u）",
                            own.connections, own.lobbies, own.port);
     } else if (!own.error.empty()) {
-        ImGui::TextColored(kRed, "Your server couldn't start: %s", own.error.c_str());
+        ImGui::TextColored(kRed, "你的服务器无法启动：%s", own.error.c_str());
     }
-    ImGui::TextColored(kGrey, "Friends join with one of your addresses (Copy puts an invite on "
-                              "the clipboard; click an address to show it). Ryujinx friends set "
-                              "this address as their LDN server:");
+    ImGui::TextColored(kGrey, "好友可通过你的地址加入（“复制”会把邀请放到 "
+                              "剪贴板；点击地址可显示）。Ryujinx 好友将 "
+                              "此地址设为其 LDN 服务器：");
     const auto addresses = Multiplayer::LocalAddresses();
     bool any_vpn = false;
     for (std::size_t i = 0; i < addresses.size(); ++i) {
@@ -941,15 +941,15 @@ void DrawRoom() {
         any_vpn |= a.label == "Radmin VPN" || a.label == "Hamachi" || a.label == "ZeroTier" ||
                    a.label == "Tailscale";
         ImGui::PushID(static_cast<int>(i) + 5000);
-        if (ImGui::SmallButton("Copy invite")) {
+        if (ImGui::SmallButton("复制邀请")) {
             const std::string code =
                 Multiplayer::InviteCode(a.ip, static_cast<u16>(std::clamp(g_port, 1, 65535)), g_pass);
             ImGui::SetClipboardText(code.c_str());
-            Notify("Invite copied to the clipboard");
+            Notify("邀请已复制到剪贴板");
         }
         ImGui::SameLine();
         const bool shown = g_shown_addresses.contains(i);
-        if (ImGui::SmallButton(shown ? a.ip.c_str() : "show address")) {
+        if (ImGui::SmallButton(shown ? a.ip.c_str() : "显示地址")) {
             if (shown) {
                 g_shown_addresses.erase(i);
             } else {
@@ -961,30 +961,30 @@ void DrawRoom() {
         ImGui::PopID();
     }
     if (!any_vpn) {
-        ImGui::TextColored(kYellow, "No Radmin VPN address found.");
-        HelpMarker("Over the internet, both of you install Radmin VPN and join the same Radmin "
-                   "network; then copy the Radmin invite here. On the same home network the "
-                   "Home network address works too.");
+        ImGui::TextColored(kYellow, "未找到 Radmin VPN 地址。");
+        HelpMarker("通过互联网时，双方都安装 Radmin VPN 并加入同一 Radmin "
+                   "网络，然后把 Radmin 邀请复制到这里。在同一家庭网络中，"
+                   "家庭网络地址也可用。");
     }
 
-    SectionTitle("You");
-    ImGui::TextUnformatted("When the game starts:");
+    SectionTitle("你");
+    ImGui::TextUnformatted("游戏启动时：");
     ImGui::SameLine();
-    bool startup_changed = ImGui::RadioButton("Stay offline", &g_startup, 0);
+    bool startup_changed = ImGui::RadioButton("保持离线", &g_startup, 0);
     ImGui::SameLine();
-    startup_changed |= ImGui::RadioButton("Host", &g_startup, 1);
+    startup_changed |= ImGui::RadioButton("主持", &g_startup, 1);
     ImGui::SameLine();
-    startup_changed |= ImGui::RadioButton("Join the last host", &g_startup, 2);
+    startup_changed |= ImGui::RadioButton("加入上一个主持", &g_startup, 2);
     if (startup_changed) {
         Multiplayer::Save(FieldsToConfig());
     }
-    if (ImGui::Checkbox("Reconnect by itself when the connection drops", &g_reconnect)) {
+    if (ImGui::Checkbox("连接断开时自动重连", &g_reconnect)) {
         Multiplayer::SetAutoReconnect(g_reconnect);
     }
 
     const auto events = Multiplayer::Events();
     if (!events.empty()) {
-        SectionTitle("Room events");
+        SectionTitle("房间事件");
         for (auto it = events.rbegin(); it != events.rend(); ++it) {
             ImGui::TextColored(kGrey, "%s", it->c_str());
         }
@@ -1002,41 +1002,41 @@ struct SettingHint {
 };
 
 constexpr SettingHint kSettingHints[] = {
-    {"Display", "fps", "Frame rate", "30|60|90|120|144|auto"},
-    {"Display", "resolution", "Resolution",
-     "default|auto|1920x1080|2560x1080|2560x1440|3440x1440|3840x2160"},
-    {"Display", "aspect", "Aspect ratio", "16:9|21:9|32:9|16:10|4:3"},
-    {"Display", "fullscreen", "Start fullscreen", ""},
-    {"Display", "show_fps", "FPS in the window title", ""},
-    {"Display", "console_mode", "Console mode", "docked|handheld"},
-    {"Graphics", "renderer", "Renderer", "Emulated|Direct", true},
-    {"Graphics", "native_render", "Render at the set resolution", ""},
-    {"Upscaler", "nvn_fsr_quality", "Quality", "Native AA|Quality|Balanced|Performance|Ultra Performance", true},
-    {"Upscaler", "nvn_fsr_sharpness", "Sharpness", ""},
-    {"Upscaler", "render_scale_override", "Override render scale", ""},
-    {"Upscaler", "nvn_fsr_split_scale", "Render below the output (split scale)", ""},
-    {"Diagnostics", "diagnostics", "Run reports", ""},
-    {"Diagnostics", "gpu_diagnostics", "Run reports (replacement renderer)", ""},
-    {"Diagnostics", "log_redact_paths", "Hide personal data in logs", ""},
-    {"Diagnostics", "nvn_call_sampling", "NVN call sampling", ""},
-    {"Diagnostics", "nvn_perf_gpu", "GPU timestamps", "1|0"},
-    {"Diagnostics", "nvn_fsr_texel_stats", "FSR texel statistics", "1|0"},
-    {"Diagnostics", "nvn_bench", "Benchmark mode", "0|1"},
-    {"Diagnostics", "nvn_bench_scene", "Benchmark scene", ""},
-    {"Diagnostics", "nvn_bench_warmup", "Benchmark warm-up (s)", ""},
-    {"Diagnostics", "nvn_bench_measure", "Benchmark measure (s)", ""},
-    {"Diagnostics", "nvn_upscaler_probe", "Upscaler probes", ""},
-    {"Diagnostics", "vulkan_validation", "Vulkan validation layer", ""},
-    {"Diagnostics", "probes", "Wiggle-hitch probes", ""},
-    {"Display", "rtss_overlay", "Allow RivaTuner overlay", ""},
-    {"Menu", "key", "Menu key", "F10|F9|F8|Home|none"},
-    {"Menu", "show_advanced", "Advanced mode", ""},
-    {"Menu", "pad_combo", "Menu controller combo",
-     "back+start|back+guide|leftstick+rightstick|none"},
+    {"显示", "fps", "帧率", "30|60|90|120|144|自动"},
+    {"显示", "resolution", "分辨率",
+     "默认|自动|1920x1080|2560x1080|2560x1440|3440x1440|3840x2160"},
+    {"显示", "aspect", "宽高比", "16:9|21:9|32:9|16:10|4:3"},
+    {"显示", "fullscreen", "启动时全屏", ""},
+    {"显示", "show_fps", "窗口标题显示 FPS", ""},
+    {"显示", "console_mode", "控制台模式", "底座|掌机"},
+    {"画面", "renderer", "渲染器", "模拟|直接", true},
+    {"画面", "native_render", "按设定分辨率渲染", ""},
+    {"超分辨率", "nvn_fsr_quality", "质量", "原生 AA|质量|均衡|性能|极致性能", true},
+    {"超分辨率", "nvn_fsr_sharpness", "锐化", ""},
+    {"超分辨率", "render_scale_override", "覆盖渲染缩放", ""},
+    {"超分辨率", "nvn_fsr_split_scale", "低于输出分辨率渲染（分离缩放）", ""},
+    {"诊断", "diagnostics", "运行报告", ""},
+    {"诊断", "gpu_diagnostics", "运行报告（替换渲染器）", ""},
+    {"诊断", "log_redact_paths", "日志中隐藏个人数据", ""},
+    {"诊断", "nvn_call_sampling", "NVN 调用采样", ""},
+    {"诊断", "nvn_perf_gpu", "GPU 时间戳", "1|0"},
+    {"诊断", "nvn_fsr_texel_stats", "FSR 纹素统计", "1|0"},
+    {"诊断", "nvn_bench", "基准测试模式", "0|1"},
+    {"诊断", "nvn_bench_scene", "基准测试场景", ""},
+    {"诊断", "nvn_bench_warmup", "基准预热（秒）", ""},
+    {"诊断", "nvn_bench_measure", "基准测量（秒）", ""},
+    {"诊断", "nvn_upscaler_probe", "超分辨率探针", ""},
+    {"诊断", "vulkan_validation", "Vulkan 验证层", ""},
+    {"诊断", "probes", "抖动卡顿探针", ""},
+    {"显示", "rtss_overlay", "允许 RivaTuner 叠加层", ""},
+    {"菜单", "key", "菜单键", "F10|F9|F8|Home|无"},
+    {"菜单", "show_advanced", "高级模式", ""},
+    {"菜单", "pad_combo", "菜单控制器组合键",
+     "返回+开始|返回+指南|左摇杆+右摇杆|无"},
 #ifdef _WIN32
-    {"Mods", "loader", "Mod loader", "Forge/forge.dll|none"},
+    {"模组", "loader", "模组加载器", "Forge/forge.dll|无"},
 #else
-    {"Mods", "loader", "Mod loader", "Forge/forge.so|none"},
+    {"模组", "loader", "模组加载器", "Forge/forge.so|无"},
 #endif
 };
 
@@ -1073,7 +1073,7 @@ Clock::time_point g_adv_next{};
 bool ShowAdvancedTab() {
     static bool shown{};
     if (Clock::now() >= g_adv_next) {
-        const std::string v = GS::Value("Menu", "show_advanced");
+        const std::string v = GS::Value("菜单", "show_advanced");
         shown = v == "true" || v == "1" || v == "yes" || v == "on";
         g_adv_next = Clock::now() + std::chrono::seconds(1);
     }
@@ -1113,7 +1113,7 @@ const UpState& Up() {
 void LoadSettingsFields() {
     g_options.clear();
     for (GS::OptionInfo& o : GS::Options()) {
-        if (o.section == "Multiplayer") {
+        if (o.section == "多人游戏") {
             continue; // has its own tab
         }
         CopyTo(g_setting_text[o.section + "/" + o.key], CurrentValue(o));
@@ -1128,11 +1128,11 @@ std::string CheckSetting(const GS::OptionInfo& o, const std::string& v) {
         const float f = std::strtof(v.c_str(), &end);
         return end != v.c_str() && *end == '\0' && f >= lo && f <= hi;
     };
-    if (o.section == "Display" && o.key == "fps" && v != "auto" && !in_range(10.0f, 360.0f)) {
-        return "Frame rate: a number from 10 to 360, or auto.";
+    if (o.section == "显示" && o.key == "fps" && v != "auto" && !in_range(10.0f, 360.0f)) {
+        return "帧率：10 到 360 的数字，或自动。";
     }
-    if (o.section == "Upscaler" && o.key == "nvn_fsr_sharpness" && !in_range(0.0f, 1.0f)) {
-        return "Sharpness: a number from 0 to 1.";
+    if (o.section == "超分辨率" && o.key == "nvn_fsr_sharpness" && !in_range(0.0f, 1.0f)) {
+        return "锐化：0 到 1 的数字。";
     }
     return {};
 }
@@ -1148,17 +1148,17 @@ void CommitSetting(const GS::OptionInfo& o, const std::string& label, const std:
         return;
     }
     GS::SetValue(o.section, o.key, value);
-    LOG_INFO(Frontend, "game menu: [{}] {} = {}", o.section, o.key, value);
+    LOG_INFO(Frontend, "游戏菜单：[{}] {} = {}", o.section, o.key, value);
     bool live = GS::ApplyLive(o.section, o.key, value);
-    if (o.section == "Menu") {
+    if (o.section == "菜单") {
         ReadMenuSettings();
         g_adv_next = {}; // Advanced mode: the tab and the rows follow at once
         live = true;
     }
     if (live) {
-        g_settings_message = fmt::format("{}: {} (applied now)", label, value);
+        g_settings_message = fmt::format("{}：{}（已应用）", label, value);
     } else {
-        g_settings_message = fmt::format("{}: {} (saved; restart the game to apply)", label, value);
+        g_settings_message = fmt::format("{}：{}（已保存；重启游戏后生效）", label, value);
         if (std::find(g_restart_needed.begin(), g_restart_needed.end(), label) ==
             g_restart_needed.end()) {
             g_restart_needed.push_back(label);
@@ -1170,12 +1170,12 @@ void CommitSetting(const GS::OptionInfo& o, const std::string& label, const std:
 void DrawAdvancedRow(Settings::BasicSetting& setting);
 void DrawAdvancedValue(Settings::BasicSetting& setting);
 
-bool g_restart_confirm{}; // "Restart now" was clicked once: ask before closing
+bool g_restart_confirm{}; // "立即重启" was clicked once: ask before closing
 bool g_restarting{};      // the new process is started and this one is closing
 std::string g_restart_error; // why the last restart could not start the new process
 
-/// The yellow "Restart the game to apply: ..." line (settings read only at start that changed this session) with
-/// a "Restart now" button beside it: a second click confirms, then the game starts again with the same command line
+/// The yellow "重启游戏以应用：..." line (settings read only at start that changed this session) with
+/// a "立即重启" button beside it: a second click confirms, then the game starts again with the same command line
 /// and this instance closes normally (the new one waits for it). If the start fails, the error is shown and
 /// nothing closes.
 void DrawRestartLine() {
@@ -1186,45 +1186,45 @@ void DrawRestartLine() {
     for (const auto& name : g_restart_needed) {
         list += (list.empty() ? "" : ", ") + name;
     }
-    ImGui::TextColored(kYellow, "Restart the game to apply: %s", list.c_str());
+    ImGui::TextColored(kYellow, "重启游戏以应用：%s", list.c_str());
     if (!g_restart_error.empty()) {
         ImGui::TextColored(kRed, "%s", g_restart_error.c_str());
     }
     if (g_restarting) {
         ImGui::SameLine();
-        ImGui::TextColored(kYellow, "(restarting...)");
+        ImGui::TextColored(kYellow, "（正在重启……）");
         return;
     }
     ImGui::SameLine();
     if (!g_restart_confirm) {
-        if (ImGui::SmallButton("Restart now")) {
+        if (ImGui::SmallButton("立即重启")) {
             g_restart_confirm = true;
             g_restart_error.clear();
         }
         return;
     }
-    ImGui::TextColored(kYellow, "Close the game and start it again?");
+    ImGui::TextColored(kYellow, "关闭游戏并重新启动？");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Yes, restart")) {
+    if (ImGui::SmallButton("是，重启")) {
         std::string error;
         unsigned long pid = 0;
         if (Relaunch::StartNewInstance(&error, &pid)) {
-            LOG_INFO(Frontend, "game menu: restart: new instance started (pid {}), closing this one", pid);
+            LOG_INFO(Frontend, "游戏菜单：重启：新实例已启动（pid {}），正在关闭当前实例", pid);
             g_restarting = true;
-            g_settings_message = "Restarting: the game closes and starts again.";
+            g_settings_message = "正在重启：游戏将关闭并重新启动。";
             g_settings_message_bad = false;
             SDL_Event quit{};
             quit.type = SDL_EVENT_QUIT; // the normal close path (window closed): saves and shuts down cleanly
             SDL_PushEvent(&quit);
         } else {
-            LOG_ERROR(Frontend, "game menu: restart failed: {}", error);
-            g_restart_error = "Restart failed: " + error + ". The game keeps running.";
+            LOG_ERROR(Frontend, "游戏菜单：重启失败：{}", error);
+            g_restart_error = "重启失败：" + error + "。游戏继续运行。";
             g_restart_confirm = false;
             return;
         }
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Cancel")) {
+    if (ImGui::SmallButton("取消")) {
         g_restart_confirm = false;
     }
 }
@@ -1247,24 +1247,26 @@ void RowStart(const std::string& label, const std::string& help) {
     ImGui::TableNextColumn();
 }
 
-/// "Upscaler": Off | FSR 3.1 | FSR 4. Stored as [Upscaler] nvn_fsr (bool) + nvn_fsr_backend (3 | 4).
+/// "超分辨率": Off | FSR 3.1 | FSR 4. Stored as [Upscaler] nvn_fsr (bool) + nvn_fsr_backend (3 | 4).
 void DrawUpscalerChoiceRow(const UpState& up, bool grey) {
-    constexpr const char* kNames[] = {"Off", "FSR 3.1", "FSR 4"};
+    constexpr const char* kNames[] = {"关闭", "FSR 3.1", "FSR 4"};
     ImGui::PushID("upscaler_choice");
     ImGui::BeginDisabled(grey);
-    RowStart("Upscaler",
-             "[Upscaler] nvn_fsr + nvn_fsr_backend\n\nOff, FSR 3.1 (Vulkan) or FSR 4 (through the graphics driver's DX12 library, "
-             "falls back to 3.1). Needs the Direct renderer. Applies after a restart.");
+    RowStart("超分辨率",
+             "[Upscaler] nvn_fsr + nvn_fsr_backend
+
+关闭、FSR 3.1 (Vulkan) 或 FSR 4 (通过显卡驱动的 DX12 库，"
+             "回退到 3.1)。需要 Direct 渲染器。重启后生效。");
     const int cur = static_cast<int>(up.choice);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
     if (ImGui::BeginCombo("##value", kNames[cur])) {
         for (int i = 0; i < 3; ++i) {
             if (ImGui::Selectable(kNames[i], i == cur) && i != cur) {
                 GS::SetUpscalerChoice(static_cast<GS::UpscalerChoice>(i));
-                LOG_INFO(Frontend, "game menu: Upscaler = {}", kNames[i]);
-                g_settings_message = fmt::format("Upscaler: {} (saved; restart the game to apply)", kNames[i]);
+                LOG_INFO(Frontend, "游戏内菜单: 超分辨率 = {}", kNames[i]);
+                g_settings_message = fmt::format("超分辨率: {} (已保存; 重启游戏后生效)", kNames[i]);
                 g_settings_message_bad = false;
-                MarkRestart("Upscaler");
+                MarkRestart("超分辨率");
             }
         }
         ImGui::EndCombo();
@@ -1273,14 +1275,16 @@ void DrawUpscalerChoiceRow(const UpState& up, bool grey) {
     ImGui::PopID();
 }
 
-/// "Render scale": the saved Graphics > Resolution scale (suyu's resolution_setup, kept as the backing store). Greyed and
+/// "渲染缩放": the saved Graphics > Resolution scale (suyu's resolution_setup, kept as the backing store). Greyed and
 /// showing the effective value while an upscaler's Quality mode decides it.
 void DrawRenderScaleRow(const UpState& up) {
     ImGui::PushID("render_scale");
-    RowStart("Render scale",
-             "How much sharper than the game's own resolution the picture is drawn (1X = native). Not the window size: "
-             "that is Display > Resolution. With the replacement renderer it applies after a restart.\n\nWhile an Upscaler "
-             "is on (and Advanced mode's Override render scale is off) the Quality mode decides this value.");
+    RowStart("渲染缩放",
+             "画面以高于游戏自身分辨率的清晰度绘制 (1X = 原生)。不是窗口大小："
+             "那是显示 > 分辨率。使用替换渲染器时重启后生效。
+
+当超分辨率"
+             "开启时 (且高级模式的覆盖渲染缩放关闭)，此值由质量模式决定。");
     if (up.by_mode) {
         ImGui::BeginDisabled(true);
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
@@ -1288,19 +1292,19 @@ void DrawRenderScaleRow(const UpState& up) {
             ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        ImGui::TextColored(kGrey, "Set by the Upscaler's Quality mode (%s). Your saved value is kept.", up.why.c_str());
+        ImGui::TextColored(kGrey, "由超分辨率的质量模式设定 (%s)。已保存的值会保留。", up.why.c_str());
     } else {
         DrawAdvancedValue(Settings::values.resolution_setup);
     }
     ImGui::PopID();
 }
 
-/// "Verbose log": suyu's log_filter *:Debug (on) or the default *:Info (off), applied to the running logger at once.
+/// "详细日志": suyu's log_filter *:Debug (on) or the default *:Info (off), applied to the running logger at once.
 void DrawVerboseLogRow(const UpState& up) {
     ImGui::PushID("verbose_log");
-    RowStart("Verbose log",
-             "suyu's log_filter: on = *:Debug (much bigger suyu log), off = the default *:Info. Applies at once and is "
-             "saved with suyu's config. A custom log_filter is replaced when you switch this.");
+    RowStart("详细日志",
+             "suyu 的 log_filter：开 = *:Debug (suyu 日志大得多)，关 = 默认 *:Info。立即生效并"
+             "随 suyu 配置保存。切换此项时会替换自定义 log_filter。");
     bool on = up.verbose;
     if (ImGui::Checkbox("##value", &on)) {
         const std::string filter_text = on ? "*:Debug" : "*:Info";
@@ -1309,18 +1313,18 @@ void DrawVerboseLogRow(const UpState& up) {
         filter.ParseFilterString(filter_text);
         Common::Log::SetGlobalFilter(filter);
         Controls::SaveConfig();
-        LOG_INFO(Frontend, "game menu: verbose log {} (log_filter = {})", on ? "on" : "off", filter_text);
-        g_settings_message = fmt::format("Verbose log: {} (applied now)", on ? "on" : "off");
+        LOG_INFO(Frontend, "游戏内菜单: 详细日志 {} (log_filter = {})", on ? "on" : "off", filter_text);
+        g_settings_message = fmt::format("详细日志: {} (已立即生效)", on ? "on" : "off");
         g_settings_message_bad = false;
     }
     ImGui::PopID();
 }
 
 void DrawSettings() {
-    ImGui::TextWrapped("The options in game_settings.ini beside the game. Changes are saved right "
-                       "away. Frame rate, the FPS display and the menu buttons apply at once; the "
-                       "rest at the next start.");
-    if (ImGui::Button("Open game_settings.ini")) {
+    ImGui::TextWrapped("游戏旁 game_settings.ini 中的选项。更改会立即"
+                       "保存。帧率、FPS 显示和菜单按钮立即生效；"
+                       "其余在下次启动时生效。");
+    if (ImGui::Button("打开 game_settings.ini")) {
         OpenPath(Common::FS::GetExeDirectory() / "game_settings.ini");
     }
     DrawRestartLine();
@@ -1339,9 +1343,9 @@ void DrawSettings() {
         if (!table_open) {
             return;
         }
-        if (finished == "Graphics") {
+        if (finished == "画面") {
             DrawRenderScaleRow(up);
-        } else if (finished == "Diagnostics") {
+        } else if (finished == "诊断") {
             DrawVerboseLogRow(up);
         }
     };
@@ -1356,18 +1360,18 @@ void DrawSettings() {
             }
             section = o.section;
             SectionTitle(section.c_str());
-            if (section == "Upscaler") {
+            if (section == "超分辨率") {
                 if (!up.direct) {
-                    ImGui::TextColored(kYellow, "FSR needs the Direct renderer: set Renderer (Graphics) to Direct and restart.");
+                    ImGui::TextColored(kYellow, "FSR 需要 Direct 渲染器：将渲染器 (画面) 设为 Direct 并重启。");
                 } else if (up.by_mode) {
-                    ImGui::TextColored(kGrey, "The Quality mode decides the Render scale (Graphics).");
+                    ImGui::TextColored(kGrey, "渲染缩放 (画面) 由质量模式决定。");
                 }
             }
             table_open = ImGui::BeginTable(section.c_str(), 2);
             if (table_open) {
                 ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed, label_width);
                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
-                if (section == "Upscaler") {
+                if (section == "超分辨率") {
                     DrawUpscalerChoiceRow(up, !up.direct);
                 }
             }
@@ -1380,7 +1384,7 @@ void DrawSettings() {
         const std::string id = o.section + "/" + o.key;
         auto& text = g_setting_text[id];
         // Upscaler rows are greyed with the Direct renderer missing; Quality and Sharpness also with the Upscaler off
-        const bool grey = o.section == "Upscaler" &&
+        const bool grey = o.section == "超分辨率" &&
                           (!up.direct || ((o.key == "nvn_fsr_quality" || o.key == "nvn_fsr_sharpness") &&
                                           up.choice == GS::UpscalerChoice::Off));
 
@@ -1390,7 +1394,9 @@ void DrawSettings() {
         ImGui::TableNextColumn();
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(label.c_str());
-        HelpMarker(fmt::format("[{}] {} (default {})\n\n{}", o.section, o.key, o.default_value,
+        HelpMarker(fmt::format("[{}] {} (默认 {})
+
+{}", o.section, o.key, o.default_value,
                                o.comment)
                        .c_str());
         ImGui::TableNextColumn();
@@ -1420,7 +1426,7 @@ void DrawSettings() {
                 }
                 ImGui::EndCombo();
             }
-        } else if (o.section == "Upscaler" && o.key == "nvn_fsr_sharpness") {
+        } else if (o.section == "超分辨率" && o.key == "nvn_fsr_sharpness") {
             float f = std::strtof(text.data(), nullptr);
             ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
             if (ImGui::SliderFloat("##value", &f, 0.0f, 1.0f, "%.2f")) {
@@ -1515,9 +1521,9 @@ const char* CategoryTitle(Settings::Category c) {
     switch (c) {
     case Category::Audio:
     case Category::SystemAudio:
-        return "Audio";
+        return "音频";
     case Category::Core:
-        return "Core";
+        return "核心";
     case Category::Cpu:
     case Category::CpuDebug:
     case Category::CpuUnsafe:
@@ -1529,22 +1535,22 @@ const char* CategoryTitle(Settings::Category c) {
     case Category::RendererExtensions:
     case Category::RendererDebug:
     case Category::GpuDriver:
-        return "Graphics";
+        return "画面";
     case Category::System:
     case Category::Services:
     case Category::LibraryApplet:
-        return "System";
+        return "系统";
     case Category::DataStorage:
-        return "Storage";
+        return "存储";
     case Category::Debugging:
     case Category::DebuggingGraphics:
-        return "Debug";
+        return "调试";
     case Category::Linux:
     case Category::Miscellaneous:
     case Category::AddOns:
-        return "Miscellaneous";
+        return "杂项";
     case Category::Network:
-        return "Network";
+        return "网络";
     default:
         return nullptr; // controls, shortcuts, paths, UI...: not shown here
     }
@@ -1566,21 +1572,21 @@ void CommitAdvanced(Settings::BasicSetting& setting, const std::string& value) {
     CopyTo(g_adv_text[setting.GetLabel()], after);
     if (after == before) {
         if (value != before) {
-            g_adv_message = fmt::format("{}: '{}' wasn't accepted (kept {})", setting.GetLabel(),
+            g_adv_message = fmt::format("{}: '{}' 未被接受 (保留 {})", setting.GetLabel(),
                                         value, after);
             g_adv_message_bad = true;
         }
         return;
     }
-    LOG_INFO(Frontend, "game menu: advanced {} = {}", setting.GetLabel(), after);
+    LOG_INFO(Frontend, "游戏内菜单: 高级 {} = {}", setting.GetLabel(), after);
     Controls::SaveConfig();
     if (g_system != nullptr && setting.RuntimeModifiable()) {
         g_system->ApplySettings();
-        g_adv_message = fmt::format("{}: {} (applied now)", setting.GetLabel(), after);
+        g_adv_message = fmt::format("{}：{}（已应用）", setting.GetLabel(), after);
     } else {
         g_adv_message =
-            fmt::format("{}: {} (saved; restart the game to apply)", setting.GetLabel(), after);
-        // read only at start: listed for the Settings tab's "Restart now" line too
+            fmt::format("{}：{}（已保存；重启游戏后生效）", setting.GetLabel(), after);
+        // read only at start: listed for the Settings tab's "立即重启" line too
         if (std::find(g_restart_needed.begin(), g_restart_needed.end(), setting.GetLabel()) ==
             g_restart_needed.end()) {
             g_restart_needed.push_back(setting.GetLabel());
@@ -1609,13 +1615,13 @@ void DrawAdvancedValue(Settings::BasicSetting& setting) {
             ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
             const std::string current = setting.ToString();
             std::string shown = setting.Canonicalize();
-            if (shown.rfind("Res", 0) == 0 && shown.size() > 3 && std::isdigit(shown[3])) {
+            if (shown.rfind("分辨率", 0) == 0 && shown.size() > 3 && std::isdigit(shown[3])) {
                 shown = PrettyResolution(shown);
             }
             if (ImGui::BeginCombo("##value", shown.c_str())) {
                 for (const auto& [name, value] : names) {
                     const std::string label =
-                        name.rfind("Res", 0) == 0 && name.size() > 3 && std::isdigit(name[3])
+                        name.rfind("分辨率", 0) == 0 && name.size() > 3 && std::isdigit(name[3])
                             ? PrettyResolution(name)
                             : name;
                     if (ImGui::Selectable(label.c_str(), std::to_string(value) == current)) {
@@ -1640,30 +1646,32 @@ void DrawAdvancedRow(Settings::BasicSetting& setting) {
     ImGui::TableNextColumn();
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(setting.GetLabel().c_str());
-    std::string help = fmt::format("{} (default {})", setting.GetLabel(), setting.DefaultToString());
+    std::string help = fmt::format("{} (默认 {})", setting.GetLabel(), setting.DefaultToString());
     if (setting.Ranged()) {
-        help += fmt::format("\nrange {} to {}", setting.MinVal(), setting.MaxVal());
+        help += fmt::format("
+范围 {} 到 {}", setting.MinVal(), setting.MaxVal());
     }
     if (!setting.RuntimeModifiable()) {
-        help += "\nApplies at the next start of the game.";
+        help += "
+下次启动游戏时生效。";
     }
     HelpMarker(help.c_str());
     ImGui::TableNextColumn();
     DrawAdvancedValue(setting);
     ImGui::SameLine();
-    if (setting.ToString() != setting.DefaultToString() && ImGui::SmallButton("Reset")) {
+    if (setting.ToString() != setting.DefaultToString() && ImGui::SmallButton("重置")) {
         CommitAdvanced(setting, setting.DefaultToString());
     }
     ImGui::PopID();
 }
 
 void DrawAdvanced() {
-    ImGui::TextWrapped("Every setting of suyu's own configuration, grouped like its config tab. "
-                       "Changes are saved with the game's config when it closes; settings that "
-                       "can change while a game runs apply at once, the rest at the next start. "
-                       "Controls and Multiplayer have their own tabs.");
+    ImGui::TextWrapped("suyu 自身配置的所有设置，按配置选项卡分组。"
+                       "更改在游戏关闭时随游戏配置保存；"
+                       "运行时可改的设置立即生效，其余在下次启动时生效。"
+                       "控制和多人游戏有各自的选项卡。");
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
-    ImGui::InputText("Search", g_adv_filter, sizeof(g_adv_filter));
+    ImGui::InputText("搜索", g_adv_filter, sizeof(g_adv_filter));
     if (!g_adv_message.empty()) {
         ImGui::TextColored(g_adv_message_bad ? kRed : kGrey, "%s", g_adv_message.c_str());
     }
@@ -1673,8 +1681,8 @@ void DrawAdvanced() {
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
     // Group the categories under their headings, in a fixed order.
-    constexpr const char* kGroups[] = {"Graphics", "CPU",     "Audio",   "System",
-                                       "Storage",  "Network", "Debug",   "Miscellaneous"};
+    constexpr const char* kGroups[] = {"画面", "CPU",     "音频",   "系统",
+                                       "存储",  "网络", "调试",   "杂项"};
     for (const char* group : kGroups) {
         std::vector<Settings::BasicSetting*> rows;
         for (const auto& [category, list] : Settings::values.linkage.by_category) {
@@ -1723,29 +1731,29 @@ void DrawGeneral() {
     if (g_system != nullptr) {
         [[maybe_unused]] auto _ = g_system->GetGameName(game_name);
     }
-    ImGui::Text("%s", game_name.empty() ? "Game" : game_name.c_str());
-    ImGui::TextColored(kGrey, "Frame rate: %s FPS", g_fps_text.c_str());
+    ImGui::Text("%s", game_name.empty() ? "游戏" : game_name.c_str());
+    ImGui::TextColored(kGrey, "帧率: %s FPS", g_fps_text.c_str());
 
-    SectionTitle("Folders");
+    SectionTitle("文件夹");
     const auto exe_dir = Common::FS::GetExeDirectory();
-    if (ImGui::Button("Saves, config and logs (user)")) {
+    if (ImGui::Button("存档、配置和日志 (用户)")) {
         OpenPath(exe_dir / "user");
     }
     ImGui::SameLine();
-    if (ImGui::Button("Mods")) {
+    if (ImGui::Button("模组")) {
         OpenPath(exe_dir / "mods");
     }
     ImGui::SameLine();
-    if (ImGui::Button("Keys")) {
+    if (ImGui::Button("密钥")) {
         OpenPath(Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir));
     }
-    if (ImGui::Button("Open game_settings.ini")) {
+    if (ImGui::Button("打开 game_settings.ini")) {
         OpenPath(exe_dir / "game_settings.ini");
     }
-    HelpMarker("Frame rate, resolution, console mode, draw distance and more. Changes there "
-               "apply the next time the game starts.");
+    HelpMarker("帧率、分辨率、主机模式、绘制距离等。那里的更改"
+               "在下次游戏启动时生效。");
 
-    SectionTitle("Mods found");
+    SectionTitle("找到的模组");
     bool any = false;
     std::error_code ec;
     const auto mods_dir = exe_dir / "mods";
@@ -1761,21 +1769,21 @@ void DrawGeneral() {
         }
     }
     if (!any) {
-        ImGui::TextColored(kGrey, "none (drop mods into mods/<title id>/)");
+        ImGui::TextColored(kGrey, "无 (将模组放入 mods/<title id>/)");
     }
 
-    SectionTitle("Keys");
+    SectionTitle("密钥");
     if (!g_key_name.empty()) {
         ImGui::BulletText("%s: this menu", g_key_name.c_str());
     }
     if (!g_combo_name.empty()) {
-        ImGui::BulletText("Hold %s on a controller for 1 s: this menu", g_combo_name.c_str());
+        ImGui::BulletText("按住控制器 %s 1 秒：打开此菜单", g_combo_name.c_str());
     }
-    ImGui::BulletText("F11 or Alt+Enter: fullscreen");
+    ImGui::BulletText("F11 或 Alt+Enter：全屏");
 #ifdef _WIN32
-    ImGui::BulletText("F12: debug panel");
+    ImGui::BulletText("F12：调试面板");
 #endif
-    ImGui::BulletText("Esc (in this window): close the menu");
+    ImGui::BulletText("Esc (在此窗口)：关闭菜单");
 }
 
 void Draw() {
@@ -1792,42 +1800,42 @@ void Draw() {
     if (!g_note.empty() && Clock::now() < g_note_until) {
         ImGui::TextColored(kYellow, "%s", g_note.c_str());
     } else {
-        ImGui::TextColored(kGrey, "Settings here are saved at once.");
+        ImGui::TextColored(kGrey, "此处的设置会立即保存。");
     }
     ImGui::SameLine();
     const float back_width =
-        ImGui::CalcTextSize("Back to game").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::CalcTextSize("返回游戏").x + ImGui::GetStyle().FramePadding.x * 2.0f;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                          std::max(0.0f, ImGui::GetContentRegionAvail().x - back_width));
-    if (ImGui::Button("Back to game")) {
+    if (ImGui::Button("返回游戏")) {
         g_close_requested = true;
     }
     if (ImGui::BeginTabBar("tabs")) {
-        if (ImGui::BeginTabItem("Controls")) {
+        if (ImGui::BeginTabItem("控制")) {
             ImGui::BeginChild("controls");
             DrawControls();
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Multiplayer")) {
+        if (ImGui::BeginTabItem("多人游戏")) {
             ImGui::BeginChild("multiplayer");
             DrawMultiplayer();
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Settings")) {
+        if (ImGui::BeginTabItem("设置")) {
             ImGui::BeginChild("settings");
             DrawSettings();
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (ShowAdvancedTab() && ImGui::BeginTabItem("Advanced")) {
+        if (ShowAdvancedTab() && ImGui::BeginTabItem("高级")) {
             ImGui::BeginChild("advanced");
             DrawAdvanced();
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("General")) {
+        if (ImGui::BeginTabItem("通用")) {
             ImGui::BeginChild("general");
             DrawGeneral();
             ImGui::EndChild();
@@ -1855,6 +1863,22 @@ void Draw() {
 
 void LoadFont(float scale) {
     ImGuiIO& io = ImGui::GetIO();
+    // zh patch: prefer a CJK font so the translated menu can render Han glyphs
+    static constexpr const char* kCjkFonts[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\Deng.ttf",
+#endif
+    };
+    std::error_code cjk_ec;
+    const ImWchar* cjk_ranges = io.Fonts->GetGlyphRangesChineseSimplifiedCommon();
+    for (const char* path : kCjkFonts) {
+        if (std::filesystem::exists(path, cjk_ec) &&
+            io.Fonts->AddFontFromFileTTF(path, 18.0f, nullptr, cjk_ranges)) {
+            ImGui::GetStyle().FontScaleDpi = scale;
+            return;
+        }
+    }
     static constexpr const char* kFonts[] = {
 #ifdef _WIN32
         "C:\\Windows\\Fonts\\segoeui.ttf",
@@ -1894,12 +1918,12 @@ void Open() {
     if (g_system != nullptr) {
         [[maybe_unused]] auto _ = g_system->GetGameName(game_name);
     }
-    const std::string title = (game_name.empty() ? std::string("Game") : game_name) + " - Menu";
+    const std::string title = (game_name.empty() ? std::string("游戏") : game_name) + " - 菜单";
     g_window = SDL_CreateWindow(title.c_str(), static_cast<int>(820 * scale),
                                 static_cast<int>(720 * scale),
                                 SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
     if (g_window == nullptr) {
-        LOG_ERROR(Frontend, "game menu: no window: {}", SDL_GetError());
+        LOG_ERROR(Frontend, "游戏内菜单: 无窗口: {}", SDL_GetError());
         return;
     }
     if (g_game_window != nullptr) {
@@ -1921,7 +1945,7 @@ void Open() {
     if (software) {
         SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0"); // window surface via GDI, not a D3D11 texture
         g_renderer = SDL_CreateRenderer(g_window, SDL_SOFTWARE_RENDERER);
-        LOG_INFO(Frontend, "game menu: RivaTuner hooks in the process, software renderer ({})",
+        LOG_INFO(Frontend, "游戏内菜单: 进程中有 RivaTuner 钩子，软件渲染器 ({})",
                  g_renderer != nullptr ? "ok" : SDL_GetError());
     }
     if (g_renderer == nullptr) {
@@ -1931,7 +1955,7 @@ void Open() {
         g_renderer = SDL_CreateRenderer(g_window, SDL_SOFTWARE_RENDERER);
     }
     if (g_renderer == nullptr) {
-        LOG_ERROR(Frontend, "game menu: no renderer: {}", SDL_GetError());
+        LOG_ERROR(Frontend, "游戏内菜单: 无渲染器: {}", SDL_GetError());
         SDL_DestroyWindow(g_window);
         g_window = nullptr;
         return;
@@ -1968,7 +1992,7 @@ void Open() {
     g_focused = true;
     UpdateGate();
     g_last_draw = {};
-    LOG_INFO(Frontend, "game menu: opened");
+    LOG_INFO(Frontend, "游戏内菜单: 已打开");
 }
 
 void Close() {
@@ -1990,7 +2014,7 @@ void Close() {
     if (g_game_window != nullptr) {
         SDL_RaiseWindow(g_game_window);
     }
-    LOG_INFO(Frontend, "game menu: closed");
+    LOG_INFO(Frontend, "游戏内菜单: 已关闭");
 }
 
 bool ComboHeld() {
@@ -2016,7 +2040,7 @@ void Init(Core::System& system, InputCommon::InputSubsystem* input, SDL_Window* 
     g_input = input;
     g_game_window = game_window;
     ReadMenuSettings();
-    LOG_INFO(Frontend, "game menu: key {}, controller combo {}",
+    LOG_INFO(Frontend, "游戏内菜单: 按键 {}，控制器组合 {}",
              g_key_name.empty() ? "none" : g_key_name,
              g_combo_name.empty() ? "none" : g_combo_name);
 }
